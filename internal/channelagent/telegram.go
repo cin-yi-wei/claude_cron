@@ -1,0 +1,172 @@
+package channelagent
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/url"
+	"strconv"
+	"time"
+)
+
+const defaultTelegramBaseURL = "https://api.telegram.org"
+
+type TelegramSource struct {
+	BaseURL string
+	Token   string
+	ChatID  string
+	Client  *http.Client
+}
+
+func (s TelegramSource) Fetch(ctx context.Context) ([]SourceMessage, error) {
+	if s.Token == "" {
+		return nil, fmt.Errorf("telegram token is required")
+	}
+	if s.ChatID == "" {
+		return nil, fmt.Errorf("telegram chat id is required")
+	}
+	baseURL := s.BaseURL
+	if baseURL == "" {
+		baseURL = defaultTelegramBaseURL
+	}
+	client := s.Client
+	if client == nil {
+		client = http.DefaultClient
+	}
+
+	endpoint, err := url.Parse(baseURL + "/bot" + s.Token + "/getUpdates")
+	if err != nil {
+		return nil, err
+	}
+	query := endpoint.Query()
+	query.Set("timeout", "0")
+	endpoint.RawQuery = query.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if err := checkHTTPResponse(resp); err != nil {
+		return nil, err
+	}
+
+	var payload telegramUpdatesResponse
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, err
+	}
+	if !payload.OK {
+		return nil, fmt.Errorf("telegram getUpdates returned ok=false")
+	}
+
+	var messages []SourceMessage
+	for _, update := range payload.Result {
+		if update.Message == nil {
+			continue
+		}
+		message := update.Message
+		chatID := strconv.FormatInt(message.Chat.ID, 10)
+		if chatID != s.ChatID {
+			continue
+		}
+		content := message.Text
+		if content == "" {
+			content = message.Caption
+		}
+		messages = append(messages, SourceMessage{
+			Platform:  "telegram",
+			ChannelID: s.ChatID,
+			MessageID: strconv.FormatInt(update.UpdateID, 10),
+			AuthorID:  strconv.FormatInt(message.From.ID, 10),
+			CreatedAt: time.Unix(message.Date, 0).UTC().Format(time.RFC3339),
+			Content:   content,
+		})
+	}
+	return messages, nil
+}
+
+type TelegramSender struct {
+	BaseURL string
+	Token   string
+	ChatID  string
+	Client  *http.Client
+}
+
+func (s TelegramSender) Send(ctx context.Context, output OutputJob) error {
+	if s.Token == "" {
+		return fmt.Errorf("telegram token is required")
+	}
+	if s.ChatID == "" {
+		return fmt.Errorf("telegram chat id is required")
+	}
+	baseURL := s.BaseURL
+	if baseURL == "" {
+		baseURL = defaultTelegramBaseURL
+	}
+	client := s.Client
+	if client == nil {
+		client = http.DefaultClient
+	}
+	body, err := json.Marshal(map[string]string{"chat_id": s.ChatID, "text": output.Text})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/bot"+s.Token+"/sendMessage", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if err := checkHTTPResponse(resp); err != nil {
+		return err
+	}
+	var payload telegramSendResponse
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return err
+	}
+	if !payload.OK {
+		return fmt.Errorf("telegram sendMessage returned ok=false")
+	}
+	return nil
+}
+
+type telegramUpdatesResponse struct {
+	OK     bool             `json:"ok"`
+	Result []telegramUpdate `json:"result"`
+}
+
+type telegramUpdate struct {
+	UpdateID int64            `json:"update_id"`
+	Message  *telegramMessage `json:"message"`
+}
+
+type telegramMessage struct {
+	MessageID int64        `json:"message_id"`
+	Date      int64        `json:"date"`
+	Text      string       `json:"text"`
+	Caption   string       `json:"caption"`
+	Chat      telegramChat `json:"chat"`
+	From      telegramUser `json:"from"`
+}
+
+type telegramChat struct {
+	ID int64 `json:"id"`
+}
+
+type telegramUser struct {
+	ID int64 `json:"id"`
+}
+
+type telegramSendResponse struct {
+	OK bool `json:"ok"`
+}

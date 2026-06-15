@@ -1,6 +1,7 @@
 package channelagent
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -16,6 +17,10 @@ type seenState struct {
 }
 
 func RunWatcher(root, sourcePath string) (int, error) {
+	return RunWatcherWithSource(context.Background(), root, MockFileSource{Path: sourcePath})
+}
+
+func RunWatcherWithSource(ctx context.Context, root string, source MessageSource) (int, error) {
 	if err := Init(root); err != nil {
 		return 0, err
 	}
@@ -25,8 +30,8 @@ func RunWatcher(root, sourcePath string) (int, error) {
 	}
 	defer lock.Release()
 
-	var messages []SourceMessage
-	if err := ReadJSON(sourcePath, &messages); err != nil {
+	messages, err := source.Fetch(ctx)
+	if err != nil {
 		return 0, err
 	}
 	sort.SliceStable(messages, func(i, j int) bool {

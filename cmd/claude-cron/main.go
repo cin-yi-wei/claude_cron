@@ -17,7 +17,7 @@ func main() {
 
 func run(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "usage: channel-agent <init|watcher|claude-worker|sender>")
+		fmt.Fprintln(stderr, "usage: claude-cron <init|watcher|claude-worker|sender>")
 		return 2
 	}
 
@@ -39,10 +39,29 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fs.SetOutput(stderr)
 		root := fs.String("root", ".channel-agent", "runtime root")
 		source := fs.String("source", ".channel-agent/mock/source_messages.json", "mock source messages JSON")
+		sourceAdapter := fs.String("source-adapter", "mock", "source adapter: mock, discord, telegram")
+		discordTokenEnv := fs.String("discord-token-env", "DISCORD_BOT_TOKEN", "Discord bot token env var")
+		discordChannelID := fs.String("discord-channel-id", "", "Discord channel ID")
+		discordBaseURL := fs.String("discord-base-url", "", "Discord API base URL")
+		telegramTokenEnv := fs.String("telegram-token-env", "TELEGRAM_BOT_TOKEN", "Telegram bot token env var")
+		telegramChatID := fs.String("telegram-chat-id", "", "Telegram chat ID")
+		telegramBaseURL := fs.String("telegram-base-url", "", "Telegram API base URL")
 		if err := fs.Parse(args[1:]); err != nil {
 			return 2
 		}
-		created, err := agent.RunWatcher(*root, *source)
+		messageSource, err := buildSource(*sourceAdapter, *source, platformConfig{
+			discordTokenEnv:  *discordTokenEnv,
+			discordChannelID: *discordChannelID,
+			discordBaseURL:   *discordBaseURL,
+			telegramTokenEnv: *telegramTokenEnv,
+			telegramChatID:   *telegramChatID,
+			telegramBaseURL:  *telegramBaseURL,
+		})
+		if err != nil {
+			fmt.Fprintln(stderr, err)
+			return 2
+		}
+		created, err := agent.RunWatcherWithSource(context.Background(), *root, messageSource)
 		if err != nil {
 			fmt.Fprintln(stderr, err)
 			return 1
@@ -70,14 +89,28 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fs.SetOutput(stderr)
 		root := fs.String("root", ".channel-agent", "runtime root")
 		adapter := fs.String("adapter", "stdout", "sender adapter")
+		discordTokenEnv := fs.String("discord-token-env", "DISCORD_BOT_TOKEN", "Discord bot token env var")
+		discordChannelID := fs.String("discord-channel-id", "", "Discord channel ID")
+		discordBaseURL := fs.String("discord-base-url", "", "Discord API base URL")
+		telegramTokenEnv := fs.String("telegram-token-env", "TELEGRAM_BOT_TOKEN", "Telegram bot token env var")
+		telegramChatID := fs.String("telegram-chat-id", "", "Telegram chat ID")
+		telegramBaseURL := fs.String("telegram-base-url", "", "Telegram API base URL")
 		if err := fs.Parse(args[1:]); err != nil {
 			return 2
 		}
-		if *adapter != "stdout" {
-			fmt.Fprintf(stderr, "unsupported adapter %q\n", *adapter)
+		sender, err := buildSender(*adapter, stdout, platformConfig{
+			discordTokenEnv:  *discordTokenEnv,
+			discordChannelID: *discordChannelID,
+			discordBaseURL:   *discordBaseURL,
+			telegramTokenEnv: *telegramTokenEnv,
+			telegramChatID:   *telegramChatID,
+			telegramBaseURL:  *telegramBaseURL,
+		})
+		if err != nil {
+			fmt.Fprintln(stderr, err)
 			return 2
 		}
-		sent, err := agent.RunSenderOnce(context.Background(), *root, agent.StdoutSender{Writer: stdout})
+		sent, err := agent.RunSenderOnce(context.Background(), *root, sender)
 		if err != nil {
 			fmt.Fprintln(stderr, err)
 			return 1
@@ -87,5 +120,57 @@ func run(args []string, stdout, stderr io.Writer) int {
 	default:
 		fmt.Fprintf(stderr, "unknown command %q\n", args[0])
 		return 2
+	}
+}
+
+type platformConfig struct {
+	discordTokenEnv  string
+	discordChannelID string
+	discordBaseURL   string
+	telegramTokenEnv string
+	telegramChatID   string
+	telegramBaseURL  string
+}
+
+func buildSource(adapter, mockPath string, cfg platformConfig) (agent.MessageSource, error) {
+	switch adapter {
+	case "mock":
+		return agent.MockFileSource{Path: mockPath}, nil
+	case "discord":
+		return agent.DiscordSource{
+			BaseURL:   cfg.discordBaseURL,
+			Token:     os.Getenv(cfg.discordTokenEnv),
+			ChannelID: cfg.discordChannelID,
+			Limit:     50,
+		}, nil
+	case "telegram", "tg":
+		return agent.TelegramSource{
+			BaseURL: cfg.telegramBaseURL,
+			Token:   os.Getenv(cfg.telegramTokenEnv),
+			ChatID:  cfg.telegramChatID,
+		}, nil
+	default:
+		return nil, fmt.Errorf("unsupported source adapter %q", adapter)
+	}
+}
+
+func buildSender(adapter string, stdout io.Writer, cfg platformConfig) (agent.Sender, error) {
+	switch adapter {
+	case "stdout":
+		return agent.StdoutSender{Writer: stdout}, nil
+	case "discord":
+		return agent.DiscordSender{
+			BaseURL:   cfg.discordBaseURL,
+			Token:     os.Getenv(cfg.discordTokenEnv),
+			ChannelID: cfg.discordChannelID,
+		}, nil
+	case "telegram", "tg":
+		return agent.TelegramSender{
+			BaseURL: cfg.telegramBaseURL,
+			Token:   os.Getenv(cfg.telegramTokenEnv),
+			ChatID:  cfg.telegramChatID,
+		}, nil
+	default:
+		return nil, fmt.Errorf("unsupported adapter %q", adapter)
 	}
 }

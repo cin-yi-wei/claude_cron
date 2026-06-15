@@ -39,6 +39,26 @@ Create pending jobs:
 go run ./cmd/claude-cron watcher --root .channel-agent --source .channel-agent/mock/source_messages.json
 ```
 
+Discord watcher:
+
+```bash
+export DISCORD_BOT_TOKEN=...
+go run ./cmd/claude-cron watcher \
+  --root .channel-agent \
+  --source-adapter discord \
+  --discord-channel-id 1234567890
+```
+
+Telegram watcher:
+
+```bash
+export TELEGRAM_BOT_TOKEN=...
+go run ./cmd/claude-cron watcher \
+  --root .channel-agent \
+  --source-adapter telegram \
+  --telegram-chat-id 1234567890
+```
+
 Run a Claude Code interactive session in tmux:
 
 ```bash
@@ -56,6 +76,26 @@ Send pending outputs to stdout:
 
 ```bash
 go run ./cmd/claude-cron sender --root .channel-agent --adapter stdout
+```
+
+Send pending outputs to Discord:
+
+```bash
+export DISCORD_BOT_TOKEN=...
+go run ./cmd/claude-cron sender \
+  --root .channel-agent \
+  --adapter discord \
+  --discord-channel-id 1234567890
+```
+
+Send pending outputs to Telegram:
+
+```bash
+export TELEGRAM_BOT_TOKEN=...
+go run ./cmd/claude-cron sender \
+  --root .channel-agent \
+  --adapter telegram \
+  --telegram-chat-id 1234567890
 ```
 
 ## Safety Rules

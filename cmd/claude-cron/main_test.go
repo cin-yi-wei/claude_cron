@@ -2,6 +2,9 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -37,6 +40,74 @@ func TestRunWatcherCommand(t *testing.T) {
 	}
 	if got := countJSONFiles(t, filepath.Join(root, "inbox", "pending")); got != 1 {
 		t.Fatalf("pending jobs = %d, want 1", got)
+	}
+}
+
+func TestRunWatcherDiscordCommand(t *testing.T) {
+	root := filepath.Join(t.TempDir(), ".channel-agent")
+	t.Setenv("DISCORD_TEST_TOKEN", "tok")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v10/channels/c1/messages" {
+			t.Fatalf("path = %s", r.URL.Path)
+		}
+		_ = json.NewEncoder(w).Encode([]map[string]any{{
+			"id": "m1", "content": "hi", "timestamp": "2026-06-16T01:30:12Z", "author": map[string]any{"id": "u1"},
+		}})
+	}))
+	defer server.Close()
+
+	code := run([]string{
+		"watcher",
+		"--root", root,
+		"--source-adapter", "discord",
+		"--discord-base-url", server.URL + "/api/v10",
+		"--discord-token-env", "DISCORD_TEST_TOKEN",
+		"--discord-channel-id", "c1",
+	}, &bytes.Buffer{}, &bytes.Buffer{})
+	if code != 0 {
+		t.Fatalf("run watcher discord exit = %d, want 0", code)
+	}
+	if got := countJSONFiles(t, filepath.Join(root, "inbox", "pending")); got != 1 {
+		t.Fatalf("pending jobs = %d, want 1", got)
+	}
+}
+
+func TestRunSenderTelegramCommand(t *testing.T) {
+	root := filepath.Join(t.TempDir(), ".channel-agent")
+	t.Setenv("TELEGRAM_TEST_TOKEN", "TOKEN")
+	if err := agent.Init(root); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := agent.AtomicWriteJSON(filepath.Join(root, "outbox", "pending", "job-1.json"), agent.OutputJob{
+		Schema: 1, JobID: "job-1", RequestID: "req-1", InputHash: "hash-1", Send: true, Text: "reply",
+	}); err != nil {
+		t.Fatalf("write output: %v", err)
+	}
+	var gotBody map[string]string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/botTOKEN/sendMessage" {
+			t.Fatalf("path = %s", r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+	}))
+	defer server.Close()
+
+	code := run([]string{
+		"sender",
+		"--root", root,
+		"--adapter", "telegram",
+		"--telegram-base-url", server.URL,
+		"--telegram-token-env", "TELEGRAM_TEST_TOKEN",
+		"--telegram-chat-id", "12345",
+	}, &bytes.Buffer{}, &bytes.Buffer{})
+	if code != 0 {
+		t.Fatalf("run sender telegram exit = %d, want 0", code)
+	}
+	if gotBody["chat_id"] != "12345" || gotBody["text"] != "reply" {
+		t.Fatalf("telegram body = %#v", gotBody)
 	}
 }
 
