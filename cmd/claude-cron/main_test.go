@@ -22,6 +22,72 @@ func TestRunInitCommand(t *testing.T) {
 	assertExists(t, filepath.Join(root, "inbox", "pending"))
 }
 
+func TestRunInitDiscordCommandWritesConfig(t *testing.T) {
+	root := filepath.Join(t.TempDir(), ".channel-agent")
+
+	code := run([]string{"init", "discord", "--root", root, "--discord-channel-id", "c1"}, &bytes.Buffer{}, &bytes.Buffer{})
+	if code != 0 {
+		t.Fatalf("run init discord exit = %d, want 0", code)
+	}
+	cfg, err := agent.LoadConfig(root)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.Platform != "discord" || cfg.Discord.ChannelID != "c1" {
+		t.Fatalf("config = %#v", cfg)
+	}
+}
+
+func TestRunDoctorCommandChecksConfig(t *testing.T) {
+	root := filepath.Join(t.TempDir(), ".channel-agent")
+	t.Setenv("DISCORD_TEST_TOKEN", "tok")
+	cfg, err := agent.DefaultConfig("discord")
+	if err != nil {
+		t.Fatalf("DefaultConfig: %v", err)
+	}
+	cfg.Discord.TokenEnv = "DISCORD_TEST_TOKEN"
+	cfg.Discord.ChannelID = "c1"
+	if err := agent.SaveConfig(root, cfg); err != nil {
+		t.Fatalf("SaveConfig: %v", err)
+	}
+
+	var stdout bytes.Buffer
+	code := run([]string{"doctor", "--root", root}, &stdout, &bytes.Buffer{})
+	if code != 0 {
+		t.Fatalf("run doctor exit = %d, want 0", code)
+	}
+	if stdout.String() != "doctor=ok\n" {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
+}
+
+func TestRunServeOnceCommandUsesConfig(t *testing.T) {
+	root := filepath.Join(t.TempDir(), ".channel-agent")
+	cfg, err := agent.DefaultConfig("mock")
+	if err != nil {
+		t.Fatalf("DefaultConfig: %v", err)
+	}
+	cfg.Mock.SourcePath = filepath.Join(root, "mock", "source_messages.json")
+	if err := agent.Init(root); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := agent.AtomicWriteJSON(cfg.Mock.SourcePath, []agent.SourceMessage{}); err != nil {
+		t.Fatalf("write mock source: %v", err)
+	}
+	if err := agent.SaveConfig(root, cfg); err != nil {
+		t.Fatalf("SaveConfig: %v", err)
+	}
+
+	var stdout bytes.Buffer
+	code := run([]string{"serve", "--root", root, "--once"}, &stdout, &bytes.Buffer{})
+	if code != 0 {
+		t.Fatalf("run serve once exit = %d, want 0", code)
+	}
+	if stdout.String() != "created=0 processed=false sent=0\n" {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
+}
+
 func TestRunWatcherCommand(t *testing.T) {
 	root := filepath.Join(t.TempDir(), ".channel-agent")
 	sourcePath := filepath.Join(root, "mock", "source_messages.json")

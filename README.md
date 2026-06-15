@@ -17,6 +17,13 @@ Create runtime directories:
 go run ./cmd/claude-cron init --root .channel-agent
 ```
 
+Create runtime directories and config in one command:
+
+```bash
+go run ./cmd/claude-cron init discord --root .channel-agent --discord-channel-id 1234567890
+go run ./cmd/claude-cron init telegram --root .channel-agent --telegram-chat-id 1234567890
+```
+
 Create `.channel-agent/mock/source_messages.json`:
 
 ```json
@@ -59,6 +66,12 @@ go run ./cmd/claude-cron watcher \
   --telegram-chat-id 1234567890
 ```
 
+Check config before serving:
+
+```bash
+go run ./cmd/claude-cron doctor --root .channel-agent
+```
+
 Run a Claude Code interactive session in tmux:
 
 ```bash
@@ -71,6 +84,20 @@ In another shell, inject one pending job:
 ```bash
 go run ./cmd/claude-cron claude-worker --root .channel-agent --tmux-session channel-agent --timeout 120s
 ```
+
+Or run the whole watcher -> Claude -> sender loop:
+
+```bash
+go run ./cmd/claude-cron serve --root .channel-agent
+```
+
+For a single cycle:
+
+```bash
+go run ./cmd/claude-cron serve --root .channel-agent --once
+```
+
+`serve` auto-starts the configured tmux session with `claude` when needed. First-time Claude Code login may still require opening the session manually once.
 
 Send pending outputs to stdout:
 

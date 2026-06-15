@@ -21,17 +21,35 @@ func (s StdoutSender) Send(_ context.Context, output OutputJob) error {
 }
 
 type TmuxInjector struct {
-	Session string
-	Root    string
+	Session   string
+	Root      string
+	AutoStart bool
 }
 
 func (i TmuxInjector) Inject(ctx context.Context, job InputJob, outputPath string) error {
 	if strings.TrimSpace(i.Session) == "" {
 		return fmt.Errorf("tmux session is required")
 	}
+	if err := i.ensureSession(ctx); err != nil {
+		return err
+	}
 	prompt := BuildClaudePrompt(i.Root, job, outputPath)
-	cmd := exec.CommandContext(ctx, "tmux", "send-keys", "-t", i.Session, prompt, "Enter")
-	return cmd.Run()
+	return runExternalCommand(ctx, "tmux", "send-keys", "-t", i.Session, prompt, "Enter")
+}
+
+var runExternalCommand = func(ctx context.Context, name string, args ...string) error {
+	return exec.CommandContext(ctx, name, args...).Run()
+}
+
+func (i TmuxInjector) ensureSession(ctx context.Context) error {
+	err := runExternalCommand(ctx, "tmux", "has-session", "-t", i.Session)
+	if err == nil {
+		return nil
+	}
+	if !i.AutoStart {
+		return err
+	}
+	return runExternalCommand(ctx, "tmux", "new-session", "-d", "-s", i.Session, "claude")
 }
 
 func BuildClaudePrompt(root string, job InputJob, outputPath string) string {

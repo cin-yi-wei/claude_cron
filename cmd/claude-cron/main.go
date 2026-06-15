@@ -17,7 +17,7 @@ func main() {
 
 func run(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "usage: claude-cron <init|watcher|claude-worker|sender>")
+		fmt.Fprintln(stderr, "usage: claude-cron <init|watcher|claude-worker|sender|serve|doctor>")
 		return 2
 	}
 
@@ -26,14 +26,100 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fs := flag.NewFlagSet("init", flag.ContinueOnError)
 		fs.SetOutput(stderr)
 		root := fs.String("root", ".channel-agent", "runtime root")
-		if err := fs.Parse(args[1:]); err != nil {
+		platform, initArgs := takePlatformArg(args[1:])
+		discordChannelID := fs.String("discord-channel-id", "", "Discord channel ID")
+		telegramChatID := fs.String("telegram-chat-id", "", "Telegram chat ID")
+		if err := fs.Parse(initArgs); err != nil {
 			return 2
 		}
 		if err := agent.Init(*root); err != nil {
 			fmt.Fprintln(stderr, err)
 			return 1
 		}
+		if platform != "" {
+			cfg, err := agent.DefaultConfig(platform)
+			if err != nil {
+				fmt.Fprintln(stderr, err)
+				return 2
+			}
+			cfg.Discord.ChannelID = *discordChannelID
+			cfg.Telegram.ChatID = *telegramChatID
+			if err := agent.SaveConfig(*root, cfg); err != nil {
+				fmt.Fprintln(stderr, err)
+				return 1
+			}
+		}
 		return 0
+	case "doctor":
+		fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
+		fs.SetOutput(stderr)
+		root := fs.String("root", ".channel-agent", "runtime root")
+		if err := fs.Parse(args[1:]); err != nil {
+			return 2
+		}
+		cfg, err := agent.LoadConfig(*root)
+		if err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		if err := validateConfig(cfg); err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		fmt.Fprintln(stdout, "doctor=ok")
+		return 0
+	case "serve":
+		fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+		fs.SetOutput(stderr)
+		root := fs.String("root", ".channel-agent", "runtime root")
+		once := fs.Bool("once", false, "run one poll/process/send cycle")
+		if err := fs.Parse(args[1:]); err != nil {
+			return 2
+		}
+		cfg, err := agent.LoadConfig(*root)
+		if err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		if err := validateConfigForServe(cfg); err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		interval, err := time.ParseDuration(cfg.PollInterval)
+		if err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		if interval <= 0 {
+			interval = 10 * time.Second
+		}
+		timeout, err := time.ParseDuration(cfg.Claude.Timeout)
+		if err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		for {
+			source, err := buildSourceFromConfig(cfg)
+			if err != nil {
+				fmt.Fprintln(stderr, err)
+				return 1
+			}
+			sender, err := buildSenderFromConfig(cfg, stdout)
+			if err != nil {
+				fmt.Fprintln(stderr, err)
+				return 1
+			}
+			result, err := agent.RunServeOnce(context.Background(), *root, source, agent.TmuxInjector{Session: cfg.Claude.TmuxSession, Root: *root, AutoStart: cfg.Claude.AutoStart}, sender, timeout)
+			if err != nil {
+				fmt.Fprintln(stderr, err)
+				return 1
+			}
+			fmt.Fprintf(stdout, "created=%d processed=%t sent=%d\n", result.Created, result.Processed, result.Sent)
+			if *once {
+				return 0
+			}
+			time.Sleep(interval)
+		}
 	case "watcher":
 		fs := flag.NewFlagSet("watcher", flag.ContinueOnError)
 		fs.SetOutput(stderr)
@@ -77,7 +163,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		if err := fs.Parse(args[1:]); err != nil {
 			return 2
 		}
-		processed, err := agent.RunWorkerOnce(context.Background(), *root, agent.TmuxInjector{Session: *session, Root: *root}, *timeout)
+		processed, err := agent.RunWorkerOnce(context.Background(), *root, agent.TmuxInjector{Session: *session, Root: *root, AutoStart: true}, *timeout)
 		if err != nil {
 			fmt.Fprintln(stderr, err)
 			return 1
@@ -120,6 +206,120 @@ func run(args []string, stdout, stderr io.Writer) int {
 	default:
 		fmt.Fprintf(stderr, "unknown command %q\n", args[0])
 		return 2
+	}
+}
+
+func takePlatformArg(args []string) (string, []string) {
+	if len(args) == 0 || len(args[0]) == 0 || args[0][0] == '-' {
+		return "", args
+	}
+	return args[0], args[1:]
+}
+
+func validateConfig(cfg agent.Config) error {
+	switch cfg.Platform {
+	case "mock":
+		if cfg.Mock.SourcePath == "" {
+			return fmt.Errorf("mock source_path is required")
+		}
+	case "discord":
+		if cfg.Discord.ChannelID == "" {
+			return fmt.Errorf("discord channel_id is required")
+		}
+		if cfg.Discord.TokenEnv == "" || os.Getenv(cfg.Discord.TokenEnv) == "" {
+			return fmt.Errorf("discord token env %q is not set", cfg.Discord.TokenEnv)
+		}
+	case "telegram":
+		if cfg.Telegram.ChatID == "" {
+			return fmt.Errorf("telegram chat_id is required")
+		}
+		if cfg.Telegram.TokenEnv == "" || os.Getenv(cfg.Telegram.TokenEnv) == "" {
+			return fmt.Errorf("telegram token env %q is not set", cfg.Telegram.TokenEnv)
+		}
+	default:
+		return fmt.Errorf("unsupported platform %q", cfg.Platform)
+	}
+	if cfg.Claude.TmuxSession == "" {
+		return fmt.Errorf("claude tmux_session is required")
+	}
+	return nil
+}
+
+func validateConfigForServe(cfg agent.Config) error {
+	switch cfg.Platform {
+	case "mock":
+		if cfg.Mock.SourcePath == "" {
+			return fmt.Errorf("mock source_path is required")
+		}
+	case "discord":
+		if cfg.Discord.ChannelID == "" {
+			return fmt.Errorf("discord channel_id is required")
+		}
+		if cfg.Discord.TokenEnv == "" || os.Getenv(cfg.Discord.TokenEnv) == "" {
+			return fmt.Errorf("discord token env %q is not set", cfg.Discord.TokenEnv)
+		}
+	case "telegram":
+		if cfg.Telegram.ChatID == "" {
+			return fmt.Errorf("telegram chat_id is required")
+		}
+		if cfg.Telegram.TokenEnv == "" || os.Getenv(cfg.Telegram.TokenEnv) == "" {
+			return fmt.Errorf("telegram token env %q is not set", cfg.Telegram.TokenEnv)
+		}
+	default:
+		return fmt.Errorf("unsupported platform %q", cfg.Platform)
+	}
+	if cfg.Claude.TmuxSession == "" {
+		return fmt.Errorf("claude tmux_session is required")
+	}
+	if cfg.Claude.Timeout == "" {
+		return fmt.Errorf("claude timeout is required")
+	}
+	if cfg.PollInterval == "" {
+		return fmt.Errorf("poll_interval is required")
+	}
+	return nil
+}
+
+func buildSourceFromConfig(cfg agent.Config) (agent.MessageSource, error) {
+	switch cfg.Platform {
+	case "mock":
+		return agent.MockFileSource{Path: cfg.Mock.SourcePath}, nil
+	case "discord":
+		return agent.DiscordSource{
+			BaseURL:   cfg.Discord.BaseURL,
+			Token:     os.Getenv(cfg.Discord.TokenEnv),
+			ChannelID: cfg.Discord.ChannelID,
+			Limit:     50,
+		}, nil
+	case "telegram":
+		return agent.TelegramSource{
+			BaseURL: cfg.Telegram.BaseURL,
+			Token:   os.Getenv(cfg.Telegram.TokenEnv),
+			ChatID:  cfg.Telegram.ChatID,
+		}, nil
+	default:
+		return nil, fmt.Errorf("unsupported platform %q", cfg.Platform)
+	}
+}
+
+func buildSenderFromConfig(cfg agent.Config, stdout io.Writer) (agent.Sender, error) {
+	switch cfg.Platform {
+	case "mock":
+		return agent.StdoutSender{Writer: stdout}, nil
+	case "discord":
+		return agent.DiscordSender{
+			BaseURL:   cfg.Discord.BaseURL,
+			Token:     os.Getenv(cfg.Discord.TokenEnv),
+			ChannelID: cfg.Discord.ChannelID,
+		}, nil
+	case "telegram":
+		return agent.TelegramSender{
+			BaseURL: cfg.Telegram.BaseURL,
+			Token:   os.Getenv(cfg.Telegram.TokenEnv),
+			ChatID:  cfg.Telegram.ChatID,
+		}, nil
+	default:
+		return nil, fmt.Errorf("unsupported platform %q", cfg.Platform)
 	}
 }
 
