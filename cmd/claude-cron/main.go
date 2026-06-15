@@ -11,6 +11,8 @@ import (
 	agent "claude_cron/internal/channelagent"
 )
 
+var version = "dev"
+
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
 }
@@ -22,6 +24,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 
 	switch args[0] {
+	case "version":
+		fmt.Fprintf(stdout, "claude-cron %s\n", version)
+		return 0
 	case "init":
 		fs := flag.NewFlagSet("init", flag.ContinueOnError)
 		fs.SetOutput(stderr)

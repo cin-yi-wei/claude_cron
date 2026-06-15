@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	agent "claude_cron/internal/channelagent"
@@ -20,6 +21,17 @@ func TestRunInitCommand(t *testing.T) {
 	}
 
 	assertExists(t, filepath.Join(root, "inbox", "pending"))
+}
+
+func TestRunVersionCommand(t *testing.T) {
+	var stdout bytes.Buffer
+	code := run([]string{"version"}, &stdout, &bytes.Buffer{})
+	if code != 0 {
+		t.Fatalf("run version exit = %d, want 0", code)
+	}
+	if !strings.Contains(stdout.String(), "claude-cron ") {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
 }
 
 func TestRunInitDiscordCommandWritesConfig(t *testing.T) {

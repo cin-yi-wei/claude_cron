@@ -1,27 +1,107 @@
 # Claude Cron
 
-Local Go CLI for queueing channel messages, asking a long-running Claude Code interactive session to generate replies, and sending verified replies through an adapter.
+Claude Cron watches Discord or Telegram messages, injects each message into a long-running Claude Code tmux session, waits for Claude to write a reply file, then sends the verified reply back.
 
-## Build
+It is built as a single CLI binary. Users do not need Go unless they want to build from source.
 
-```bash
-go test ./...
-go build ./cmd/claude-cron
+## Install From GitHub Release
+
+Pick the binary for your platform from the latest GitHub release:
+
+```text
+claude-cron-linux-amd64
+claude-cron-linux-arm64
+claude-cron-darwin-amd64
+claude-cron-darwin-arm64
+claude-cron-windows-amd64.exe
 ```
 
-## Local Mock Flow
-
-Create runtime directories:
+Linux:
 
 ```bash
-go run ./cmd/claude-cron init --root .channel-agent
+curl -L -o claude-cron https://github.com/cin-yi-wei/claude_cron/releases/latest/download/claude-cron-linux-amd64
+chmod +x claude-cron
+sudo mv claude-cron /usr/local/bin/
+claude-cron version
 ```
 
-Create runtime directories and config in one command:
+macOS Apple Silicon:
 
 ```bash
-go run ./cmd/claude-cron init discord --root .channel-agent --discord-channel-id 1234567890
-go run ./cmd/claude-cron init telegram --root .channel-agent --telegram-chat-id 1234567890
+curl -L -o claude-cron https://github.com/cin-yi-wei/claude_cron/releases/latest/download/claude-cron-darwin-arm64
+chmod +x claude-cron
+sudo mv claude-cron /usr/local/bin/
+claude-cron version
+```
+
+macOS Intel:
+
+```bash
+curl -L -o claude-cron https://github.com/cin-yi-wei/claude_cron/releases/latest/download/claude-cron-darwin-amd64
+chmod +x claude-cron
+sudo mv claude-cron /usr/local/bin/
+claude-cron version
+```
+
+Windows PowerShell:
+
+```powershell
+Invoke-WebRequest -Uri "https://github.com/cin-yi-wei/claude_cron/releases/latest/download/claude-cron-windows-amd64.exe" -OutFile "$env:USERPROFILE\claude-cron.exe"
+& "$env:USERPROFILE\claude-cron.exe" version
+```
+
+## Requirements
+
+- Claude Code CLI installed and logged in.
+- `tmux` installed on Linux/macOS.
+- A Discord bot token or Telegram bot token.
+
+First-time Claude Code login may still require opening Claude manually once:
+
+```bash
+claude
+```
+
+After that, `claude-cron serve` can auto-start the configured tmux session.
+
+## Quick Start: Discord
+
+```bash
+export DISCORD_BOT_TOKEN=...
+
+claude-cron init discord \
+  --root .channel-agent \
+  --discord-channel-id 1234567890
+
+claude-cron doctor --root .channel-agent
+claude-cron serve --root .channel-agent
+```
+
+## Quick Start: Telegram
+
+```bash
+export TELEGRAM_BOT_TOKEN=...
+
+claude-cron init telegram \
+  --root .channel-agent \
+  --telegram-chat-id 1234567890
+
+claude-cron doctor --root .channel-agent
+claude-cron serve --root .channel-agent
+```
+
+## Useful Commands
+
+Run one cycle:
+
+```bash
+claude-cron serve --root .channel-agent --once
+```
+
+Use mock input:
+
+```bash
+claude-cron init mock --root .channel-agent
 ```
 
 Create `.channel-agent/mock/source_messages.json`:
@@ -40,90 +120,59 @@ Create `.channel-agent/mock/source_messages.json`:
 ]
 ```
 
-Create pending jobs:
+Then:
 
 ```bash
-go run ./cmd/claude-cron watcher --root .channel-agent --source .channel-agent/mock/source_messages.json
+claude-cron serve --root .channel-agent --once
 ```
 
-Discord watcher:
+Advanced manual commands remain available:
 
 ```bash
-export DISCORD_BOT_TOKEN=...
-go run ./cmd/claude-cron watcher \
-  --root .channel-agent \
-  --source-adapter discord \
-  --discord-channel-id 1234567890
+claude-cron watcher --root .channel-agent --source-adapter discord --discord-channel-id 1234567890
+claude-cron claude-worker --root .channel-agent --tmux-session claude-cron --timeout 120s
+claude-cron sender --root .channel-agent --adapter discord --discord-channel-id 1234567890
 ```
 
-Telegram watcher:
+## Build From Source
+
+Install Go, then:
 
 ```bash
-export TELEGRAM_BOT_TOKEN=...
-go run ./cmd/claude-cron watcher \
-  --root .channel-agent \
-  --source-adapter telegram \
-  --telegram-chat-id 1234567890
+make test
+make build
+./bin/claude-cron version
 ```
 
-Check config before serving:
+Install into your Go bin:
 
 ```bash
-go run ./cmd/claude-cron doctor --root .channel-agent
+make install
 ```
 
-Run a Claude Code interactive session in tmux:
+Build release binaries for Linux, macOS, and Windows:
 
 ```bash
-tmux new -s channel-agent
-claude
+make dist
+ls dist/
 ```
 
-In another shell, inject one pending job:
+## Release
+
+Create and push a tag:
 
 ```bash
-go run ./cmd/claude-cron claude-worker --root .channel-agent --tmux-session channel-agent --timeout 120s
+git tag v0.1.0
+git push origin v0.1.0
 ```
 
-Or run the whole watcher -> Claude -> sender loop:
+GitHub Actions builds release assets for:
 
-```bash
-go run ./cmd/claude-cron serve --root .channel-agent
-```
-
-For a single cycle:
-
-```bash
-go run ./cmd/claude-cron serve --root .channel-agent --once
-```
-
-`serve` auto-starts the configured tmux session with `claude` when needed. First-time Claude Code login may still require opening the session manually once.
-
-Send pending outputs to stdout:
-
-```bash
-go run ./cmd/claude-cron sender --root .channel-agent --adapter stdout
-```
-
-Send pending outputs to Discord:
-
-```bash
-export DISCORD_BOT_TOKEN=...
-go run ./cmd/claude-cron sender \
-  --root .channel-agent \
-  --adapter discord \
-  --discord-channel-id 1234567890
-```
-
-Send pending outputs to Telegram:
-
-```bash
-export TELEGRAM_BOT_TOKEN=...
-go run ./cmd/claude-cron sender \
-  --root .channel-agent \
-  --adapter telegram \
-  --telegram-chat-id 1234567890
-```
+- Linux amd64
+- Linux arm64
+- macOS amd64
+- macOS arm64
+- Windows amd64
 
 ## Safety Rules
 
