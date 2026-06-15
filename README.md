@@ -1,0 +1,67 @@
+# Claude Cron
+
+Local Go CLI for queueing channel messages, asking a long-running Claude Code interactive session to generate replies, and sending verified replies through an adapter.
+
+## Build
+
+```bash
+go test ./...
+go build ./cmd/claude-cron
+```
+
+## Local Mock Flow
+
+Create runtime directories:
+
+```bash
+go run ./cmd/claude-cron init --root .channel-agent
+```
+
+Create `.channel-agent/mock/source_messages.json`:
+
+```json
+[
+  {
+    "platform": "mock",
+    "channel_id": "local",
+    "message_id": "m1",
+    "author_id": "user",
+    "created_at": "2026-06-16T01:30:12+08:00",
+    "content": "hello",
+    "attachments": []
+  }
+]
+```
+
+Create pending jobs:
+
+```bash
+go run ./cmd/claude-cron watcher --root .channel-agent --source .channel-agent/mock/source_messages.json
+```
+
+Run a Claude Code interactive session in tmux:
+
+```bash
+tmux new -s channel-agent
+claude
+```
+
+In another shell, inject one pending job:
+
+```bash
+go run ./cmd/claude-cron claude-worker --root .channel-agent --tmux-session channel-agent --timeout 120s
+```
+
+Send pending outputs to stdout:
+
+```bash
+go run ./cmd/claude-cron sender --root .channel-agent --adapter stdout
+```
+
+## Safety Rules
+
+- `watcher` owns `inbox/pending` and `state/seen_message_ids.json`.
+- Claude Code only reads `.channel-agent/current_job.json` and writes `outbox/pending/<job_id>.json`.
+- `claude-worker` validates `job_id`, `request_id`, and `input_hash` before marking input jobs done.
+- `sender` records output hashes only after successful sends.
+- `send=false` outputs are marked handled without calling the sender adapter.
