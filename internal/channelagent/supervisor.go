@@ -20,24 +20,13 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 		root = abs
 	}
 	token := os.Getenv(cfg.Discord.TokenEnv)
-	admin := DiscordAdmin{BaseURL: cfg.Discord.BaseURL, Token: token}
 
 	reg, err := LoadRegistry(root)
 	if err != nil {
 		return err
 	}
 
-	deps := ControlDeps{
-		Root:           root,
-		GuildID:        cfg.Discord.GuildID,
-		CreateChannel:  admin.CreateChannel,
-		DeleteChannel:  admin.DeleteChannel,
-		EnsureWorktree: EnsureWorktree,
-		RemoveWorktree: RemoveWorktree,
-		StartSession:   StartTmuxClaude,
-		StopSession:    StopTmuxSession,
-		InitRoot:       Init,
-	}
+	deps := BuildControlDeps(root, cfg)
 
 	controlSource := DiscordSource{BaseURL: cfg.Discord.BaseURL, Token: token, ChannelID: cfg.Discord.ChannelID, Limit: 50}
 	controlSender := DiscordSender{BaseURL: cfg.Discord.BaseURL, Token: token, ChannelID: cfg.Discord.ChannelID}

@@ -207,6 +207,25 @@ name 只能用小寫字母、數字、減號。回覆使用者時直接用一般
 		workspace, root, root, root, root)
 }
 
+// BuildControlDeps assembles a ControlDeps wired to the real Discord/worktree/
+// tmux implementations. Shared by the supervisor and the management CLI so
+// /bind and `claude-cron bind` behave identically.
+func BuildControlDeps(root string, cfg Config) ControlDeps {
+	token := os.Getenv(cfg.Discord.TokenEnv)
+	admin := DiscordAdmin{BaseURL: cfg.Discord.BaseURL, Token: token}
+	return ControlDeps{
+		Root:           root,
+		GuildID:        cfg.Discord.GuildID,
+		CreateChannel:  admin.CreateChannel,
+		DeleteChannel:  admin.DeleteChannel,
+		EnsureWorktree: EnsureWorktree,
+		RemoveWorktree: RemoveWorktree,
+		StartSession:   StartTmuxClaude,
+		StopSession:    StopTmuxSession,
+		InitRoot:       Init,
+	}
+}
+
 // RunControlOnce polls the control channel, executes any new commands, replies,
 // persists the registry when it changed, and records processed message IDs so
 // they are not handled twice. Dedup reuses the watcher's seen-state pattern

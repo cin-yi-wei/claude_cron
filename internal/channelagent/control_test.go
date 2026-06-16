@@ -171,6 +171,22 @@ func TestControlSystemPromptMentionsCommands(t *testing.T) {
 	}
 }
 
+func TestBuildControlDepsWiresConfig(t *testing.T) {
+	cfg := Config{}
+	cfg.Discord.GuildID = "g1"
+	cfg.Discord.TokenEnv = "DISCORD_BOT_TOKEN"
+	deps := BuildControlDeps("/abs/root", cfg)
+	if deps.Root != "/abs/root" {
+		t.Fatalf("Root = %q", deps.Root)
+	}
+	if deps.GuildID != "g1" {
+		t.Fatalf("GuildID = %q", deps.GuildID)
+	}
+	if deps.CreateChannel == nil || deps.EnsureWorktree == nil || deps.StartSession == nil || deps.InitRoot == nil {
+		t.Fatal("control deps function fields must be non-nil")
+	}
+}
+
 func TestRunControlOnceRetriesFailedCommand(t *testing.T) {
 	root := filepath.Join(t.TempDir(), ".channel-agent")
 	if err := Init(root); err != nil {
