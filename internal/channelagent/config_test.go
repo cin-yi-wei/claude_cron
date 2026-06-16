@@ -21,6 +21,25 @@ func TestDefaultConfigForDiscord(t *testing.T) {
 	}
 }
 
+func TestDiscordConfigHasGuildID(t *testing.T) {
+	root := t.TempDir()
+	cfg, err := DefaultConfig("discord")
+	if err != nil {
+		t.Fatalf("DefaultConfig: %v", err)
+	}
+	cfg.Discord.GuildID = "g123"
+	if err := SaveConfig(root, cfg); err != nil {
+		t.Fatalf("SaveConfig: %v", err)
+	}
+	got, err := LoadConfig(root)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if got.Discord.GuildID != "g123" {
+		t.Fatalf("GuildID = %q, want g123", got.Discord.GuildID)
+	}
+}
+
 func TestSaveAndLoadConfig(t *testing.T) {
 	root := filepath.Join(t.TempDir(), ".channel-agent")
 	cfg, err := DefaultConfig("telegram")
