@@ -135,6 +135,81 @@ func (s DiscordSender) Send(ctx context.Context, output OutputJob) error {
 	return checkHTTPResponse(resp)
 }
 
+type DiscordAdmin struct {
+	BaseURL string
+	Token   string
+	Client  *http.Client
+}
+
+func (a DiscordAdmin) client() *http.Client {
+	if a.Client != nil {
+		return a.Client
+	}
+	return http.DefaultClient
+}
+
+func (a DiscordAdmin) baseURL() string {
+	if a.BaseURL != "" {
+		return a.BaseURL
+	}
+	return defaultDiscordBaseURL
+}
+
+// CreateChannel creates a text channel (type 0) in guildID and returns its id.
+func (a DiscordAdmin) CreateChannel(ctx context.Context, guildID, name string) (string, error) {
+	if a.Token == "" {
+		return "", fmt.Errorf("discord token is required")
+	}
+	if guildID == "" {
+		return "", fmt.Errorf("discord guild id is required")
+	}
+	body, err := json.Marshal(map[string]any{"name": name, "type": 0})
+	if err != nil {
+		return "", err
+	}
+	endpoint := a.baseURL() + "/guilds/" + url.PathEscape(guildID) + "/channels"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bot "+a.Token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := a.client().Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if err := checkHTTPResponse(resp); err != nil {
+		return "", err
+	}
+	var out struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", err
+	}
+	return out.ID, nil
+}
+
+// DeleteChannel deletes a channel by id.
+func (a DiscordAdmin) DeleteChannel(ctx context.Context, channelID string) error {
+	if a.Token == "" {
+		return fmt.Errorf("discord token is required")
+	}
+	endpoint := a.baseURL() + "/channels/" + url.PathEscape(channelID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, endpoint, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bot "+a.Token)
+	resp, err := a.client().Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	return checkHTTPResponse(resp)
+}
+
 type discordMessage struct {
 	ID          string              `json:"id"`
 	Content     string              `json:"content"`

@@ -113,3 +113,31 @@ func TestDiscordSenderPostsMessage(t *testing.T) {
 		t.Fatalf("content = %q, want reply", gotBody["content"])
 	}
 }
+
+func TestDiscordAdminCreateChannel(t *testing.T) {
+	var gotPath, gotName string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		gotName, _ = body["name"].(string)
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"id":"chan999"}`))
+	}))
+	defer server.Close()
+
+	id, err := DiscordAdmin{BaseURL: server.URL + "/api/v10", Token: "tok"}.
+		CreateChannel(context.Background(), "guild1", "proj-a")
+	if err != nil {
+		t.Fatalf("CreateChannel: %v", err)
+	}
+	if id != "chan999" {
+		t.Fatalf("id = %q, want chan999", id)
+	}
+	if gotPath != "/api/v10/guilds/guild1/channels" {
+		t.Fatalf("path = %q", gotPath)
+	}
+	if gotName != "proj-a" {
+		t.Fatalf("name = %q, want proj-a", gotName)
+	}
+}
