@@ -80,6 +80,9 @@ func handleBind(ctx context.Context, deps ControlDeps, reg *Registry, cmd Comman
 	if !ValidName(name) {
 		return fmt.Sprintf("name %q 不合法 (只能用 a-z 0-9 -)", name), false, nil
 	}
+	if name == "control" {
+		return `name "control" 為保留字 (控管助理專用)，請換別的名稱`, false, nil
+	}
 	if _, ok := reg.Get(name); ok {
 		return fmt.Sprintf("binding %q 已存在", name), false, nil
 	}

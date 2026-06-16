@@ -118,6 +118,28 @@ func TestHandleBindThenUnbind(t *testing.T) {
 	}
 }
 
+func TestHandleBindRejectsReservedControlName(t *testing.T) {
+	root := filepath.Join(t.TempDir(), ".channel-agent")
+	_ = Init(root)
+	var actions []string
+	deps := newTestDeps(root, &actions)
+	reg := Registry{}
+	cmd, _ := ParseCommand("/bind control " + t.TempDir() + " dev")
+	reply, changed, err := HandleCommand(context.Background(), deps, &reg, cmd)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if changed {
+		t.Fatal("reserved name must not change registry")
+	}
+	if !strings.Contains(reply, "control") {
+		t.Fatalf("reply should explain reserved name, got %q", reply)
+	}
+	if len(actions) != 0 {
+		t.Fatalf("no provisioning should happen, got %#v", actions)
+	}
+}
+
 func TestHandleBindRejectsBadName(t *testing.T) {
 	root := filepath.Join(t.TempDir(), ".channel-agent")
 	_ = Init(root)
