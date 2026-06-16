@@ -12,7 +12,7 @@ import (
 // tmux-driven session cannot answer). Scoped to the tools the agent prompt uses.
 const agentSettings = `{
   "permissions": {
-    "allow": ["Read", "Write", "Edit", "Bash(mv:*)", "Bash(ls:*)", "Bash(rtk:*)", "Bash(git:*)"]
+    "allow": ["Read", "Write", "Edit", "Bash"]
   }
 }
 `

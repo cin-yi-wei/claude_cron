@@ -62,7 +62,7 @@ func TestEnsureAgentSettingsWritesAllowlist(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read settings: %v", err)
 	}
-	if !strings.Contains(string(data), `"Write"`) || !strings.Contains(string(data), `"Bash(mv:*)"`) {
+	if !strings.Contains(string(data), `"Write"`) || !strings.Contains(string(data), `"Bash"`) {
 		t.Fatalf("settings missing expected allowlist entries: %s", data)
 	}
 
