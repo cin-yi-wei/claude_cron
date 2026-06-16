@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 )
 
@@ -173,4 +174,54 @@ func countJSON(dir string) int {
 		}
 	}
 	return n
+}
+
+// RunControlOnce polls the control channel, executes any new commands, replies,
+// persists the registry when it changed, and records processed message IDs so
+// they are not handled twice. Dedup reuses the watcher's seen-state pattern
+// under a control-specific state file.
+func RunControlOnce(ctx context.Context, root string, deps ControlDeps, reg *Registry, source MessageSource, sender Sender) error {
+	if err := Init(root); err != nil {
+		return err
+	}
+	messages, err := source.Fetch(ctx)
+	if err != nil {
+		return err
+	}
+	sort.SliceStable(messages, func(i, j int) bool { return messages[i].CreatedAt < messages[j].CreatedAt })
+
+	statePath := pathIn(root, "state", "control_seen.json")
+	state, err := readSeenState(statePath)
+	if err != nil {
+		return err
+	}
+
+	changed := false
+	for _, m := range messages {
+		key := seenKey(m)
+		if state.MessageIDs[key] {
+			continue
+		}
+		state.MessageIDs[key] = true
+		cmd, ok := ParseCommand(m.Content)
+		if !ok {
+			continue
+		}
+		reply, regChanged, herr := HandleCommand(ctx, deps, reg, cmd)
+		if herr != nil {
+			reply = "⚠️ " + herr.Error()
+		}
+		if regChanged {
+			changed = true
+		}
+		if reply != "" {
+			_ = sender.Send(ctx, OutputJob{Send: true, Text: reply})
+		}
+	}
+	if changed {
+		if err := SaveRegistry(root, *reg); err != nil {
+			return err
+		}
+	}
+	return AtomicWriteJSON(statePath, state)
 }
