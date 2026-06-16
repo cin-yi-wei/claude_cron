@@ -1,6 +1,11 @@
 package channelagent
 
-import "strings"
+import (
+	"context"
+	"fmt"
+	"os"
+	"strings"
+)
 
 type Command struct {
 	Name  string
@@ -29,4 +34,140 @@ func ParseCommand(content string) (Command, bool) {
 		cmd.Args = append(cmd.Args, f)
 	}
 	return cmd, true
+}
+
+type ControlDeps struct {
+	Root           string
+	GuildID        string
+	CreateChannel  func(ctx context.Context, guildID, name string) (string, error)
+	DeleteChannel  func(ctx context.Context, channelID string) error
+	EnsureWorktree func(ctx context.Context, projectDir, branch, worktree string) error
+	RemoveWorktree func(ctx context.Context, projectDir, worktree string) error
+	StartSession   func(ctx context.Context, session, cwd string) error
+	StopSession    func(ctx context.Context, session string) error
+	InitRoot       func(root string) error
+}
+
+const controlUsage = "指令: /bind <name> <project-dir> <branch> | /unbind <name> [--delete-channel] | /list | /status <name> | /help"
+
+// HandleCommand executes a parsed control command against the registry, using
+// deps for side effects. Returns a reply to post to the control channel and
+// whether the registry changed (caller persists it).
+func HandleCommand(ctx context.Context, deps ControlDeps, reg *Registry, cmd Command) (string, bool, error) {
+	switch cmd.Name {
+	case "bind":
+		return handleBind(ctx, deps, reg, cmd)
+	case "unbind":
+		return handleUnbind(ctx, deps, reg, cmd)
+	case "list":
+		return handleList(reg), false, nil
+	case "status":
+		return handleStatus(reg, cmd), false, nil
+	case "help":
+		return controlUsage, false, nil
+	default:
+		return "未知指令。" + controlUsage, false, nil
+	}
+}
+
+func handleBind(ctx context.Context, deps ControlDeps, reg *Registry, cmd Command) (string, bool, error) {
+	if len(cmd.Args) != 3 {
+		return "用法: /bind <name> <project-dir> <branch>", false, nil
+	}
+	name, projectDir, branch := cmd.Args[0], cmd.Args[1], cmd.Args[2]
+	if !ValidName(name) {
+		return fmt.Sprintf("name %q 不合法 (只能用 a-z 0-9 -)", name), false, nil
+	}
+	if _, ok := reg.Get(name); ok {
+		return fmt.Sprintf("binding %q 已存在", name), false, nil
+	}
+	if _, err := os.Stat(projectDir); err != nil {
+		return fmt.Sprintf("project-dir %q 不存在", projectDir), false, nil
+	}
+
+	b := BindingDefaults(deps.Root, name, projectDir, branch)
+
+	channelID, err := deps.CreateChannel(ctx, deps.GuildID, name)
+	if err != nil {
+		return "", false, fmt.Errorf("建頻道失敗: %w", err)
+	}
+	b.ChannelID = channelID
+
+	if err := deps.EnsureWorktree(ctx, projectDir, branch, b.Worktree); err != nil {
+		_ = deps.DeleteChannel(ctx, channelID)
+		return "", false, fmt.Errorf("建 worktree 失敗: %w", err)
+	}
+	if err := deps.InitRoot(b.Root); err != nil {
+		_ = deps.RemoveWorktree(ctx, projectDir, b.Worktree)
+		_ = deps.DeleteChannel(ctx, channelID)
+		return "", false, fmt.Errorf("init root 失敗: %w", err)
+	}
+	if err := deps.StartSession(ctx, b.TmuxSession, b.Worktree); err != nil {
+		_ = deps.RemoveWorktree(ctx, projectDir, b.Worktree)
+		_ = deps.DeleteChannel(ctx, channelID)
+		return "", false, fmt.Errorf("啟 session 失敗: %w", err)
+	}
+
+	if err := reg.Add(b); err != nil {
+		return "", false, err
+	}
+	return fmt.Sprintf("✅ 綁定 %s → channel %s (branch %s, session %s)", name, channelID, branch, b.TmuxSession), true, nil
+}
+
+func handleUnbind(ctx context.Context, deps ControlDeps, reg *Registry, cmd Command) (string, bool, error) {
+	if len(cmd.Args) != 1 {
+		return "用法: /unbind <name> [--delete-channel]", false, nil
+	}
+	name := cmd.Args[0]
+	b, ok := reg.Get(name)
+	if !ok {
+		return fmt.Sprintf("找不到 binding %q", name), false, nil
+	}
+	_ = deps.StopSession(ctx, b.TmuxSession)
+	_ = deps.RemoveWorktree(ctx, b.ProjectDir, b.Worktree)
+	if cmd.Flags["delete-channel"] {
+		_ = deps.DeleteChannel(ctx, b.ChannelID)
+	}
+	_ = os.RemoveAll(b.Root)
+	reg.Remove(name)
+	return fmt.Sprintf("🗑️ 解綁 %s 完成", name), true, nil
+}
+
+func handleList(reg *Registry) string {
+	if len(reg.Bindings) == 0 {
+		return "(無綁定)"
+	}
+	var sb strings.Builder
+	for _, b := range reg.Bindings {
+		fmt.Fprintf(&sb, "• %s → channel %s | branch %s | session %s\n", b.Name, b.ChannelID, b.Branch, b.TmuxSession)
+	}
+	return strings.TrimRight(sb.String(), "\n")
+}
+
+func handleStatus(reg *Registry, cmd Command) string {
+	if len(cmd.Args) != 1 {
+		return "用法: /status <name>"
+	}
+	b, ok := reg.Get(cmd.Args[0])
+	if !ok {
+		return fmt.Sprintf("找不到 binding %q", cmd.Args[0])
+	}
+	pending := countJSON(pathIn(b.Root, "inbox", "pending"))
+	processing := countJSON(pathIn(b.Root, "inbox", "processing"))
+	failed := countJSON(pathIn(b.Root, "inbox", "failed"))
+	return fmt.Sprintf("%s: session %s | pending=%d processing=%d failed=%d", b.Name, b.TmuxSession, pending, processing, failed)
+}
+
+func countJSON(dir string) int {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".json") {
+			n++
+		}
+	}
+	return n
 }
