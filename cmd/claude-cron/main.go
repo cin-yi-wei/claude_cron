@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"time"
 
 	agent "claude_cron/internal/channelagent"
@@ -196,10 +197,76 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 		fmt.Fprintf(stdout, "sent=%d\n", sent)
 		return 0
+	case "bind", "unbind", "list":
+		return runManageCommand(args[0], args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown command %q\n", args[0])
 		return 2
 	}
+}
+
+func runManageCommand(name string, rest []string, stdout, stderr io.Writer) int {
+	root := ".channel-agent"
+	deleteChannel := false
+	var pos []string
+	for i := 0; i < len(rest); i++ {
+		switch rest[i] {
+		case "--root":
+			if i+1 >= len(rest) {
+				fmt.Fprintln(stderr, "--root requires a value")
+				return 2
+			}
+			root = rest[i+1]
+			i++
+		case "--delete-channel":
+			deleteChannel = true
+		default:
+			pos = append(pos, rest[i])
+		}
+	}
+
+	if absRoot, err := filepath.Abs(root); err == nil {
+		root = absRoot
+	}
+
+	cfg, cfgErr := agent.LoadConfig(root)
+	if cfgErr != nil && name != "list" {
+		fmt.Fprintln(stderr, cfgErr)
+		return 1
+	}
+	reg, err := agent.LoadRegistry(root)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	deps := agent.BuildControlDeps(root, cfg)
+
+	cmd := agent.Command{Name: name, Args: pos, Flags: map[string]bool{}}
+	if deleteChannel {
+		cmd.Flags["delete-channel"] = true
+	}
+
+	reply, changed, herr := agent.HandleCommand(context.Background(), deps, &reg, cmd)
+	if changed {
+		if serr := agent.SaveRegistry(root, reg); serr != nil {
+			fmt.Fprintln(stderr, serr)
+			return 1
+		}
+	}
+	if reply != "" {
+		fmt.Fprintln(stdout, reply)
+	}
+	if herr != nil {
+		fmt.Fprintln(stderr, herr)
+		return 1
+	}
+	// Validation rejections (bad name, missing dir, dup) come back as a reply
+	// with changed=false and no error. For mutating commands treat "not changed"
+	// as failure so callers/scripts see it; `list` is read-only and always 0.
+	if !changed && name != "list" {
+		return 1
+	}
+	return 0
 }
 
 func takePlatformArg(args []string) (string, []string) {
