@@ -230,7 +230,7 @@ func BuildControlDeps(root string, cfg Config) ControlDeps {
 // persists the registry when it changed, and records processed message IDs so
 // they are not handled twice. Dedup reuses the watcher's seen-state pattern
 // under a control-specific state file.
-func RunControlOnce(ctx context.Context, root string, deps ControlDeps, reg *Registry, source MessageSource, sender Sender) error {
+func RunControlOnce(ctx context.Context, root, controlRoot string, deps ControlDeps, reg *Registry, source MessageSource, sender Sender) error {
 	if err := Init(root); err != nil {
 		return err
 	}
@@ -254,6 +254,11 @@ func RunControlOnce(ctx context.Context, root string, deps ControlDeps, reg *Reg
 		}
 		cmd, ok := ParseCommand(m.Content)
 		if !ok {
+			// Free text → hand to the control AI assistant via its job queue.
+			if err := enqueueControlJob(controlRoot, m); err != nil {
+				// leave unseen so it retries next poll
+				continue
+			}
 			state.MessageIDs[key] = true
 			continue
 		}
@@ -277,4 +282,26 @@ func RunControlOnce(ctx context.Context, root string, deps ControlDeps, reg *Reg
 		}
 	}
 	return AtomicWriteJSON(statePath, state)
+}
+
+// enqueueControlJob writes a free-text control message into the control
+// binding's inbox so the cc-control assistant session processes it through the
+// normal worker/sender pipeline. Mirrors the watcher's job construction.
+func enqueueControlJob(controlRoot string, m SourceMessage) error {
+	if err := Init(controlRoot); err != nil {
+		return err
+	}
+	hash, err := HashSource(m)
+	if err != nil {
+		return err
+	}
+	job := InputJob{
+		Schema:    1,
+		JobID:     buildJobID(m, hash),
+		RequestID: buildRequestID(m, hash),
+		InputHash: hash,
+		Source:    m,
+		CreatedAt: m.CreatedAt,
+	}
+	return AtomicWriteJSON(pathIn(controlRoot, "inbox", "pending", job.JobID+".json"), job)
 }

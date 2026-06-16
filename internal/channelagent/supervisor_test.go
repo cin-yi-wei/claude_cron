@@ -32,7 +32,7 @@ func TestRunControlOnceExecutesCommandAndReplies(t *testing.T) {
 	}}}
 	sender := &capSender{}
 
-	if err := RunControlOnce(context.Background(), root, deps, &reg, src, sender); err != nil {
+	if err := RunControlOnce(context.Background(), root, ControlBinding(root).Root, deps, &reg, src, sender); err != nil {
 		t.Fatalf("RunControlOnce: %v", err)
 	}
 	if _, ok := reg.Get("proj-a"); !ok {
@@ -44,7 +44,7 @@ func TestRunControlOnceExecutesCommandAndReplies(t *testing.T) {
 
 	sender2 := &capSender{}
 	reg2, _ := LoadRegistry(root)
-	if err := RunControlOnce(context.Background(), root, deps, &reg2, src, sender2); err != nil {
+	if err := RunControlOnce(context.Background(), root, ControlBinding(root).Root, deps, &reg2, src, sender2); err != nil {
 		t.Fatalf("RunControlOnce 2: %v", err)
 	}
 	if len(sender2.sent) != 0 {

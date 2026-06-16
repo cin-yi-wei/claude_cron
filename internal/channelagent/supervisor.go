@@ -30,7 +30,7 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 
 	controlSource := DiscordSource{BaseURL: cfg.Discord.BaseURL, Token: token, ChannelID: cfg.Discord.ChannelID, Limit: 50}
 	controlSender := DiscordSender{BaseURL: cfg.Discord.BaseURL, Token: token, ChannelID: cfg.Discord.ChannelID}
-	if err := RunControlOnce(ctx, root, deps, &reg, controlSource, controlSender); err != nil {
+	if err := RunControlOnce(ctx, root, ControlBinding(root).Root, deps, &reg, controlSource, controlSender); err != nil {
 		fmt.Fprintf(stdout, "control error: %v\n", err)
 	}
 

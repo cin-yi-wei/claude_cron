@@ -3,6 +3,7 @@ package channelagent
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -202,10 +203,46 @@ func TestRunControlOnceRetriesFailedCommand(t *testing.T) {
 	reg := Registry{}
 	src := stubSource{msgs: []SourceMessage{{Platform: "discord", ChannelID: "ctl", MessageID: "m1", AuthorID: "u1", CreatedAt: "2026-06-16T00:00:00Z", Content: "/bind proj-a " + t.TempDir() + " ticket-1"}}}
 	sender := &capSender{}
-	_ = RunControlOnce(context.Background(), root, deps, &reg, src, sender)
+	_ = RunControlOnce(context.Background(), root, ControlBinding(root).Root, deps, &reg, src, sender)
 	reg2, _ := LoadRegistry(root)
-	_ = RunControlOnce(context.Background(), root, deps, &reg2, src, sender)
+	_ = RunControlOnce(context.Background(), root, ControlBinding(root).Root, deps, &reg2, src, sender)
 	if calls != 2 {
 		t.Fatalf("expected failed command retried (calls=2), got calls=%d", calls)
+	}
+}
+
+func TestRunControlOnceRoutesFreeTextToInbox(t *testing.T) {
+	root := filepath.Join(t.TempDir(), ".channel-agent")
+	if err := Init(root); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	controlRoot := ControlBinding(root).Root
+	if err := Init(controlRoot); err != nil {
+		t.Fatalf("Init controlRoot: %v", err)
+	}
+	var actions []string
+	deps := newTestDeps(root, &actions)
+	reg := Registry{}
+	src := stubSource{msgs: []SourceMessage{{
+		Platform: "discord", ChannelID: "ctl", MessageID: "m1",
+		AuthorID: "u1", CreatedAt: "2026-06-16T00:00:00Z",
+		Content: "幫我建一個 logs 資料夾",
+	}}}
+	sender := &capSender{}
+
+	if err := RunControlOnce(context.Background(), root, controlRoot, deps, &reg, src, sender); err != nil {
+		t.Fatalf("RunControlOnce: %v", err)
+	}
+	pending, _ := os.ReadDir(pathIn(controlRoot, "inbox", "pending"))
+	if len(pending) != 1 {
+		t.Fatalf("expected 1 queued control job, got %d", len(pending))
+	}
+
+	if err := RunControlOnce(context.Background(), root, controlRoot, deps, &reg, src, sender); err != nil {
+		t.Fatalf("RunControlOnce 2: %v", err)
+	}
+	pending2, _ := os.ReadDir(pathIn(controlRoot, "inbox", "pending"))
+	if len(pending2) != 1 {
+		t.Fatalf("free-text message re-enqueued, pending=%d", len(pending2))
 	}
 }
