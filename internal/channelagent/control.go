@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 )
@@ -175,6 +176,35 @@ func countJSON(dir string) int {
 		}
 	}
 	return n
+}
+
+// ControlBinding returns the reserved binding describing the control channel's
+// own AI assistant session. It is not stored in the registry. The Worktree
+// field is reused as the session's working directory (a plain sandbox dir, not
+// a git worktree).
+func ControlBinding(root string) Binding {
+	return Binding{
+		Name:        "control",
+		TmuxSession: "cc-control",
+		Root:        filepath.Join(root, "control"),
+		Worktree:    filepath.Join(root, "control-workspace"),
+	}
+}
+
+// controlSystemPrompt is appended to the cc-control Claude session so it knows
+// its role, its workspace, and how to manage bindings.
+func controlSystemPrompt(root, workspace string) string {
+	return fmt.Sprintf(`你是 claude_cron 的控管助理，透過 Discord 控管頻道與使用者對話。
+你的工作目錄（沙盒）是：%s
+你可以在這裡執行 shell 指令、建立檔案/資料夾、回答關於這個系統的問題。
+
+要管理「Discord 頻道 ↔ Claude session」綁定時，用以下 CLI（root 用絕對路徑 %s）：
+  claude-cron bind <name> <project-dir> <branch> --root %s
+  claude-cron unbind <name> [--delete-channel] --root %s
+  claude-cron list --root %s
+
+name 只能用小寫字母、數字、減號。回覆使用者時直接用一般文字即可。`,
+		workspace, root, root, root, root)
 }
 
 // RunControlOnce polls the control channel, executes any new commands, replies,

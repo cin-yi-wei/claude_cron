@@ -146,6 +146,31 @@ func containsStr(s []string, v string) bool {
 	return false
 }
 
+func TestControlBindingDerivation(t *testing.T) {
+	b := ControlBinding("/abs/root")
+	if b.Name != "control" {
+		t.Fatalf("Name = %q", b.Name)
+	}
+	if b.TmuxSession != "cc-control" {
+		t.Fatalf("TmuxSession = %q", b.TmuxSession)
+	}
+	if b.Root != "/abs/root/control" {
+		t.Fatalf("Root = %q", b.Root)
+	}
+	if b.Worktree != "/abs/root/control-workspace" {
+		t.Fatalf("Worktree (workspace) = %q", b.Worktree)
+	}
+}
+
+func TestControlSystemPromptMentionsCommands(t *testing.T) {
+	p := controlSystemPrompt("/abs/root", "/abs/root/control-workspace")
+	for _, want := range []string{"claude-cron bind", "claude-cron unbind", "claude-cron list", "/abs/root/control-workspace"} {
+		if !strings.Contains(p, want) {
+			t.Fatalf("system prompt missing %q:\n%s", want, p)
+		}
+	}
+}
+
 func TestRunControlOnceRetriesFailedCommand(t *testing.T) {
 	root := filepath.Join(t.TempDir(), ".channel-agent")
 	if err := Init(root); err != nil {
