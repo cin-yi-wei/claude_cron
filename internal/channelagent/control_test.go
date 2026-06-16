@@ -3,6 +3,7 @@ package channelagent
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -117,6 +118,28 @@ func TestHandleBindThenUnbind(t *testing.T) {
 	}
 }
 
+func TestHandleBindRejectsReservedControlName(t *testing.T) {
+	root := filepath.Join(t.TempDir(), ".channel-agent")
+	_ = Init(root)
+	var actions []string
+	deps := newTestDeps(root, &actions)
+	reg := Registry{}
+	cmd, _ := ParseCommand("/bind control " + t.TempDir() + " dev")
+	reply, changed, err := HandleCommand(context.Background(), deps, &reg, cmd)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if changed {
+		t.Fatal("reserved name must not change registry")
+	}
+	if !strings.Contains(reply, "control") {
+		t.Fatalf("reply should explain reserved name, got %q", reply)
+	}
+	if len(actions) != 0 {
+		t.Fatalf("no provisioning should happen, got %#v", actions)
+	}
+}
+
 func TestHandleBindRejectsBadName(t *testing.T) {
 	root := filepath.Join(t.TempDir(), ".channel-agent")
 	_ = Init(root)
@@ -146,6 +169,47 @@ func containsStr(s []string, v string) bool {
 	return false
 }
 
+func TestControlBindingDerivation(t *testing.T) {
+	b := ControlBinding("/abs/root")
+	if b.Name != "control" {
+		t.Fatalf("Name = %q", b.Name)
+	}
+	if b.TmuxSession != "cc-control" {
+		t.Fatalf("TmuxSession = %q", b.TmuxSession)
+	}
+	if b.Root != "/abs/root/control" {
+		t.Fatalf("Root = %q", b.Root)
+	}
+	if b.Worktree != "/abs/root/control-workspace" {
+		t.Fatalf("Worktree (workspace) = %q", b.Worktree)
+	}
+}
+
+func TestControlSystemPromptMentionsCommands(t *testing.T) {
+	p := controlSystemPrompt("/abs/root", "/abs/root/control-workspace")
+	for _, want := range []string{"claude-cron bind", "claude-cron unbind", "claude-cron list", "/abs/root/control-workspace"} {
+		if !strings.Contains(p, want) {
+			t.Fatalf("system prompt missing %q:\n%s", want, p)
+		}
+	}
+}
+
+func TestBuildControlDepsWiresConfig(t *testing.T) {
+	cfg := Config{}
+	cfg.Discord.GuildID = "g1"
+	cfg.Discord.TokenEnv = "DISCORD_BOT_TOKEN"
+	deps := BuildControlDeps("/abs/root", cfg)
+	if deps.Root != "/abs/root" {
+		t.Fatalf("Root = %q", deps.Root)
+	}
+	if deps.GuildID != "g1" {
+		t.Fatalf("GuildID = %q", deps.GuildID)
+	}
+	if deps.CreateChannel == nil || deps.EnsureWorktree == nil || deps.StartSession == nil || deps.InitRoot == nil {
+		t.Fatal("control deps function fields must be non-nil")
+	}
+}
+
 func TestRunControlOnceRetriesFailedCommand(t *testing.T) {
 	root := filepath.Join(t.TempDir(), ".channel-agent")
 	if err := Init(root); err != nil {
@@ -161,10 +225,46 @@ func TestRunControlOnceRetriesFailedCommand(t *testing.T) {
 	reg := Registry{}
 	src := stubSource{msgs: []SourceMessage{{Platform: "discord", ChannelID: "ctl", MessageID: "m1", AuthorID: "u1", CreatedAt: "2026-06-16T00:00:00Z", Content: "/bind proj-a " + t.TempDir() + " ticket-1"}}}
 	sender := &capSender{}
-	_ = RunControlOnce(context.Background(), root, deps, &reg, src, sender)
+	_ = RunControlOnce(context.Background(), root, ControlBinding(root).Root, deps, &reg, src, sender)
 	reg2, _ := LoadRegistry(root)
-	_ = RunControlOnce(context.Background(), root, deps, &reg2, src, sender)
+	_ = RunControlOnce(context.Background(), root, ControlBinding(root).Root, deps, &reg2, src, sender)
 	if calls != 2 {
 		t.Fatalf("expected failed command retried (calls=2), got calls=%d", calls)
+	}
+}
+
+func TestRunControlOnceRoutesFreeTextToInbox(t *testing.T) {
+	root := filepath.Join(t.TempDir(), ".channel-agent")
+	if err := Init(root); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	controlRoot := ControlBinding(root).Root
+	if err := Init(controlRoot); err != nil {
+		t.Fatalf("Init controlRoot: %v", err)
+	}
+	var actions []string
+	deps := newTestDeps(root, &actions)
+	reg := Registry{}
+	src := stubSource{msgs: []SourceMessage{{
+		Platform: "discord", ChannelID: "ctl", MessageID: "m1",
+		AuthorID: "u1", CreatedAt: "2026-06-16T00:00:00Z",
+		Content: "幫我建一個 logs 資料夾",
+	}}}
+	sender := &capSender{}
+
+	if err := RunControlOnce(context.Background(), root, controlRoot, deps, &reg, src, sender); err != nil {
+		t.Fatalf("RunControlOnce: %v", err)
+	}
+	pending, _ := os.ReadDir(pathIn(controlRoot, "inbox", "pending"))
+	if len(pending) != 1 {
+		t.Fatalf("expected 1 queued control job, got %d", len(pending))
+	}
+
+	if err := RunControlOnce(context.Background(), root, controlRoot, deps, &reg, src, sender); err != nil {
+		t.Fatalf("RunControlOnce 2: %v", err)
+	}
+	pending2, _ := os.ReadDir(pathIn(controlRoot, "inbox", "pending"))
+	if len(pending2) != 1 {
+		t.Fatalf("free-text message re-enqueued, pending=%d", len(pending2))
 	}
 }

@@ -52,6 +52,40 @@ func TestStartTmuxClaudeStartsWhenMissing(t *testing.T) {
 	}
 }
 
+func TestStartControlSessionInjectsTokenAndPrompt(t *testing.T) {
+	old := runExternalCommand
+	defer func() { runExternalCommand = old }()
+
+	var calls [][]string
+	runExternalCommand = func(_ context.Context, name string, args ...string) error {
+		calls = append(calls, append([]string{name}, args...))
+		if len(args) > 0 && args[0] == "has-session" {
+			return context.Canceled // not running yet
+		}
+		return nil
+	}
+
+	cwd := t.TempDir()
+	if err := StartControlSession(context.Background(), "cc-control", cwd, "DISCORD_BOT_TOKEN", "tok123", "SYS PROMPT"); err != nil {
+		t.Fatalf("StartControlSession: %v", err)
+	}
+	var start []string
+	for _, c := range calls {
+		if len(c) > 1 && c[1] == "new-session" {
+			start = c
+		}
+	}
+	if start == nil {
+		t.Fatalf("no new-session call: %#v", calls)
+	}
+	joined := strings.Join(start, " ")
+	for _, want := range []string{"-e DISCORD_BOT_TOKEN=tok123", "-c " + cwd, "--append-system-prompt", "SYS PROMPT", "claude"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("new-session missing %q: %v", want, start)
+		}
+	}
+}
+
 func TestEnsureAgentSettingsWritesAllowlist(t *testing.T) {
 	dir := t.TempDir()
 	if err := EnsureAgentSettings(dir); err != nil {

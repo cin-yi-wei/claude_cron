@@ -210,3 +210,44 @@ func countJSONFiles(t *testing.T, dir string) int {
 	}
 	return count
 }
+
+func TestListSubcommandPrintsBindings(t *testing.T) {
+	root := filepath.Join(t.TempDir(), ".channel-agent")
+	if err := agent.Init(root); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	reg := agent.Registry{}
+	_ = reg.Add(agent.BindingDefaults(root, "proj-a", "/p/a", "dev"))
+	if err := agent.SaveRegistry(root, reg); err != nil {
+		t.Fatalf("SaveRegistry: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"list", "--root", root}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "proj-a") {
+		t.Fatalf("stdout = %q, want it to list proj-a", stdout.String())
+	}
+}
+
+func TestBindSubcommandRejectsBadName(t *testing.T) {
+	root := filepath.Join(t.TempDir(), ".channel-agent")
+	if err := agent.Init(root); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	cfg, _ := agent.DefaultConfig("discord")
+	cfg.Discord.ChannelID = "c1"
+	cfg.Discord.GuildID = "g1"
+	_ = agent.SaveConfig(root, cfg)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"bind", "Bad_Name", "/p/a", "dev", "--root", root}, &stdout, &stderr)
+	if code == 0 {
+		t.Fatalf("expected non-zero exit for bad name; stdout=%s", stdout.String())
+	}
+	if !strings.Contains(stdout.String()+stderr.String(), "name") {
+		t.Fatalf("expected name error, got stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+}

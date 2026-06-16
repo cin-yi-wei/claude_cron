@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 )
@@ -78,6 +79,9 @@ func handleBind(ctx context.Context, deps ControlDeps, reg *Registry, cmd Comman
 	name, projectDir, branch := cmd.Args[0], cmd.Args[1], cmd.Args[2]
 	if !ValidName(name) {
 		return fmt.Sprintf("name %q 不合法 (只能用 a-z 0-9 -)", name), false, nil
+	}
+	if name == "control" {
+		return `name "control" 為保留字 (控管助理專用)，請換別的名稱`, false, nil
 	}
 	if _, ok := reg.Get(name); ok {
 		return fmt.Sprintf("binding %q 已存在", name), false, nil
@@ -177,11 +181,59 @@ func countJSON(dir string) int {
 	return n
 }
 
+// ControlBinding returns the reserved binding describing the control channel's
+// own AI assistant session. It is not stored in the registry. The Worktree
+// field is reused as the session's working directory (a plain sandbox dir, not
+// a git worktree).
+func ControlBinding(root string) Binding {
+	return Binding{
+		Name:        "control",
+		TmuxSession: "cc-control",
+		Root:        filepath.Join(root, "control"),
+		Worktree:    filepath.Join(root, "control-workspace"),
+	}
+}
+
+// controlSystemPrompt is appended to the cc-control Claude session so it knows
+// its role, its workspace, and how to manage bindings.
+func controlSystemPrompt(root, workspace string) string {
+	return fmt.Sprintf(`你是 claude_cron 的控管助理，透過 Discord 控管頻道與使用者對話。
+你的工作目錄（沙盒）是：%s
+你可以在這裡執行 shell 指令、建立檔案/資料夾、回答關於這個系統的問題。
+
+要管理「Discord 頻道 ↔ Claude session」綁定時，用以下 CLI（root 用絕對路徑 %s）：
+  claude-cron bind <name> <project-dir> <branch> --root %s
+  claude-cron unbind <name> [--delete-channel] --root %s
+  claude-cron list --root %s
+
+name 只能用小寫字母、數字、減號。回覆使用者時直接用一般文字即可。`,
+		workspace, root, root, root, root)
+}
+
+// BuildControlDeps assembles a ControlDeps wired to the real Discord/worktree/
+// tmux implementations. Shared by the supervisor and the management CLI so
+// /bind and `claude-cron bind` behave identically.
+func BuildControlDeps(root string, cfg Config) ControlDeps {
+	token := os.Getenv(cfg.Discord.TokenEnv)
+	admin := DiscordAdmin{BaseURL: cfg.Discord.BaseURL, Token: token}
+	return ControlDeps{
+		Root:           root,
+		GuildID:        cfg.Discord.GuildID,
+		CreateChannel:  admin.CreateChannel,
+		DeleteChannel:  admin.DeleteChannel,
+		EnsureWorktree: EnsureWorktree,
+		RemoveWorktree: RemoveWorktree,
+		StartSession:   StartTmuxClaude,
+		StopSession:    StopTmuxSession,
+		InitRoot:       Init,
+	}
+}
+
 // RunControlOnce polls the control channel, executes any new commands, replies,
 // persists the registry when it changed, and records processed message IDs so
 // they are not handled twice. Dedup reuses the watcher's seen-state pattern
 // under a control-specific state file.
-func RunControlOnce(ctx context.Context, root string, deps ControlDeps, reg *Registry, source MessageSource, sender Sender) error {
+func RunControlOnce(ctx context.Context, root, controlRoot string, deps ControlDeps, reg *Registry, source MessageSource, sender Sender) error {
 	if err := Init(root); err != nil {
 		return err
 	}
@@ -205,6 +257,11 @@ func RunControlOnce(ctx context.Context, root string, deps ControlDeps, reg *Reg
 		}
 		cmd, ok := ParseCommand(m.Content)
 		if !ok {
+			// Free text → hand to the control AI assistant via its job queue.
+			if err := enqueueControlJob(controlRoot, m); err != nil {
+				// leave unseen so it retries next poll
+				continue
+			}
 			state.MessageIDs[key] = true
 			continue
 		}
@@ -228,4 +285,26 @@ func RunControlOnce(ctx context.Context, root string, deps ControlDeps, reg *Reg
 		}
 	}
 	return AtomicWriteJSON(statePath, state)
+}
+
+// enqueueControlJob writes a free-text control message into the control
+// binding's inbox so the cc-control assistant session processes it through the
+// normal worker/sender pipeline. Mirrors the watcher's job construction.
+func enqueueControlJob(controlRoot string, m SourceMessage) error {
+	if err := Init(controlRoot); err != nil {
+		return err
+	}
+	hash, err := HashSource(m)
+	if err != nil {
+		return err
+	}
+	job := InputJob{
+		Schema:    1,
+		JobID:     buildJobID(m, hash),
+		RequestID: buildRequestID(m, hash),
+		InputHash: hash,
+		Source:    m,
+		CreatedAt: m.CreatedAt,
+	}
+	return AtomicWriteJSON(pathIn(controlRoot, "inbox", "pending", job.JobID+".json"), job)
 }

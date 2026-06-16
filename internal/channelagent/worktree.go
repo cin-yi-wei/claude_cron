@@ -69,6 +69,23 @@ func StartTmuxClaude(ctx context.Context, session, cwd string) error {
 	return runExternalCommand(ctx, "tmux", "new-session", "-d", "-s", session, "-c", cwd, "claude")
 }
 
+// StartControlSession starts the control channel's AI assistant session: a
+// detached tmux session running `claude` with the given system prompt appended
+// and the Discord bot token injected into the session environment (so the
+// assistant's `claude-cron` management calls can authenticate). No-op if the
+// session already exists. tokenEnv is the env var name, tokenValue its value.
+func StartControlSession(ctx context.Context, session, cwd, tokenEnv, tokenValue, systemPrompt string) error {
+	if err := EnsureAgentSettings(cwd); err != nil {
+		return err
+	}
+	if runExternalCommand(ctx, "tmux", "has-session", "-t", session) == nil {
+		return nil
+	}
+	return runExternalCommand(ctx, "tmux", "new-session", "-d", "-s", session,
+		"-c", cwd, "-e", tokenEnv+"="+tokenValue,
+		"claude", "--append-system-prompt", systemPrompt)
+}
+
 // StopTmuxSession kills a tmux session. A missing session is not an error.
 func StopTmuxSession(ctx context.Context, session string) error {
 	_ = runExternalCommand(ctx, "tmux", "kill-session", "-t", session)
