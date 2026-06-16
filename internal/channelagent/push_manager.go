@@ -2,6 +2,7 @@ package channelagent
 
 import (
 	"context"
+	"net/http"
 	"sync"
 )
 
@@ -14,19 +15,63 @@ import (
 // one only if not already running; Reconcile stops ingesters whose binding is
 // gone; StopAll tears everything down at shutdown.
 type PushManager struct {
-	mu      sync.Mutex
-	running map[string]*pushHandle
-	parent  context.Context
+	mu       sync.Mutex
+	running  map[string]*pushHandle
+	parent   context.Context
+	servers  map[string]*webhookServer // by listen addr, shared across bindings
+	webhooks map[string]webhookRoute   // by binding name
 }
 
 type pushHandle struct {
 	cancel context.CancelFunc
 }
 
+type webhookRoute struct {
+	addr string
+	path string
+}
+
 // NewPushManager returns a manager whose ingesters are children of parent;
 // cancelling parent (or calling StopAll) stops them all.
 func NewPushManager(parent context.Context) *PushManager {
-	return &PushManager{running: map[string]*pushHandle{}, parent: parent}
+	return &PushManager{
+		running:  map[string]*pushHandle{},
+		parent:   parent,
+		servers:  map[string]*webhookServer{},
+		webhooks: map[string]webhookRoute{},
+	}
+}
+
+// EnsureWebhook registers a webhook route for name on the shared server at addr
+// (started lazily, once per addr), so many webhook bindings share one port. On
+// first registration for name, onFirstStart runs once (e.g. setWebhook); its
+// error is reported but does not unwind the route. No-op if already registered.
+func (m *PushManager) EnsureWebhook(name, addr, path string, h http.Handler, onFirstStart func() error) {
+	m.mu.Lock()
+	if _, ok := m.webhooks[name]; ok {
+		m.mu.Unlock()
+		return
+	}
+	srv, ok := m.servers[addr]
+	if !ok {
+		srv = newWebhookServer(addr)
+		m.servers[addr] = srv
+	}
+	srv.register(m.parent, path, h)
+	m.webhooks[name] = webhookRoute{addr: addr, path: path}
+	m.mu.Unlock()
+
+	if onFirstStart != nil {
+		_ = onFirstStart()
+	}
+}
+
+// WebhookRegistered reports whether name has a webhook route.
+func (m *PushManager) WebhookRegistered(name string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.webhooks[name]
+	return ok
 }
 
 // Ensure starts the ingester for name if it is not already running. The
@@ -56,7 +101,8 @@ func (m *PushManager) Ensure(name string, ing PushIngester, onExit func(error)) 
 	}()
 }
 
-// Reconcile stops any running ingester whose name is not in active.
+// Reconcile stops any running goroutine ingester and unregisters any webhook
+// route whose name is not in active.
 func (m *PushManager) Reconcile(active map[string]bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -64,6 +110,14 @@ func (m *PushManager) Reconcile(active map[string]bool) {
 		if !active[name] {
 			h.cancel()
 			delete(m.running, name)
+		}
+	}
+	for name, route := range m.webhooks {
+		if !active[name] {
+			if srv, ok := m.servers[route.addr]; ok {
+				srv.unregister(route.path)
+			}
+			delete(m.webhooks, name)
 		}
 	}
 }
@@ -76,7 +130,7 @@ func (m *PushManager) Running(name string) bool {
 	return ok
 }
 
-// StopAll cancels every running ingester.
+// StopAll cancels every running ingester and shuts down shared webhook servers.
 func (m *PushManager) StopAll() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -84,4 +138,9 @@ func (m *PushManager) StopAll() {
 		h.cancel()
 		delete(m.running, name)
 	}
+	for addr, srv := range m.servers {
+		srv.stop()
+		delete(m.servers, addr)
+	}
+	m.webhooks = map[string]webhookRoute{}
 }

@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -99,17 +100,36 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 				fmt.Fprintf(stdout, "binding %s: push mode but no push manager\n", b.Name)
 				continue
 			}
-			pushIng, err := SelectPushIngester(b, cfg, tokens)
-			if err != nil {
-				fmt.Fprintf(stdout, "binding %s push ingester error: %v\n", b.Name, err)
-				continue
-			}
 			name := b.Name
-			push.Ensure(name, pushIng, func(e error) {
-				if e != nil {
-					fmt.Fprintf(stdout, "binding %s push ingester exited: %v\n", name, e)
+			switch b.PlatformOf() {
+			case PlatformTelegram:
+				// Telegram webhooks share one HTTP server (one port), keyed by
+				// path, so multiple tg-push bindings don't collide.
+				handler := TelegramWebhookHandler{Root: b.Root, ChatID: b.ChannelID, Secret: cfg.Push.Secret}
+				path := "/tg/" + b.ChannelID
+				push.EnsureWebhook(name, cfg.Push.Listen, path, handler, func() error {
+					if cfg.Push.PublicURL == "" {
+						return nil
+					}
+					url := strings.TrimRight(cfg.Push.PublicURL, "/") + path
+					if err := SetWebhook(ctx, cfg.Telegram.BaseURL, tokens.telegram, url, cfg.Push.Secret, nil); err != nil {
+						fmt.Fprintf(stdout, "binding %s setWebhook error: %v\n", name, err)
+						return err
+					}
+					return nil
+				})
+			default:
+				pushIng, err := SelectPushIngester(b, cfg, tokens)
+				if err != nil {
+					fmt.Fprintf(stdout, "binding %s push ingester error: %v\n", b.Name, err)
+					continue
 				}
-			})
+				push.Ensure(name, pushIng, func(e error) {
+					if e != nil {
+						fmt.Fprintf(stdout, "binding %s push ingester exited: %v\n", name, e)
+					}
+				})
+			}
 			activePush[name] = true
 			ingester = noopIngester{}
 		} else {

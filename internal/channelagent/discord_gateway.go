@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -138,6 +139,10 @@ func (g DiscordGatewayIngester) runLoop(ctx context.Context, conn gwConn) error 
 	hbCtx, cancelHB := context.WithCancel(ctx)
 	defer cancelHB()
 	var lastSeq *int
+	// missedAcks counts heartbeats sent since the last ACK. If Discord stops
+	// ACKing (zombied connection), close the conn so Read errors and Run
+	// returns; the PushManager reconnects next cycle.
+	var missedAcks int32
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
@@ -146,6 +151,10 @@ func (g DiscordGatewayIngester) runLoop(ctx context.Context, conn gwConn) error 
 			case <-hbCtx.Done():
 				return
 			case <-ticker.C:
+				if atomic.AddInt32(&missedAcks, 1) > 1 {
+					conn.Close() // no ACK since last beat → treat as dead
+					return
+				}
 				_ = writeJSON(hbCtx, conn, map[string]any{"op": gwHeartbeat, "d": lastSeq})
 			}
 		}
@@ -166,7 +175,7 @@ func (g DiscordGatewayIngester) runLoop(ctx context.Context, conn gwConn) error 
 		}
 		switch ev.Op {
 		case gwHeartbeatACK:
-			// ok
+			atomic.StoreInt32(&missedAcks, 0)
 		case gwReconnect, gwInvalid:
 			return fmt.Errorf("discord gateway: server asked to reconnect (op %d)", ev.Op)
 		case gwDispatch:
