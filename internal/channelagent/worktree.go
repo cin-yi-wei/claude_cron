@@ -3,7 +3,33 @@ package channelagent
 import (
 	"context"
 	"os"
+	"path/filepath"
 )
+
+// agentSettings is the Claude Code permission allowlist written into each
+// binding's worktree so the driven agent can read the job, write its reply, and
+// rename the output file without interactive permission prompts (which a
+// tmux-driven session cannot answer). Scoped to the tools the agent prompt uses.
+const agentSettings = `{
+  "permissions": {
+    "allow": ["Read", "Write", "Edit", "Bash(mv:*)", "Bash(ls:*)", "Bash(rtk:*)", "Bash(git:*)"]
+  }
+}
+`
+
+// EnsureAgentSettings writes .claude/settings.local.json into dir if it does not
+// already exist, so a freshly-created worktree grants the agent the permissions
+// it needs to run unattended. An existing file is left untouched.
+func EnsureAgentSettings(dir string) error {
+	settingsPath := filepath.Join(dir, ".claude", "settings.local.json")
+	if _, err := os.Stat(settingsPath); err == nil {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(settingsPath), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(settingsPath, []byte(agentSettings), 0o644)
+}
 
 // EnsureWorktree makes sure worktreePath is a git worktree of branch, checked
 // out from projectDir. Idempotent: if worktreePath already exists it is a no-op.
@@ -28,6 +54,9 @@ func RemoveWorktree(ctx context.Context, projectDir, worktreePath string) error 
 // StartTmuxClaude ensures a detached tmux session named session is running
 // `claude` with its working directory set to cwd. No-op if it already exists.
 func StartTmuxClaude(ctx context.Context, session, cwd string) error {
+	if err := EnsureAgentSettings(cwd); err != nil {
+		return err
+	}
 	if runExternalCommand(ctx, "tmux", "has-session", "-t", session) == nil {
 		return nil
 	}

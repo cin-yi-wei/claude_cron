@@ -2,8 +2,10 @@ package channelagent
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -40,11 +42,39 @@ func TestStartTmuxClaudeStartsWhenMissing(t *testing.T) {
 		}
 		return nil
 	}
-	if err := StartTmuxClaude(context.Background(), "cc-proj", "/repo/wt"); err != nil {
+	cwd := t.TempDir()
+	if err := StartTmuxClaude(context.Background(), "cc-proj", cwd); err != nil {
 		t.Fatalf("StartTmuxClaude: %v", err)
 	}
-	wantStart := []string{"tmux", "new-session", "-d", "-s", "cc-proj", "-c", "/repo/wt", "claude"}
+	wantStart := []string{"tmux", "new-session", "-d", "-s", "cc-proj", "-c", cwd, "claude"}
 	if len(calls) != 2 || !reflect.DeepEqual(calls[1], wantStart) {
 		t.Fatalf("calls = %#v", calls)
+	}
+}
+
+func TestEnsureAgentSettingsWritesAllowlist(t *testing.T) {
+	dir := t.TempDir()
+	if err := EnsureAgentSettings(dir); err != nil {
+		t.Fatalf("EnsureAgentSettings: %v", err)
+	}
+	path := filepath.Join(dir, ".claude", "settings.local.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read settings: %v", err)
+	}
+	if !strings.Contains(string(data), `"Write"`) || !strings.Contains(string(data), `"Bash(mv:*)"`) {
+		t.Fatalf("settings missing expected allowlist entries: %s", data)
+	}
+
+	// Existing file is left untouched.
+	if err := os.WriteFile(path, []byte(`{"custom":true}`), 0o644); err != nil {
+		t.Fatalf("overwrite: %v", err)
+	}
+	if err := EnsureAgentSettings(dir); err != nil {
+		t.Fatalf("EnsureAgentSettings 2: %v", err)
+	}
+	data2, _ := os.ReadFile(path)
+	if string(data2) != `{"custom":true}` {
+		t.Fatalf("existing settings should be preserved, got: %s", data2)
 	}
 }
