@@ -11,12 +11,12 @@ import (
 
 // Discord Gateway opcodes (subset we use).
 const (
-	gwDispatch  = 0  // server → client: an event (t names it)
-	gwHeartbeat = 1  // client → server: keepalive
-	gwIdentify  = 2  // client → server: auth
-	gwReconnect = 7  // server → client: please reconnect
-	gwInvalid   = 9  // server → client: invalid session
-	gwHello     = 10 // server → client: heartbeat_interval
+	gwDispatch     = 0  // server → client: an event (t names it)
+	gwHeartbeat    = 1  // client → server: keepalive
+	gwIdentify     = 2  // client → server: auth
+	gwReconnect    = 7  // server → client: please reconnect
+	gwInvalid      = 9  // server → client: invalid session
+	gwHello        = 10 // server → client: heartbeat_interval
 	gwHeartbeatACK = 11
 
 	// Intents: GUILD_MESSAGES (1<<9) | MESSAGE_CONTENT (1<<15). MESSAGE_CONTENT
@@ -50,9 +50,9 @@ func (w coderWSConn) Close() { _ = w.c.Close(websocket.StatusNormalClosure, "") 
 // writes them to the inbox. On disconnect Run returns; the PushManager restarts
 // it on the next supervisor cycle.
 type DiscordGatewayIngester struct {
-	Root      string
-	Token     string
-	ChannelID string
+	Root       string
+	Token      string
+	ChannelID  string
 	GatewayURL string // optional override (tests / self-host)
 
 	// dial is injectable for tests; nil uses the real coder/websocket dialer.

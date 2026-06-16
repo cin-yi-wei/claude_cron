@@ -17,8 +17,8 @@ func TestPushTelegramEndToEndToInbox(t *testing.T) {
 	chat := "12345"
 
 	ing := TelegramWebhookIngester{
-		Addr: addr,
-		Path: "/tg/" + chat,
+		Addr:    addr,
+		Path:    "/tg/" + chat,
 		Handler: TelegramWebhookHandler{Root: root, ChatID: chat, Secret: "sek"},
 		// PublicURL empty → no setWebhook call (local-only), the "fake" bring-up.
 	}
