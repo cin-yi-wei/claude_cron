@@ -95,6 +95,7 @@ func handleBind(ctx context.Context, deps ControlDeps, reg *Registry, cmd Comman
 	b.ChannelID = channelID
 
 	if err := deps.EnsureWorktree(ctx, projectDir, branch, b.Worktree); err != nil {
+		_ = deps.RemoveWorktree(ctx, projectDir, b.Worktree)
 		_ = deps.DeleteChannel(ctx, channelID)
 		return "", false, fmt.Errorf("建 worktree 失敗: %w", err)
 	}
@@ -202,15 +203,18 @@ func RunControlOnce(ctx context.Context, root string, deps ControlDeps, reg *Reg
 		if state.MessageIDs[key] {
 			continue
 		}
-		state.MessageIDs[key] = true
 		cmd, ok := ParseCommand(m.Content)
 		if !ok {
+			state.MessageIDs[key] = true
 			continue
 		}
 		reply, regChanged, herr := HandleCommand(ctx, deps, reg, cmd)
 		if herr != nil {
-			reply = "⚠️ " + herr.Error()
+			// Leave unseen so a transient failure can be retried next poll.
+			_ = sender.Send(ctx, OutputJob{Send: true, Text: "⚠️ " + herr.Error()})
+			continue
 		}
+		state.MessageIDs[key] = true
 		if regChanged {
 			changed = true
 		}

@@ -252,6 +252,9 @@ func validateConfigForServe(cfg agent.Config) error {
 		if cfg.Discord.TokenEnv == "" {
 			return fmt.Errorf("discord token_env is required")
 		}
+		if cfg.Discord.GuildID == "" {
+			return fmt.Errorf("discord guild_id is required")
+		}
 	case "telegram":
 		if cfg.Telegram.ChatID == "" {
 			return fmt.Errorf("telegram chat_id is required")

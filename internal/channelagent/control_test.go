@@ -2,6 +2,7 @@ package channelagent
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -143,4 +144,27 @@ func containsStr(s []string, v string) bool {
 		}
 	}
 	return false
+}
+
+func TestRunControlOnceRetriesFailedCommand(t *testing.T) {
+	root := filepath.Join(t.TempDir(), ".channel-agent")
+	if err := Init(root); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	var actions []string
+	deps := newTestDeps(root, &actions)
+	calls := 0
+	deps.CreateChannel = func(_ context.Context, guildID, name string) (string, error) {
+		calls++
+		return "", fmt.Errorf("boom")
+	}
+	reg := Registry{}
+	src := stubSource{msgs: []SourceMessage{{Platform: "discord", ChannelID: "ctl", MessageID: "m1", AuthorID: "u1", CreatedAt: "2026-06-16T00:00:00Z", Content: "/bind proj-a " + t.TempDir() + " ticket-1"}}}
+	sender := &capSender{}
+	_ = RunControlOnce(context.Background(), root, deps, &reg, src, sender)
+	reg2, _ := LoadRegistry(root)
+	_ = RunControlOnce(context.Background(), root, deps, &reg2, src, sender)
+	if calls != 2 {
+		t.Fatalf("expected failed command retried (calls=2), got calls=%d", calls)
+	}
 }
