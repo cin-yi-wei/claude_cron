@@ -59,7 +59,11 @@ func SelectPushIngester(b Binding, cfg Config, tokens bindingTokens) (PushIngest
 			PublicURL: cfg.Push.PublicURL,
 		}, nil
 	case PlatformDiscord:
-		return nil, fmt.Errorf("binding %q: discord push (gateway websocket) not implemented yet", b.Name)
+		return DiscordGatewayIngester{
+			Root:      b.Root,
+			Token:     tokens.discord,
+			ChannelID: b.ChannelID,
+		}, nil
 	default:
 		return nil, fmt.Errorf("binding %q: unknown platform %q", b.Name, b.Platform)
 	}
