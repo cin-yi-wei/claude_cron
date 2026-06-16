@@ -231,6 +231,7 @@ func runManageCommand(name string, rest []string, stdout, stderr io.Writer) int 
 	if absRoot, err := filepath.Abs(root); err == nil {
 		root = absRoot
 	}
+	loadDotEnv(root)
 
 	cfg, cfgErr := agent.LoadConfig(root)
 	if cfgErr != nil && name != "list" {
@@ -401,6 +402,7 @@ func runNotifyCommand(rest []string, stdout, stderr io.Writer) int {
 	if absRoot, err := filepath.Abs(root); err == nil {
 		root = absRoot
 	}
+	loadDotEnv(root)
 	cfg, err := agent.LoadConfig(root)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
@@ -437,4 +439,54 @@ func buildSender(adapter string, stdout io.Writer, cfg platformConfig) (agent.Se
 	default:
 		return nil, fmt.Errorf("unsupported adapter %q", adapter)
 	}
+}
+
+// loadDotEnv walks up from start (bounded) looking for a .env file and loads
+// its KEY=VALUE pairs into the process environment. Existing environment
+// variables are never overwritten, so an explicitly-exported token still wins.
+// It is best-effort: a missing or unreadable .env is silently ignored.
+//
+// This lets ad-hoc invocations such as `claude-cron notify` (often run from a
+// detached background shell that did not inherit DISCORD_BOT_TOKEN) find the
+// token the same way the long-running daemon does.
+func loadDotEnv(start string) {
+	dir := start
+	for i := 0; i < 8; i++ {
+		if applyDotEnvFile(filepath.Join(dir, ".env")) {
+			return
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+}
+
+// applyDotEnvFile loads one .env file. It returns true when the file existed
+// and was read (regardless of how many keys it held), false when absent.
+func applyDotEnvFile(path string) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		key, val, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		val = strings.Trim(strings.TrimSpace(val), `"'`)
+		if _, exists := os.LookupEnv(key); !exists {
+			os.Setenv(key, val)
+		}
+	}
+	return true
 }
