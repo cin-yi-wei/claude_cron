@@ -33,6 +33,9 @@ func TestEnsureWorktreeCreatesBranchWhenMissing(t *testing.T) {
 func TestStartTmuxClaudeStartsWhenMissing(t *testing.T) {
 	old := runExternalCommand
 	defer func() { runExternalCommand = old }()
+	oldDelay := sessionBootDelay
+	sessionBootDelay = 0
+	defer func() { sessionBootDelay = oldDelay }()
 
 	var calls [][]string
 	runExternalCommand = func(_ context.Context, name string, args ...string) error {
@@ -55,6 +58,9 @@ func TestStartTmuxClaudeStartsWhenMissing(t *testing.T) {
 func TestStartControlSessionInjectsTokenAndPrompt(t *testing.T) {
 	old := runExternalCommand
 	defer func() { runExternalCommand = old }()
+	oldDelay := sessionBootDelay
+	sessionBootDelay = 0
+	defer func() { sessionBootDelay = oldDelay }()
 
 	var calls [][]string
 	runExternalCommand = func(_ context.Context, name string, args ...string) error {

@@ -4,7 +4,16 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"time"
 )
+
+// sessionBootDelay is how long to wait after creating a NEW tmux Claude session
+// before returning, giving the Claude TUI time to finish booting. Without it the
+// first prompt injected into a freshly-created session races the boot and is
+// dropped (the keystrokes land before the input is interactive), so that job
+// stalls until it times out. Only paid once per session creation. Overridable
+// in tests.
+var sessionBootDelay = 6 * time.Second
 
 // agentSettings is the Claude Code permission allowlist written into each
 // binding's worktree so the driven agent can read the job, write its reply, and
@@ -66,7 +75,11 @@ func StartTmuxClaude(ctx context.Context, session, cwd string) error {
 	if runExternalCommand(ctx, "tmux", "has-session", "-t", session) == nil {
 		return nil
 	}
-	return runExternalCommand(ctx, "tmux", "new-session", "-d", "-s", session, "-c", cwd, "claude")
+	if err := runExternalCommand(ctx, "tmux", "new-session", "-d", "-s", session, "-c", cwd, "claude"); err != nil {
+		return err
+	}
+	time.Sleep(sessionBootDelay)
+	return nil
 }
 
 // StartControlSession starts the control channel's AI assistant session: a
@@ -81,9 +94,13 @@ func StartControlSession(ctx context.Context, session, cwd, tokenEnv, tokenValue
 	if runExternalCommand(ctx, "tmux", "has-session", "-t", session) == nil {
 		return nil
 	}
-	return runExternalCommand(ctx, "tmux", "new-session", "-d", "-s", session,
+	if err := runExternalCommand(ctx, "tmux", "new-session", "-d", "-s", session,
 		"-c", cwd, "-e", tokenEnv+"="+tokenValue,
-		"claude", "--append-system-prompt", systemPrompt)
+		"claude", "--append-system-prompt", systemPrompt); err != nil {
+		return err
+	}
+	time.Sleep(sessionBootDelay)
+	return nil
 }
 
 // StopTmuxSession kills a tmux session. A missing session is not an error.
