@@ -67,28 +67,36 @@ func (s TelegramSource) Fetch(ctx context.Context) ([]SourceMessage, error) {
 
 	var messages []SourceMessage
 	for _, update := range payload.Result {
-		if update.Message == nil {
-			continue
+		if msg, ok := telegramUpdateToMessage(update, s.ChatID); ok {
+			messages = append(messages, msg)
 		}
-		message := update.Message
-		chatID := strconv.FormatInt(message.Chat.ID, 10)
-		if chatID != s.ChatID {
-			continue
-		}
-		content := message.Text
-		if content == "" {
-			content = message.Caption
-		}
-		messages = append(messages, SourceMessage{
-			Platform:  "telegram",
-			ChannelID: s.ChatID,
-			MessageID: strconv.FormatInt(update.UpdateID, 10),
-			AuthorID:  strconv.FormatInt(message.From.ID, 10),
-			CreatedAt: time.Unix(message.Date, 0).UTC().Format(time.RFC3339),
-			Content:   content,
-		})
 	}
 	return messages, nil
+}
+
+// telegramUpdateToMessage maps a Telegram update to a SourceMessage, keeping
+// only messages for chatID. Returns ok=false for non-message updates or other
+// chats. Shared by getUpdates (poll) and the webhook handler (push).
+func telegramUpdateToMessage(update telegramUpdate, chatID string) (SourceMessage, bool) {
+	if update.Message == nil {
+		return SourceMessage{}, false
+	}
+	message := update.Message
+	if strconv.FormatInt(message.Chat.ID, 10) != chatID {
+		return SourceMessage{}, false
+	}
+	content := message.Text
+	if content == "" {
+		content = message.Caption
+	}
+	return SourceMessage{
+		Platform:  "telegram",
+		ChannelID: chatID,
+		MessageID: strconv.FormatInt(update.UpdateID, 10),
+		AuthorID:  strconv.FormatInt(message.From.ID, 10),
+		CreatedAt: time.Unix(message.Date, 0).UTC().Format(time.RFC3339),
+		Content:   content,
+	}, true
 }
 
 type TelegramSender struct {
