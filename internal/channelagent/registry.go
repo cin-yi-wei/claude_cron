@@ -17,6 +17,36 @@ type Binding struct {
 	TmuxSession string `json:"tmux_session"`
 	Root        string `json:"root"`
 	CreatedAt   string `json:"created_at"`
+	// Platform is "discord" or "telegram"; Mode is "poll" (passive) or "push"
+	// (active). Both are optional in stored JSON: an empty value means the
+	// legacy default (discord/poll), so existing registries keep working.
+	Platform string `json:"platform,omitempty"`
+	Mode     string `json:"mode,omitempty"`
+}
+
+// Platform and Mode values. Empty string is treated as the default
+// (PlatformDiscord / ModePoll) for backward compatibility with older registries.
+const (
+	PlatformDiscord  = "discord"
+	PlatformTelegram = "telegram"
+	ModePoll         = "poll"
+	ModePush         = "push"
+)
+
+// PlatformOf returns the binding's platform, defaulting to discord when unset.
+func (b Binding) PlatformOf() string {
+	if b.Platform == "" {
+		return PlatformDiscord
+	}
+	return b.Platform
+}
+
+// ModeOf returns the binding's arrival mode, defaulting to poll when unset.
+func (b Binding) ModeOf() string {
+	if b.Mode == "" {
+		return ModePoll
+	}
+	return b.Mode
 }
 
 type Registry struct {

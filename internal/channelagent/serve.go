@@ -11,8 +11,8 @@ type ServeResult struct {
 	Sent      int
 }
 
-func RunServeOnce(ctx context.Context, root string, source MessageSource, injector Injector, sender Sender, timeout time.Duration) (ServeResult, error) {
-	created, err := RunWatcherWithSource(ctx, root, source)
+func RunServeOnce(ctx context.Context, root string, ingester Ingester, injector Injector, sender Sender, timeout time.Duration) (ServeResult, error) {
+	created, err := ingester.Ingest(ctx, root)
 	if err != nil {
 		return ServeResult{}, err
 	}

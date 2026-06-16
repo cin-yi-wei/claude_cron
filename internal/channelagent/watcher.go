@@ -21,6 +21,18 @@ func RunWatcher(root, sourcePath string) (int, error) {
 }
 
 func RunWatcherWithSource(ctx context.Context, root string, source MessageSource) (int, error) {
+	messages, err := source.Fetch(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return IngestMessages(ctx, root, messages)
+}
+
+// IngestMessages writes the given messages to the binding's inbox, skipping any
+// already seen (dedup by platform:channel:message id) and recording new ones in
+// the seen-state. It acquires the watcher lock, so it is safe to call from a
+// per-cycle poll and from a long-running push ingester concurrently.
+func IngestMessages(ctx context.Context, root string, messages []SourceMessage) (int, error) {
 	if err := Init(root); err != nil {
 		return 0, err
 	}
@@ -30,10 +42,6 @@ func RunWatcherWithSource(ctx context.Context, root string, source MessageSource
 	}
 	defer lock.Release()
 
-	messages, err := source.Fetch(ctx)
-	if err != nil {
-		return 0, err
-	}
 	sort.SliceStable(messages, func(i, j int) bool {
 		return messages[i].CreatedAt < messages[j].CreatedAt
 	})

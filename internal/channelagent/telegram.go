@@ -67,28 +67,36 @@ func (s TelegramSource) Fetch(ctx context.Context) ([]SourceMessage, error) {
 
 	var messages []SourceMessage
 	for _, update := range payload.Result {
-		if update.Message == nil {
-			continue
+		if msg, ok := telegramUpdateToMessage(update, s.ChatID); ok {
+			messages = append(messages, msg)
 		}
-		message := update.Message
-		chatID := strconv.FormatInt(message.Chat.ID, 10)
-		if chatID != s.ChatID {
-			continue
-		}
-		content := message.Text
-		if content == "" {
-			content = message.Caption
-		}
-		messages = append(messages, SourceMessage{
-			Platform:  "telegram",
-			ChannelID: s.ChatID,
-			MessageID: strconv.FormatInt(update.UpdateID, 10),
-			AuthorID:  strconv.FormatInt(message.From.ID, 10),
-			CreatedAt: time.Unix(message.Date, 0).UTC().Format(time.RFC3339),
-			Content:   content,
-		})
 	}
 	return messages, nil
+}
+
+// telegramUpdateToMessage maps a Telegram update to a SourceMessage, keeping
+// only messages for chatID. Returns ok=false for non-message updates or other
+// chats. Shared by getUpdates (poll) and the webhook handler (push).
+func telegramUpdateToMessage(update telegramUpdate, chatID string) (SourceMessage, bool) {
+	if update.Message == nil {
+		return SourceMessage{}, false
+	}
+	message := update.Message
+	if strconv.FormatInt(message.Chat.ID, 10) != chatID {
+		return SourceMessage{}, false
+	}
+	content := message.Text
+	if content == "" {
+		content = message.Caption
+	}
+	return SourceMessage{
+		Platform:  "telegram",
+		ChannelID: chatID,
+		MessageID: strconv.FormatInt(update.UpdateID, 10),
+		AuthorID:  strconv.FormatInt(message.From.ID, 10),
+		CreatedAt: time.Unix(message.Date, 0).UTC().Format(time.RFC3339),
+		Content:   content,
+	}, true
 }
 
 type TelegramSender struct {
@@ -136,6 +144,53 @@ func (s TelegramSender) Send(ctx context.Context, output OutputJob) error {
 	}
 	if !payload.OK {
 		return fmt.Errorf("telegram sendMessage returned ok=false")
+	}
+	return nil
+}
+
+// SetWebhook registers webhookURL with Telegram so it POSTs updates there. If
+// secret is non-empty it is set as the secret token Telegram echoes in the
+// X-Telegram-Bot-Api-Secret-Token header. Used by push mode at startup.
+func SetWebhook(ctx context.Context, baseURL, token, webhookURL, secret string, client *http.Client) error {
+	if token == "" {
+		return fmt.Errorf("telegram token is required")
+	}
+	if webhookURL == "" {
+		return fmt.Errorf("webhook url is required")
+	}
+	if baseURL == "" {
+		baseURL = defaultTelegramBaseURL
+	}
+	if client == nil {
+		client = http.DefaultClient
+	}
+	payload := map[string]string{"url": webhookURL}
+	if secret != "" {
+		payload["secret_token"] = secret
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/bot"+token+"/setWebhook", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if err := checkHTTPResponse(resp); err != nil {
+		return err
+	}
+	var out telegramSendResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return err
+	}
+	if !out.OK {
+		return fmt.Errorf("telegram setWebhook returned ok=false")
 	}
 	return nil
 }
