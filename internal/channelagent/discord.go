@@ -70,6 +70,11 @@ func (s DiscordSource) Fetch(ctx context.Context) ([]SourceMessage, error) {
 	messages := make([]SourceMessage, 0, len(payload))
 	for i := len(payload) - 1; i >= 0; i-- {
 		msg := payload[i]
+		// Skip messages authored by bots (including this bot itself) to avoid
+		// echo loops where the agent's own replies are re-ingested as new input.
+		if msg.Author.Bot {
+			continue
+		}
 		source := SourceMessage{
 			Platform:  "discord",
 			ChannelID: s.ChannelID,
@@ -139,7 +144,8 @@ type discordMessage struct {
 }
 
 type discordAuthor struct {
-	ID string `json:"id"`
+	ID  string `json:"id"`
+	Bot bool   `json:"bot"`
 }
 
 type discordAttachment struct {

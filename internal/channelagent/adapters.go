@@ -6,6 +6,7 @@ import (
 	"io"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 type StdoutSender struct {
@@ -33,8 +34,33 @@ func (i TmuxInjector) Inject(ctx context.Context, job InputJob, outputPath strin
 	if err := i.ensureSession(ctx); err != nil {
 		return err
 	}
-	prompt := BuildClaudePrompt(i.Root, job, outputPath)
-	return runExternalCommand(ctx, "tmux", "send-keys", "-t", i.Session, prompt, "Enter")
+	// Collapse the prompt to a single line. Embedded newlines sent to the Claude
+	// TUI via send-keys are interpreted as Enter keypresses, which submit the
+	// input prematurely and fragment the prompt. A single line submits cleanly.
+	prompt := collapseWhitespace(BuildClaudePrompt(i.Root, job, outputPath))
+
+	// Send the prompt literally (-l) so it is inserted as text rather than
+	// interpreted as key names. Then submit with a SEPARATE Enter after a delay
+	// long enough for the TUI to finish inserting a long prompt before it is
+	// submitted. This two-step recipe (literal text, pause, Enter) is the only
+	// one observed to reliably land and submit a multi-hundred-character prompt
+	// in the Claude TUI; sending the Enter in the same call, or with too short a
+	// delay, drops the input.
+	if err := runExternalCommand(ctx, "tmux", "send-keys", "-t", i.Session, "-l", prompt); err != nil {
+		return err
+	}
+	time.Sleep(injectSubmitDelay)
+	return runExternalCommand(ctx, "tmux", "send-keys", "-t", i.Session, "Enter")
+}
+
+// injectSubmitDelay is the pause between inserting the prompt text and pressing
+// Enter, giving the TUI time to finish accepting a long literal paste.
+var injectSubmitDelay = 800 * time.Millisecond
+
+// collapseWhitespace replaces all runs of whitespace (including newlines) with a
+// single space and trims the result, producing a single-line string.
+func collapseWhitespace(s string) string {
+	return strings.Join(strings.Fields(s), " ")
 }
 
 var runExternalCommand = func(ctx context.Context, name string, args ...string) error {

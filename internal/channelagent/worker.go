@@ -25,6 +25,14 @@ func RunWorkerOnce(ctx context.Context, root string, injector Injector, timeout 
 	}
 	defer lock.Release()
 
+	// Recover orphaned jobs: anything left in processing/ is from a worker that
+	// was killed mid-job (the worker is single-threaded under the lock, so no
+	// job is legitimately in processing/ at this point). Requeue them so they
+	// are retried instead of being stuck forever.
+	if err := requeueProcessing(root); err != nil {
+		return false, err
+	}
+
 	pendingPath, err := oldestJSON(pathIn(root, "inbox", "pending"))
 	if err != nil {
 		return false, err
@@ -114,6 +122,30 @@ func waitOutput(ctx context.Context, path string, timeout time.Duration) (Output
 		case <-ticker.C:
 		}
 	}
+}
+
+// requeueProcessing moves any leftover jobs from inbox/processing back to
+// inbox/pending so a worker that died mid-job does not strand them.
+func requeueProcessing(root string) error {
+	dir := pathIn(root, "inbox", "processing")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		from := filepath.Join(dir, entry.Name())
+		to := pathIn(root, "inbox", "pending", entry.Name())
+		if err := moveFile(from, to); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func oldestJSON(dir string) (string, error) {

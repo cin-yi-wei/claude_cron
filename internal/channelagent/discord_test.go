@@ -52,6 +52,37 @@ func TestDiscordSourceFetchesChannelMessages(t *testing.T) {
 	}
 }
 
+func TestDiscordSourceSkipsBotMessages(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode([]map[string]any{
+			{
+				"id":        "m2",
+				"content":   "bot echo",
+				"timestamp": "2026-06-16T01:31:00.000000+00:00",
+				"author":    map[string]any{"id": "selfbot", "bot": true},
+			},
+			{
+				"id":        "m1",
+				"content":   "hello",
+				"timestamp": "2026-06-16T01:30:12.000000+00:00",
+				"author":    map[string]any{"id": "u1"},
+			},
+		})
+	}))
+	defer server.Close()
+
+	messages, err := DiscordSource{BaseURL: server.URL + "/api/v10", Token: "tok", ChannelID: "c1"}.Fetch(context.Background())
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if len(messages) != 1 {
+		t.Fatalf("messages len = %d, want 1 (bot message filtered)", len(messages))
+	}
+	if messages[0].MessageID != "m1" {
+		t.Fatalf("message = %#v, want only human message m1", messages[0])
+	}
+}
+
 func TestDiscordSenderPostsMessage(t *testing.T) {
 	var gotAuth string
 	var gotBody map[string]string

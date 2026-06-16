@@ -2,3 +2,6 @@
 /dist/
 /claude-cron
 /claude-cron.exe
+.env
+/.channel-agent/
+/.claude/

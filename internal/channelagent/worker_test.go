@@ -72,6 +72,38 @@ func TestWorkerRejectsMismatchedOutputAndMovesInputToFailed(t *testing.T) {
 	assertNotExists(t, filepath.Join(root, "inbox", "done", job.JobID+".json"))
 }
 
+func TestWorkerRecoversOrphanedProcessingJob(t *testing.T) {
+	root := filepath.Join(t.TempDir(), ".channel-agent")
+	job := seedPendingJob(t, root, "m1")
+	// Simulate a worker killed mid-job: the job is left in processing/.
+	if err := moveFile(
+		filepath.Join(root, "inbox", "pending", job.JobID+".json"),
+		filepath.Join(root, "inbox", "processing", job.JobID+".json"),
+	); err != nil {
+		t.Fatalf("seed processing: %v", err)
+	}
+
+	processed, err := RunWorkerOnce(context.Background(), root, fakeInjector{
+		write: func(job InputJob, outputPath string) error {
+			return AtomicWriteJSON(outputPath, OutputJob{
+				Schema:    1,
+				JobID:     job.JobID,
+				RequestID: job.RequestID,
+				InputHash: job.InputHash,
+				Send:      true,
+				Text:      "reply",
+			})
+		},
+	}, time.Second)
+	if err != nil {
+		t.Fatalf("RunWorkerOnce: %v", err)
+	}
+	if !processed {
+		t.Fatal("processed = false, want true (orphan should be requeued and processed)")
+	}
+	assertExists(t, filepath.Join(root, "inbox", "done", job.JobID+".json"))
+}
+
 func seedPendingJob(t *testing.T, root, messageID string) InputJob {
 	t.Helper()
 	if err := Init(root); err != nil {
