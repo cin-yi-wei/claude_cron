@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -63,11 +64,22 @@ type TelegramWebhookIngester struct {
 	Addr    string // listen address, e.g. ":8443"
 	Path    string // URL path Telegram is configured to POST to, e.g. "/tg/<chat>"
 	Handler TelegramWebhookHandler
+
+	// Registration (optional). When PublicURL is set, Run calls setWebhook so
+	// Telegram POSTs to PublicURL+Path. Empty PublicURL = serve locally only.
+	BaseURL   string
+	Token     string
+	PublicURL string
 }
 
 func (t TelegramWebhookIngester) Run(ctx context.Context) error {
 	if t.Path == "" {
 		return fmt.Errorf("telegram webhook ingester: path is required")
+	}
+	if t.PublicURL != "" {
+		if err := SetWebhook(ctx, t.BaseURL, t.Token, strings.TrimRight(t.PublicURL, "/")+t.Path, t.Handler.Secret, nil); err != nil {
+			return fmt.Errorf("setWebhook: %w", err)
+		}
 	}
 	mux := http.NewServeMux()
 	mux.Handle(t.Path, t.Handler)

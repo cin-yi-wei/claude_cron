@@ -22,6 +22,10 @@ type Config struct {
 type PushConfig struct {
 	Listen string `json:"listen,omitempty"`
 	Secret string `json:"secret,omitempty"`
+	// PublicURL is the externally reachable base URL Telegram POSTs to (the
+	// binding's path is appended). Empty disables webhook registration, so the
+	// server still runs locally but Telegram is not told to push.
+	PublicURL string `json:"public_url,omitempty"`
 }
 
 type MockConfig struct {

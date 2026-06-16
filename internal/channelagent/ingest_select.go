@@ -54,6 +54,9 @@ func SelectPushIngester(b Binding, cfg Config, tokens bindingTokens) (PushIngest
 				ChatID: b.ChannelID,
 				Secret: cfg.Push.Secret,
 			},
+			BaseURL:   cfg.Telegram.BaseURL,
+			Token:     tokens.telegram,
+			PublicURL: cfg.Push.PublicURL,
 		}, nil
 	case PlatformDiscord:
 		return nil, fmt.Errorf("binding %q: discord push (gateway websocket) not implemented yet", b.Name)

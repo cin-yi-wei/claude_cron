@@ -148,6 +148,53 @@ func (s TelegramSender) Send(ctx context.Context, output OutputJob) error {
 	return nil
 }
 
+// SetWebhook registers webhookURL with Telegram so it POSTs updates there. If
+// secret is non-empty it is set as the secret token Telegram echoes in the
+// X-Telegram-Bot-Api-Secret-Token header. Used by push mode at startup.
+func SetWebhook(ctx context.Context, baseURL, token, webhookURL, secret string, client *http.Client) error {
+	if token == "" {
+		return fmt.Errorf("telegram token is required")
+	}
+	if webhookURL == "" {
+		return fmt.Errorf("webhook url is required")
+	}
+	if baseURL == "" {
+		baseURL = defaultTelegramBaseURL
+	}
+	if client == nil {
+		client = http.DefaultClient
+	}
+	payload := map[string]string{"url": webhookURL}
+	if secret != "" {
+		payload["secret_token"] = secret
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/bot"+token+"/setWebhook", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if err := checkHTTPResponse(resp); err != nil {
+		return err
+	}
+	var out telegramSendResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return err
+	}
+	if !out.OK {
+		return fmt.Errorf("telegram setWebhook returned ok=false")
+	}
+	return nil
+}
+
 type telegramUpdatesResponse struct {
 	OK     bool             `json:"ok"`
 	Result []telegramUpdate `json:"result"`
