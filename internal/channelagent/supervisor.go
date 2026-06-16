@@ -85,7 +85,7 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 		source := DiscordSource{BaseURL: cfg.Discord.BaseURL, Token: token, ChannelID: b.ChannelID, Limit: 50}
 		sender := DiscordSender{BaseURL: cfg.Discord.BaseURL, Token: token, ChannelID: b.ChannelID}
 		injector := TmuxInjector{Session: b.TmuxSession, Root: b.Root, AutoStart: true}
-		res, err := RunServeOnce(ctx, b.Root, source, injector, sender, timeout)
+		res, err := RunServeOnce(ctx, b.Root, PollIngester{Source: source}, injector, sender, timeout)
 		if err != nil {
 			fmt.Fprintf(stdout, "binding %s error: %v\n", b.Name, err)
 			continue

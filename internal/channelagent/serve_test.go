@@ -24,7 +24,7 @@ func TestRunServeOnceProcessesAndSends(t *testing.T) {
 	}}
 	sender := &recordingSender{}
 
-	result, err := RunServeOnce(context.Background(), root, source, injector, sender, time.Second)
+	result, err := RunServeOnce(context.Background(), root, PollIngester{Source: source}, injector, sender, time.Second)
 	if err != nil {
 		t.Fatalf("RunServeOnce: %v", err)
 	}
