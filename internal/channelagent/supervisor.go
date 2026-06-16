@@ -32,7 +32,7 @@ func runControlAssistant(ctx context.Context, root, tokenEnv, tokenValue string,
 
 // RunSupervisorOnce runs one supervisor cycle: process the control channel,
 // then run the per-binding pipeline for every registered binding.
-func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout time.Duration, stdout io.Writer) error {
+func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout time.Duration, stdout io.Writer, push *PushManager) error {
 	// Resolve root to an absolute path so derived binding worktree/root paths are
 	// absolute. git resolves a relative worktree path against the project repo
 	// (`git -C <repo>`), not this process's cwd, so a relative root would place
@@ -73,6 +73,7 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 		}
 	}
 
+	activePush := map[string]bool{}
 	for _, b := range reg.Bindings {
 		if err := EnsureWorktree(ctx, b.ProjectDir, b.Branch, b.Worktree); err != nil {
 			fmt.Fprintf(stdout, "binding %s worktree error: %v\n", b.Name, err)
@@ -83,16 +84,42 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 			continue
 		}
 		tokens := bindingTokens{discord: token, telegram: os.Getenv(cfg.Telegram.TokenEnv)}
-		ingester, err := SelectIngester(b, cfg, tokens)
-		if err != nil {
-			fmt.Fprintf(stdout, "binding %s ingester error: %v\n", b.Name, err)
-			continue
-		}
 		sender, err := SelectSender(b, cfg, tokens)
 		if err != nil {
 			fmt.Fprintf(stdout, "binding %s sender error: %v\n", b.Name, err)
 			continue
 		}
+
+		// Pick the per-cycle ingester. Poll bindings ingest each cycle; push
+		// bindings ingest out-of-band via a persistent ingester (started once,
+		// kept alive by the PushManager) and only drain here.
+		var ingester Ingester
+		if b.ModeOf() == ModePush {
+			if push == nil {
+				fmt.Fprintf(stdout, "binding %s: push mode but no push manager\n", b.Name)
+				continue
+			}
+			pushIng, err := SelectPushIngester(b, cfg, tokens)
+			if err != nil {
+				fmt.Fprintf(stdout, "binding %s push ingester error: %v\n", b.Name, err)
+				continue
+			}
+			name := b.Name
+			push.Ensure(name, pushIng, func(e error) {
+				if e != nil {
+					fmt.Fprintf(stdout, "binding %s push ingester exited: %v\n", name, e)
+				}
+			})
+			activePush[name] = true
+			ingester = noopIngester{}
+		} else {
+			ingester, err = SelectIngester(b, cfg, tokens)
+			if err != nil {
+				fmt.Fprintf(stdout, "binding %s ingester error: %v\n", b.Name, err)
+				continue
+			}
+		}
+
 		injector := TmuxInjector{Session: b.TmuxSession, Root: b.Root, AutoStart: true}
 		res, err := RunServeOnce(ctx, b.Root, ingester, injector, sender, timeout)
 		if err != nil {
@@ -100,6 +127,10 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 			continue
 		}
 		fmt.Fprintf(stdout, "binding=%s created=%d processed=%t sent=%d\n", b.Name, res.Created, res.Processed, res.Sent)
+	}
+	// Stop push ingesters whose binding was removed or flipped to poll.
+	if push != nil {
+		push.Reconcile(activePush)
 	}
 	return nil
 }

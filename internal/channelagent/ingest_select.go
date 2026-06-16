@@ -1,6 +1,9 @@
 package channelagent
 
-import "fmt"
+import (
+	"context"
+	"fmt"
+)
 
 // bindingTokens carries the resolved bot tokens for each platform so the
 // selectors don't reach into the environment themselves (keeps them testable).
@@ -27,6 +30,35 @@ func SelectIngester(b Binding, cfg Config, tokens bindingTokens) (Ingester, erro
 		return nil, fmt.Errorf("binding %q: push mode for %s not implemented yet", b.Name, b.PlatformOf())
 	default:
 		return nil, fmt.Errorf("binding %q: unknown mode %q", b.Name, b.Mode)
+	}
+}
+
+// noopIngester is used for push bindings on the per-cycle path: the push
+// ingester writes to the inbox out-of-band, so the cycle itself ingests nothing
+// and only drains (worker + sender).
+type noopIngester struct{}
+
+func (noopIngester) Ingest(context.Context, string) (int, error) { return 0, nil }
+
+// SelectPushIngester builds the persistent PushIngester for a push-mode binding.
+//   - telegram → TelegramWebhookIngester (HTTP server hosting the webhook).
+//   - discord  → not implemented yet (Gateway websocket is a later step).
+func SelectPushIngester(b Binding, cfg Config, tokens bindingTokens) (PushIngester, error) {
+	switch b.PlatformOf() {
+	case PlatformTelegram:
+		return TelegramWebhookIngester{
+			Addr: cfg.Push.Listen,
+			Path: "/tg/" + b.ChannelID,
+			Handler: TelegramWebhookHandler{
+				Root:   b.Root,
+				ChatID: b.ChannelID,
+				Secret: cfg.Push.Secret,
+			},
+		}, nil
+	case PlatformDiscord:
+		return nil, fmt.Errorf("binding %q: discord push (gateway websocket) not implemented yet", b.Name)
+	default:
+		return nil, fmt.Errorf("binding %q: unknown platform %q", b.Name, b.Platform)
 	}
 }
 

@@ -105,8 +105,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, err)
 			return 1
 		}
+		// One PushManager lives across the whole serve loop so push ingesters
+		// (webhook servers / gateway sockets) persist between per-cycle ticks.
+		supCtx := context.Background()
+		pushMgr := agent.NewPushManager(supCtx)
+		defer pushMgr.StopAll()
 		for {
-			if err := agent.RunSupervisorOnce(context.Background(), *root, cfg, timeout, stdout); err != nil {
+			if err := agent.RunSupervisorOnce(supCtx, *root, cfg, timeout, stdout, pushMgr); err != nil {
 				fmt.Fprintln(stderr, err)
 				return 1
 			}

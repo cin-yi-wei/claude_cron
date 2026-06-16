@@ -12,6 +12,16 @@ type Config struct {
 	Discord      DiscordConfig  `json:"discord"`
 	Telegram     TelegramConfig `json:"telegram"`
 	Claude       ClaudeConfig   `json:"claude"`
+	Push         PushConfig     `json:"push,omitempty"`
+}
+
+// PushConfig configures push-mode (active) ingestion. Listen is the local
+// address the webhook/HTTP server binds (e.g. ":8443"); Secret, when set, is
+// the token Telegram echoes in X-Telegram-Bot-Api-Secret-Token. All optional;
+// poll-mode bindings ignore this block entirely.
+type PushConfig struct {
+	Listen string `json:"listen,omitempty"`
+	Secret string `json:"secret,omitempty"`
 }
 
 type MockConfig struct {
