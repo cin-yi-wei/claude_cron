@@ -55,3 +55,20 @@ func TestTmuxInjectorAutoStartsMissingSession(t *testing.T) {
 		t.Fatalf("fifth call = %#v, want Enter submit", calls[4])
 	}
 }
+
+func TestBuildClaudePromptTeachesNotify(t *testing.T) {
+	job := InputJob{
+		Schema:    1,
+		JobID:     "j1",
+		RequestID: "r1",
+		InputHash: "h1",
+		Source:    SourceMessage{Platform: "discord", ChannelID: "chan99", Content: "hi"},
+	}
+	p := BuildClaudePrompt(".channel-agent", job, ".channel-agent/outbox/pending/j1.json")
+	if !strings.Contains(p, "claude-cron notify") {
+		t.Fatalf("prompt should teach notify:\n%s", p)
+	}
+	if !strings.Contains(p, "chan99") {
+		t.Fatalf("prompt should include the job's channel id:\n%s", p)
+	}
+}

@@ -145,5 +145,9 @@ JSON 必須是這個格式（注意 send 要設成布林 true 才會把回覆送
 不要自己呼叫任何發送訊息的指令。
 不要修改 %s/state。
 不要移動 inbox/outbox job。
-不要做 hash 判斷。`, root, outputPath, outputPath, 1, job.JobID, job.RequestID, job.InputHash, root)
+不要做 hash 判斷。
+
+若你啟動了長時間的背景任務（detached，例如安裝、編譯、長測試），請在 shell 指令鏈的最後加上：
+&& claude-cron notify %s "完成訊息" --root %s
+這樣任務跑完會自動通知使用者；不要為了等它而卡住這次回覆。`, root, outputPath, outputPath, 1, job.JobID, job.RequestID, job.InputHash, root, job.Source.ChannelID, root)
 }

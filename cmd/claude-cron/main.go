@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	agent "claude_cron/internal/channelagent"
@@ -197,6 +198,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 		fmt.Fprintf(stdout, "sent=%d\n", sent)
 		return 0
+	case "notify":
+		return runNotifyCommand(args[1:], stdout, stderr)
 	case "bind", "unbind", "list":
 		return runManageCommand(args[0], args[1:], stdout, stderr)
 	default:
@@ -371,6 +374,48 @@ func buildSource(adapter, mockPath string, cfg platformConfig) (agent.MessageSou
 	default:
 		return nil, fmt.Errorf("unsupported source adapter %q", adapter)
 	}
+}
+
+func runNotifyCommand(rest []string, stdout, stderr io.Writer) int {
+	root := ".channel-agent"
+	var pos []string
+	for i := 0; i < len(rest); i++ {
+		if rest[i] == "--root" {
+			if i+1 >= len(rest) {
+				fmt.Fprintln(stderr, "--root requires a value")
+				return 2
+			}
+			root = rest[i+1]
+			i++
+			continue
+		}
+		pos = append(pos, rest[i])
+	}
+	if len(pos) < 2 {
+		fmt.Fprintln(stderr, "usage: claude-cron notify <channel-id> <text...> [--root <root>]")
+		return 2
+	}
+	channelID := pos[0]
+	text := strings.Join(pos[1:], " ")
+
+	if absRoot, err := filepath.Abs(root); err == nil {
+		root = absRoot
+	}
+	cfg, err := agent.LoadConfig(root)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	sender := agent.DiscordSender{
+		BaseURL:   cfg.Discord.BaseURL,
+		Token:     os.Getenv(cfg.Discord.TokenEnv),
+		ChannelID: channelID,
+	}
+	if err := sender.Send(context.Background(), agent.OutputJob{Send: true, Text: text}); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	return 0
 }
 
 func buildSender(adapter string, stdout io.Writer, cfg platformConfig) (agent.Sender, error) {
