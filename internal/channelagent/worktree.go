@@ -39,10 +39,16 @@ func EnsureWorktree(ctx context.Context, projectDir, branch, worktreePath string
 		return nil
 	}
 	branchExists := runExternalCommand(ctx, "git", "-C", projectDir, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch) == nil
+	// `-c core.hooksPath=/dev/null` disables repo git hooks for this command. A
+	// `worktree add` runs the post-checkout hook, which fails (non-zero exit) in
+	// repos using hook frameworks like Overcommit when their tooling is not
+	// installed — that failure should not block provisioning. worktreePath must
+	// be absolute: git resolves a relative path against the -C directory, not the
+	// caller's cwd, which would place the worktree inside the project repo.
 	if branchExists {
-		return runExternalCommand(ctx, "git", "-C", projectDir, "worktree", "add", worktreePath, branch)
+		return runExternalCommand(ctx, "git", "-c", "core.hooksPath=/dev/null", "-C", projectDir, "worktree", "add", worktreePath, branch)
 	}
-	return runExternalCommand(ctx, "git", "-C", projectDir, "worktree", "add", "-b", branch, worktreePath)
+	return runExternalCommand(ctx, "git", "-c", "core.hooksPath=/dev/null", "-C", projectDir, "worktree", "add", "-b", branch, worktreePath)
 }
 
 // RemoveWorktree removes a git worktree. Force is used so dirty worktrees are

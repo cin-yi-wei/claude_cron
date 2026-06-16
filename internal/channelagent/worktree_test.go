@@ -24,7 +24,7 @@ func TestEnsureWorktreeCreatesBranchWhenMissing(t *testing.T) {
 		t.Fatalf("EnsureWorktree: %v", err)
 	}
 	wantProbe := []string{"git", "-C", "/repo", "rev-parse", "--verify", "--quiet", "refs/heads/feat"}
-	wantAdd := []string{"git", "-C", "/repo", "worktree", "add", wt, "feat"}
+	wantAdd := []string{"git", "-c", "core.hooksPath=/dev/null", "-C", "/repo", "worktree", "add", wt, "feat"}
 	if len(calls) != 2 || !reflect.DeepEqual(calls[0], wantProbe) || !reflect.DeepEqual(calls[1], wantAdd) {
 		t.Fatalf("calls = %#v", calls)
 	}

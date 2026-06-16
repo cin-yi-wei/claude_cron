@@ -5,12 +5,20 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"time"
 )
 
 // RunSupervisorOnce runs one supervisor cycle: process the control channel,
 // then run the per-binding pipeline for every registered binding.
 func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout time.Duration, stdout io.Writer) error {
+	// Resolve root to an absolute path so derived binding worktree/root paths are
+	// absolute. git resolves a relative worktree path against the project repo
+	// (`git -C <repo>`), not this process's cwd, so a relative root would place
+	// worktrees inside the wrong directory.
+	if abs, err := filepath.Abs(root); err == nil {
+		root = abs
+	}
 	token := os.Getenv(cfg.Discord.TokenEnv)
 	admin := DiscordAdmin{BaseURL: cfg.Discord.BaseURL, Token: token}
 
