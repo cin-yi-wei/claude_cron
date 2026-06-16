@@ -13,11 +13,14 @@ type Command struct {
 	Name  string
 	Args  []string
 	Flags map[string]bool
+	// Opts holds --key=value options (e.g. --platform=tg). Bare --flag tokens
+	// still go to Flags as booleans.
+	Opts map[string]string
 }
 
 // ParseCommand parses a control message. Returns ok=false for non-command text
-// (anything not starting with "/"). Tokens of the form --flag become Flags;
-// everything else is a positional Arg.
+// (anything not starting with "/"). Tokens of the form --key=value become Opts;
+// bare --flag become Flags; everything else is a positional Arg.
 func ParseCommand(content string) (Command, bool) {
 	content = strings.TrimSpace(content)
 	if !strings.HasPrefix(content, "/") {
@@ -27,15 +30,29 @@ func ParseCommand(content string) (Command, bool) {
 	if len(fields) == 0 {
 		return Command{}, false
 	}
-	cmd := Command{Name: fields[0], Flags: map[string]bool{}}
+	cmd := Command{Name: fields[0], Flags: map[string]bool{}, Opts: map[string]string{}}
 	for _, f := range fields[1:] {
 		if strings.HasPrefix(f, "--") {
-			cmd.Flags[strings.TrimPrefix(f, "--")] = true
+			kv := strings.TrimPrefix(f, "--")
+			if k, v, ok := strings.Cut(kv, "="); ok {
+				cmd.Opts[k] = v
+				continue
+			}
+			cmd.Flags[kv] = true
 			continue
 		}
 		cmd.Args = append(cmd.Args, f)
 	}
 	return cmd, true
+}
+
+// opt returns the value of a --key=value option, or "" if absent. Safe on a nil
+// Opts map (commands built without options).
+func (c Command) opt(key string) string {
+	if c.Opts == nil {
+		return ""
+	}
+	return c.Opts[key]
 }
 
 type ControlDeps struct {
@@ -50,7 +67,7 @@ type ControlDeps struct {
 	InitRoot       func(root string) error
 }
 
-const controlUsage = "指令: /bind <name> <project-dir> <branch> | /unbind <name> [--delete-channel] | /list | /status <name> | /help"
+const controlUsage = "指令: /bind <name> <project-dir> <branch> [--platform=dc|tg] [--mode=poll|push] [--chat-id=<id> (tg)] | /unbind <name> [--delete-channel] | /list | /status <name> | /help"
 
 // HandleCommand executes a parsed control command against the registry, using
 // deps for side effects. Returns a reply to post to the control channel and
@@ -90,37 +107,92 @@ func handleBind(ctx context.Context, deps ControlDeps, reg *Registry, cmd Comman
 		return fmt.Sprintf("project-dir %q 不存在", projectDir), false, nil
 	}
 
-	b := BindingDefaults(deps.Root, name, projectDir, branch)
+	platform, perr := normalizePlatform(cmd.opt("platform"))
+	if perr != nil {
+		return perr.Error(), false, nil
+	}
+	mode, merr := normalizeMode(cmd.opt("mode"))
+	if merr != nil {
+		return merr.Error(), false, nil
+	}
 
-	channelID, err := deps.CreateChannel(ctx, deps.GuildID, name)
-	if err != nil {
-		return "", false, fmt.Errorf("建頻道失敗: %w", err)
+	b := BindingDefaults(deps.Root, name, projectDir, branch)
+	b.Platform = platform
+	b.Mode = mode
+
+	// Provision the channel/chat. Discord auto-creates a channel; Telegram reuses
+	// an existing chat, so the chat id must be supplied via --chat-id.
+	var channelID string
+	if platform == PlatformTelegram {
+		channelID = cmd.opt("chat-id")
+		if channelID == "" {
+			return "telegram 綁定需要 --chat-id=<chat id>", false, nil
+		}
+	} else {
+		var err error
+		channelID, err = deps.CreateChannel(ctx, deps.GuildID, name)
+		if err != nil {
+			return "", false, fmt.Errorf("建頻道失敗: %w", err)
+		}
 	}
 	b.ChannelID = channelID
 
+	// On failure, only tear down a channel we created. A Telegram chat is the
+	// user's, never ours to delete.
+	cleanupChannel := func() {
+		if platform == PlatformDiscord {
+			_ = deps.DeleteChannel(ctx, channelID)
+		}
+	}
+
 	if err := deps.EnsureWorktree(ctx, projectDir, branch, b.Worktree); err != nil {
 		_ = deps.RemoveWorktree(ctx, projectDir, b.Worktree)
-		_ = deps.DeleteChannel(ctx, channelID)
+		cleanupChannel()
 		return "", false, fmt.Errorf("建 worktree 失敗: %w", err)
 	}
 	if err := deps.InitRoot(b.Root); err != nil {
 		_ = deps.RemoveWorktree(ctx, projectDir, b.Worktree)
-		_ = deps.DeleteChannel(ctx, channelID)
+		cleanupChannel()
 		return "", false, fmt.Errorf("init root 失敗: %w", err)
 	}
 	if err := deps.StartSession(ctx, b.TmuxSession, b.Worktree); err != nil {
 		_ = deps.RemoveWorktree(ctx, projectDir, b.Worktree)
-		_ = deps.DeleteChannel(ctx, channelID)
+		cleanupChannel()
 		return "", false, fmt.Errorf("啟 session 失敗: %w", err)
 	}
 
 	if err := reg.Add(b); err != nil {
 		_ = deps.StopSession(ctx, b.TmuxSession)
 		_ = deps.RemoveWorktree(ctx, projectDir, b.Worktree)
-		_ = deps.DeleteChannel(ctx, channelID)
+		cleanupChannel()
 		return "", false, err
 	}
-	return fmt.Sprintf("✅ 綁定 %s → channel %s (branch %s, session %s)", name, channelID, branch, b.TmuxSession), true, nil
+	return fmt.Sprintf("✅ 綁定 %s [%s/%s] → channel %s (branch %s, session %s)", name, b.PlatformOf(), b.ModeOf(), channelID, branch, b.TmuxSession), true, nil
+}
+
+// normalizePlatform maps user input (incl. dc/tg aliases) to a canonical
+// platform. Empty defaults to discord.
+func normalizePlatform(s string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "dc", "discord":
+		return PlatformDiscord, nil
+	case "tg", "telegram":
+		return PlatformTelegram, nil
+	default:
+		return "", fmt.Errorf("platform %q 不合法 (用 discord|dc 或 telegram|tg)", s)
+	}
+}
+
+// normalizeMode maps user input to a canonical mode. Empty defaults to poll.
+func normalizeMode(s string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "poll", "passive":
+		return ModePoll, nil
+	case "push", "active":
+		return ModePush, nil
+	default:
+		return "", fmt.Errorf("mode %q 不合法 (用 poll|passive 或 push|active)", s)
+	}
 }
 
 func handleUnbind(ctx context.Context, deps ControlDeps, reg *Registry, cmd Command) (string, bool, error) {
@@ -148,7 +220,7 @@ func handleList(reg *Registry) string {
 	}
 	var sb strings.Builder
 	for _, b := range reg.Bindings {
-		fmt.Fprintf(&sb, "• %s → channel %s | branch %s | session %s\n", b.Name, b.ChannelID, b.Branch, b.TmuxSession)
+		fmt.Fprintf(&sb, "• %s [%s/%s] → channel %s | branch %s | session %s\n", b.Name, b.PlatformOf(), b.ModeOf(), b.ChannelID, b.Branch, b.TmuxSession)
 	}
 	return strings.TrimRight(sb.String(), "\n")
 }

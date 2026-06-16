@@ -212,17 +212,24 @@ func runManageCommand(name string, rest []string, stdout, stderr io.Writer) int 
 	root := ".channel-agent"
 	deleteChannel := false
 	var pos []string
+	opts := map[string]string{}
 	for i := 0; i < len(rest); i++ {
-		switch rest[i] {
-		case "--root":
+		switch {
+		case rest[i] == "--root":
 			if i+1 >= len(rest) {
 				fmt.Fprintln(stderr, "--root requires a value")
 				return 2
 			}
 			root = rest[i+1]
 			i++
-		case "--delete-channel":
+		case rest[i] == "--delete-channel":
 			deleteChannel = true
+		case strings.HasPrefix(rest[i], "--"):
+			// --key=value options (e.g. --platform=tg). Bare flags fall through.
+			kv := strings.TrimPrefix(rest[i], "--")
+			if k, v, ok := strings.Cut(kv, "="); ok {
+				opts[k] = v
+			}
 		default:
 			pos = append(pos, rest[i])
 		}
@@ -245,7 +252,7 @@ func runManageCommand(name string, rest []string, stdout, stderr io.Writer) int 
 	}
 	deps := agent.BuildControlDeps(root, cfg)
 
-	cmd := agent.Command{Name: name, Args: pos, Flags: map[string]bool{}}
+	cmd := agent.Command{Name: name, Args: pos, Flags: map[string]bool{}, Opts: opts}
 	if deleteChannel {
 		cmd.Flags["delete-channel"] = true
 	}
