@@ -402,6 +402,11 @@ func runNotifyCommand(rest []string, stdout, stderr io.Writer) int {
 	if absRoot, err := filepath.Abs(root); err == nil {
 		root = absRoot
 	}
+	// Be forgiving about the --root the caller passed: notify is often invoked
+	// with the control subdir (.channel-agent/control) but config.json lives at
+	// .channel-agent. Walk up to the nearest ancestor that actually has a
+	// config.json so both roots work.
+	root = resolveConfigRoot(root)
 	loadDotEnv(root)
 	cfg, err := agent.LoadConfig(root)
 	if err != nil {
@@ -439,6 +444,24 @@ func buildSender(adapter string, stdout io.Writer, cfg platformConfig) (agent.Se
 	default:
 		return nil, fmt.Errorf("unsupported adapter %q", adapter)
 	}
+}
+
+// resolveConfigRoot returns the nearest ancestor of start (including start
+// itself) that contains a config.json. If none is found within a bounded walk,
+// start is returned unchanged so the caller surfaces the original error.
+func resolveConfigRoot(start string) string {
+	dir := start
+	for i := 0; i < 8; i++ {
+		if _, err := os.Stat(agent.ConfigPath(dir)); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return start
 }
 
 // loadDotEnv walks up from start (bounded) looking for a .env file and loads
