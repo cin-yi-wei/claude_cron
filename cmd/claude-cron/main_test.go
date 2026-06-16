@@ -251,3 +251,48 @@ func TestBindSubcommandRejectsBadName(t *testing.T) {
 		t.Fatalf("expected name error, got stdout=%q stderr=%q", stdout.String(), stderr.String())
 	}
 }
+
+func TestNotifySubcommandPostsMessage(t *testing.T) {
+	var gotPath string
+	var gotBody map[string]string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"x"}`))
+	}))
+	defer server.Close()
+
+	t.Setenv("NOTIFY_TEST_TOKEN", "tok")
+	root := filepath.Join(t.TempDir(), ".channel-agent")
+	if err := agent.Init(root); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	cfg, _ := agent.DefaultConfig("discord")
+	cfg.Discord.TokenEnv = "NOTIFY_TEST_TOKEN"
+	cfg.Discord.BaseURL = server.URL + "/api/v10"
+	cfg.Discord.ChannelID = "ignored"
+	if err := agent.SaveConfig(root, cfg); err != nil {
+		t.Fatalf("SaveConfig: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"notify", "chan42", "all", "done", "--root", root}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr=%s", code, stderr.String())
+	}
+	if gotPath != "/api/v10/channels/chan42/messages" {
+		t.Fatalf("path = %q", gotPath)
+	}
+	if gotBody["content"] != "all done" {
+		t.Fatalf("content = %q, want 'all done'", gotBody["content"])
+	}
+}
+
+func TestNotifySubcommandRequiresArgs(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"notify"}, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("exit = %d, want 2", code)
+	}
+}
