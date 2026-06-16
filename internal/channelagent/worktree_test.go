@@ -1,0 +1,50 @@
+package channelagent
+
+import (
+	"context"
+	"path/filepath"
+	"reflect"
+	"testing"
+)
+
+func TestEnsureWorktreeCreatesBranchWhenMissing(t *testing.T) {
+	old := runExternalCommand
+	defer func() { runExternalCommand = old }()
+
+	var calls [][]string
+	runExternalCommand = func(_ context.Context, name string, args ...string) error {
+		calls = append(calls, append([]string{name}, args...))
+		return nil // rev-parse "succeeds" => branch exists path
+	}
+
+	wt := filepath.Join(t.TempDir(), "does-not-exist", "wt") // os.Stat will fail => proceed
+	if err := EnsureWorktree(context.Background(), "/repo", "feat", wt); err != nil {
+		t.Fatalf("EnsureWorktree: %v", err)
+	}
+	wantProbe := []string{"git", "-C", "/repo", "rev-parse", "--verify", "--quiet", "refs/heads/feat"}
+	wantAdd := []string{"git", "-C", "/repo", "worktree", "add", wt, "feat"}
+	if len(calls) != 2 || !reflect.DeepEqual(calls[0], wantProbe) || !reflect.DeepEqual(calls[1], wantAdd) {
+		t.Fatalf("calls = %#v", calls)
+	}
+}
+
+func TestStartTmuxClaudeStartsWhenMissing(t *testing.T) {
+	old := runExternalCommand
+	defer func() { runExternalCommand = old }()
+
+	var calls [][]string
+	runExternalCommand = func(_ context.Context, name string, args ...string) error {
+		calls = append(calls, append([]string{name}, args...))
+		if len(args) > 0 && args[0] == "has-session" {
+			return context.Canceled // simulate "no such session"
+		}
+		return nil
+	}
+	if err := StartTmuxClaude(context.Background(), "cc-proj", "/repo/wt"); err != nil {
+		t.Fatalf("StartTmuxClaude: %v", err)
+	}
+	wantStart := []string{"tmux", "new-session", "-d", "-s", "cc-proj", "-c", "/repo/wt", "claude"}
+	if len(calls) != 2 || !reflect.DeepEqual(calls[1], wantStart) {
+		t.Fatalf("calls = %#v", calls)
+	}
+}

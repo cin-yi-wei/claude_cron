@@ -104,22 +104,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return 1
 		}
 		for {
-			source, err := buildSourceFromConfig(cfg)
-			if err != nil {
+			if err := agent.RunSupervisorOnce(context.Background(), *root, cfg, timeout, stdout); err != nil {
 				fmt.Fprintln(stderr, err)
 				return 1
 			}
-			sender, err := buildSenderFromConfig(cfg, stdout)
-			if err != nil {
-				fmt.Fprintln(stderr, err)
-				return 1
-			}
-			result, err := agent.RunServeOnce(context.Background(), *root, source, agent.TmuxInjector{Session: cfg.Claude.TmuxSession, Root: *root, AutoStart: cfg.Claude.AutoStart}, sender, timeout)
-			if err != nil {
-				fmt.Fprintln(stderr, err)
-				return 1
-			}
-			fmt.Fprintf(stdout, "created=%d processed=%t sent=%d\n", result.Created, result.Processed, result.Sent)
 			if *once {
 				return 0
 			}
@@ -260,21 +248,23 @@ func validateConfigForServe(cfg agent.Config) error {
 		if cfg.Discord.ChannelID == "" {
 			return fmt.Errorf("discord channel_id is required")
 		}
-		if cfg.Discord.TokenEnv == "" || os.Getenv(cfg.Discord.TokenEnv) == "" {
-			return fmt.Errorf("discord token env %q is not set", cfg.Discord.TokenEnv)
+		// Token value is checked at runtime; the supervisor handles auth errors gracefully.
+		if cfg.Discord.TokenEnv == "" {
+			return fmt.Errorf("discord token_env is required")
+		}
+		if cfg.Discord.GuildID == "" {
+			return fmt.Errorf("discord guild_id is required")
 		}
 	case "telegram":
 		if cfg.Telegram.ChatID == "" {
 			return fmt.Errorf("telegram chat_id is required")
 		}
-		if cfg.Telegram.TokenEnv == "" || os.Getenv(cfg.Telegram.TokenEnv) == "" {
-			return fmt.Errorf("telegram token env %q is not set", cfg.Telegram.TokenEnv)
+		// Token value is checked at runtime; the supervisor handles auth errors gracefully.
+		if cfg.Telegram.TokenEnv == "" {
+			return fmt.Errorf("telegram token_env is required")
 		}
 	default:
 		return fmt.Errorf("unsupported platform %q", cfg.Platform)
-	}
-	if cfg.Claude.TmuxSession == "" {
-		return fmt.Errorf("claude tmux_session is required")
 	}
 	if cfg.Claude.Timeout == "" {
 		return fmt.Errorf("claude timeout is required")
@@ -283,49 +273,6 @@ func validateConfigForServe(cfg agent.Config) error {
 		return fmt.Errorf("poll_interval is required")
 	}
 	return nil
-}
-
-func buildSourceFromConfig(cfg agent.Config) (agent.MessageSource, error) {
-	switch cfg.Platform {
-	case "mock":
-		return agent.MockFileSource{Path: cfg.Mock.SourcePath}, nil
-	case "discord":
-		return agent.DiscordSource{
-			BaseURL:   cfg.Discord.BaseURL,
-			Token:     os.Getenv(cfg.Discord.TokenEnv),
-			ChannelID: cfg.Discord.ChannelID,
-			Limit:     50,
-		}, nil
-	case "telegram":
-		return agent.TelegramSource{
-			BaseURL: cfg.Telegram.BaseURL,
-			Token:   os.Getenv(cfg.Telegram.TokenEnv),
-			ChatID:  cfg.Telegram.ChatID,
-		}, nil
-	default:
-		return nil, fmt.Errorf("unsupported platform %q", cfg.Platform)
-	}
-}
-
-func buildSenderFromConfig(cfg agent.Config, stdout io.Writer) (agent.Sender, error) {
-	switch cfg.Platform {
-	case "mock":
-		return agent.StdoutSender{Writer: stdout}, nil
-	case "discord":
-		return agent.DiscordSender{
-			BaseURL:   cfg.Discord.BaseURL,
-			Token:     os.Getenv(cfg.Discord.TokenEnv),
-			ChannelID: cfg.Discord.ChannelID,
-		}, nil
-	case "telegram":
-		return agent.TelegramSender{
-			BaseURL: cfg.Telegram.BaseURL,
-			Token:   os.Getenv(cfg.Telegram.TokenEnv),
-			ChatID:  cfg.Telegram.ChatID,
-		}, nil
-	default:
-		return nil, fmt.Errorf("unsupported platform %q", cfg.Platform)
-	}
 }
 
 type platformConfig struct {

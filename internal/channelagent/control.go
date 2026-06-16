@@ -1,0 +1,231 @@
+package channelagent
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"sort"
+	"strings"
+)
+
+type Command struct {
+	Name  string
+	Args  []string
+	Flags map[string]bool
+}
+
+// ParseCommand parses a control message. Returns ok=false for non-command text
+// (anything not starting with "/"). Tokens of the form --flag become Flags;
+// everything else is a positional Arg.
+func ParseCommand(content string) (Command, bool) {
+	content = strings.TrimSpace(content)
+	if !strings.HasPrefix(content, "/") {
+		return Command{}, false
+	}
+	fields := strings.Fields(content[1:])
+	if len(fields) == 0 {
+		return Command{}, false
+	}
+	cmd := Command{Name: fields[0], Flags: map[string]bool{}}
+	for _, f := range fields[1:] {
+		if strings.HasPrefix(f, "--") {
+			cmd.Flags[strings.TrimPrefix(f, "--")] = true
+			continue
+		}
+		cmd.Args = append(cmd.Args, f)
+	}
+	return cmd, true
+}
+
+type ControlDeps struct {
+	Root           string
+	GuildID        string
+	CreateChannel  func(ctx context.Context, guildID, name string) (string, error)
+	DeleteChannel  func(ctx context.Context, channelID string) error
+	EnsureWorktree func(ctx context.Context, projectDir, branch, worktree string) error
+	RemoveWorktree func(ctx context.Context, projectDir, worktree string) error
+	StartSession   func(ctx context.Context, session, cwd string) error
+	StopSession    func(ctx context.Context, session string) error
+	InitRoot       func(root string) error
+}
+
+const controlUsage = "指令: /bind <name> <project-dir> <branch> | /unbind <name> [--delete-channel] | /list | /status <name> | /help"
+
+// HandleCommand executes a parsed control command against the registry, using
+// deps for side effects. Returns a reply to post to the control channel and
+// whether the registry changed (caller persists it).
+func HandleCommand(ctx context.Context, deps ControlDeps, reg *Registry, cmd Command) (string, bool, error) {
+	switch cmd.Name {
+	case "bind":
+		return handleBind(ctx, deps, reg, cmd)
+	case "unbind":
+		return handleUnbind(ctx, deps, reg, cmd)
+	case "list":
+		return handleList(reg), false, nil
+	case "status":
+		return handleStatus(reg, cmd), false, nil
+	case "help":
+		return controlUsage, false, nil
+	default:
+		return "未知指令。" + controlUsage, false, nil
+	}
+}
+
+func handleBind(ctx context.Context, deps ControlDeps, reg *Registry, cmd Command) (string, bool, error) {
+	if len(cmd.Args) != 3 {
+		return "用法: /bind <name> <project-dir> <branch>", false, nil
+	}
+	name, projectDir, branch := cmd.Args[0], cmd.Args[1], cmd.Args[2]
+	if !ValidName(name) {
+		return fmt.Sprintf("name %q 不合法 (只能用 a-z 0-9 -)", name), false, nil
+	}
+	if _, ok := reg.Get(name); ok {
+		return fmt.Sprintf("binding %q 已存在", name), false, nil
+	}
+	if _, err := os.Stat(projectDir); err != nil {
+		return fmt.Sprintf("project-dir %q 不存在", projectDir), false, nil
+	}
+
+	b := BindingDefaults(deps.Root, name, projectDir, branch)
+
+	channelID, err := deps.CreateChannel(ctx, deps.GuildID, name)
+	if err != nil {
+		return "", false, fmt.Errorf("建頻道失敗: %w", err)
+	}
+	b.ChannelID = channelID
+
+	if err := deps.EnsureWorktree(ctx, projectDir, branch, b.Worktree); err != nil {
+		_ = deps.RemoveWorktree(ctx, projectDir, b.Worktree)
+		_ = deps.DeleteChannel(ctx, channelID)
+		return "", false, fmt.Errorf("建 worktree 失敗: %w", err)
+	}
+	if err := deps.InitRoot(b.Root); err != nil {
+		_ = deps.RemoveWorktree(ctx, projectDir, b.Worktree)
+		_ = deps.DeleteChannel(ctx, channelID)
+		return "", false, fmt.Errorf("init root 失敗: %w", err)
+	}
+	if err := deps.StartSession(ctx, b.TmuxSession, b.Worktree); err != nil {
+		_ = deps.RemoveWorktree(ctx, projectDir, b.Worktree)
+		_ = deps.DeleteChannel(ctx, channelID)
+		return "", false, fmt.Errorf("啟 session 失敗: %w", err)
+	}
+
+	if err := reg.Add(b); err != nil {
+		_ = deps.StopSession(ctx, b.TmuxSession)
+		_ = deps.RemoveWorktree(ctx, projectDir, b.Worktree)
+		_ = deps.DeleteChannel(ctx, channelID)
+		return "", false, err
+	}
+	return fmt.Sprintf("✅ 綁定 %s → channel %s (branch %s, session %s)", name, channelID, branch, b.TmuxSession), true, nil
+}
+
+func handleUnbind(ctx context.Context, deps ControlDeps, reg *Registry, cmd Command) (string, bool, error) {
+	if len(cmd.Args) != 1 {
+		return "用法: /unbind <name> [--delete-channel]", false, nil
+	}
+	name := cmd.Args[0]
+	b, ok := reg.Get(name)
+	if !ok {
+		return fmt.Sprintf("找不到 binding %q", name), false, nil
+	}
+	_ = deps.StopSession(ctx, b.TmuxSession)
+	_ = deps.RemoveWorktree(ctx, b.ProjectDir, b.Worktree)
+	if cmd.Flags["delete-channel"] {
+		_ = deps.DeleteChannel(ctx, b.ChannelID)
+	}
+	_ = os.RemoveAll(b.Root)
+	reg.Remove(name)
+	return fmt.Sprintf("🗑️ 解綁 %s 完成", name), true, nil
+}
+
+func handleList(reg *Registry) string {
+	if len(reg.Bindings) == 0 {
+		return "(無綁定)"
+	}
+	var sb strings.Builder
+	for _, b := range reg.Bindings {
+		fmt.Fprintf(&sb, "• %s → channel %s | branch %s | session %s\n", b.Name, b.ChannelID, b.Branch, b.TmuxSession)
+	}
+	return strings.TrimRight(sb.String(), "\n")
+}
+
+func handleStatus(reg *Registry, cmd Command) string {
+	if len(cmd.Args) != 1 {
+		return "用法: /status <name>"
+	}
+	b, ok := reg.Get(cmd.Args[0])
+	if !ok {
+		return fmt.Sprintf("找不到 binding %q", cmd.Args[0])
+	}
+	pending := countJSON(pathIn(b.Root, "inbox", "pending"))
+	processing := countJSON(pathIn(b.Root, "inbox", "processing"))
+	failed := countJSON(pathIn(b.Root, "inbox", "failed"))
+	return fmt.Sprintf("%s: session %s | pending=%d processing=%d failed=%d", b.Name, b.TmuxSession, pending, processing, failed)
+}
+
+func countJSON(dir string) int {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".json") {
+			n++
+		}
+	}
+	return n
+}
+
+// RunControlOnce polls the control channel, executes any new commands, replies,
+// persists the registry when it changed, and records processed message IDs so
+// they are not handled twice. Dedup reuses the watcher's seen-state pattern
+// under a control-specific state file.
+func RunControlOnce(ctx context.Context, root string, deps ControlDeps, reg *Registry, source MessageSource, sender Sender) error {
+	if err := Init(root); err != nil {
+		return err
+	}
+	messages, err := source.Fetch(ctx)
+	if err != nil {
+		return err
+	}
+	sort.SliceStable(messages, func(i, j int) bool { return messages[i].CreatedAt < messages[j].CreatedAt })
+
+	statePath := pathIn(root, "state", "control_seen.json")
+	state, err := readSeenState(statePath)
+	if err != nil {
+		return err
+	}
+
+	changed := false
+	for _, m := range messages {
+		key := seenKey(m)
+		if state.MessageIDs[key] {
+			continue
+		}
+		cmd, ok := ParseCommand(m.Content)
+		if !ok {
+			state.MessageIDs[key] = true
+			continue
+		}
+		reply, regChanged, herr := HandleCommand(ctx, deps, reg, cmd)
+		if herr != nil {
+			// Leave unseen so a transient failure can be retried next poll.
+			_ = sender.Send(ctx, OutputJob{Send: true, Text: "⚠️ " + herr.Error()})
+			continue
+		}
+		state.MessageIDs[key] = true
+		if regChanged {
+			changed = true
+		}
+		if reply != "" {
+			_ = sender.Send(ctx, OutputJob{Send: true, Text: reply})
+		}
+	}
+	if changed {
+		if err := SaveRegistry(root, *reg); err != nil {
+			return err
+		}
+	}
+	return AtomicWriteJSON(statePath, state)
+}

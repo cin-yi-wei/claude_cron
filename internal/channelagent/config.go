@@ -21,6 +21,7 @@ type MockConfig struct {
 type DiscordConfig struct {
 	TokenEnv  string `json:"token_env"`
 	ChannelID string `json:"channel_id"`
+	GuildID   string `json:"guild_id,omitempty"`
 	BaseURL   string `json:"base_url,omitempty"`
 }
 
