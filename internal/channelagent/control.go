@@ -109,6 +109,9 @@ func handleBind(ctx context.Context, deps ControlDeps, reg *Registry, cmd Comman
 	}
 
 	if err := reg.Add(b); err != nil {
+		_ = deps.StopSession(ctx, b.TmuxSession)
+		_ = deps.RemoveWorktree(ctx, projectDir, b.Worktree)
+		_ = deps.DeleteChannel(ctx, channelID)
 		return "", false, err
 	}
 	return fmt.Sprintf("✅ 綁定 %s → channel %s (branch %s, session %s)", name, channelID, branch, b.TmuxSession), true, nil
