@@ -2,6 +2,8 @@
 
 Claude Cron watches Discord or Telegram messages, injects each message into a long-running Claude Code tmux session, waits for Claude to write a reply file, then sends the verified reply back.
 
+It also runs a **multi-project control plane**: a single `serve` supervisor can manage many `Discord channel ↔ tmux Claude session` bindings, dispatched from a control channel with `/bind`, `/unbind`, `/list`, and `/status` commands. Each binding is isolated on its own git worktree branch. The control channel is also an AI assistant — free-text messages are answered by a dedicated Claude session that can manage bindings and run shell tasks. See [Multi-Project Control Plane](#multi-project-control-plane).
+
 It is built as a single CLI binary. Users do not need Go unless they want to build from source.
 
 ## Install From GitHub Release
@@ -53,8 +55,9 @@ Invoke-WebRequest -Uri "https://github.com/cin-yi-wei/claude_cron/releases/lates
 ## Requirements
 
 - Claude Code CLI installed and logged in.
-- `tmux` installed on Linux/macOS.
+- `tmux` installed on Linux/macOS (3.x; the control assistant uses `tmux new-session -e`).
 - A Discord bot token or Telegram bot token.
+- For the multi-project control plane (auto-creating channels): a Discord bot with the **Manage Channels** permission, and `discord.guild_id` set in the config.
 
 First-time Claude Code login may still require opening Claude manually once:
 
@@ -89,6 +92,59 @@ claude-cron init telegram \
 claude-cron doctor --root .channel-agent
 claude-cron serve --root .channel-agent
 ```
+
+## Multi-Project Control Plane
+
+Run one `serve` against a control channel and dispatch many project bindings from it. Each binding gets its own Discord channel, its own tmux Claude session, and an isolated git worktree on a chosen branch.
+
+Set up the control config (the `discord.channel_id` is the control channel; `discord.guild_id` is required so the bot can create channels):
+
+```bash
+export DISCORD_BOT_TOKEN=...
+
+claude-cron init discord \
+  --root .channel-agent \
+  --discord-channel-id <control-channel-id>
+
+# add "guild_id": "<server-id>" under "discord" in .channel-agent/config.json
+claude-cron serve --root .channel-agent
+```
+
+Then, in the control channel, use slash commands:
+
+```text
+/bind <name> <project-dir> <branch>   # create a channel + worktree + session for a project
+/unbind <name> [--delete-channel]     # tear it down (keeps the Discord channel unless --delete-channel)
+/list                                  # list bindings
+/status <name>                         # session + queue status for one binding
+/help
+```
+
+`/bind myproj /home/me/proj feature-x` creates a Discord channel `myproj`, a git worktree of `/home/me/proj` on branch `feature-x` (created from HEAD if new), and a tmux session `cc-myproj` running Claude in that worktree. Messages posted in the new `#myproj` channel are answered by that project's Claude session.
+
+The same actions are available as CLI subcommands (used by the control assistant, or directly):
+
+```bash
+claude-cron bind <name> <project-dir> <branch> --root .channel-agent
+claude-cron unbind <name> [--delete-channel] --root .channel-agent
+claude-cron list --root .channel-agent
+```
+
+### Control Channel AI Assistant
+
+Non-command (free-text) messages in the control channel are handled by a dedicated `cc-control` Claude session running in `<root>/control-workspace`. Ask it questions, tell it to do things ("create a folder", "scaffold X"), or manage bindings in natural language (it runs the `claude-cron bind/...` CLI for you).
+
+> Security: the control assistant has shell access and the bot token in its environment, and can create/delete bindings. Restrict the control channel to trusted users via Discord channel permissions.
+
+### Notifying When Long Tasks Finish
+
+Agents are request/response — after launching a long detached task they go idle and cannot proactively message you. Use `notify` to post to a channel from the shell, so a background task can report its own completion:
+
+```bash
+claude-cron notify <channel-id> "build finished ✅" --root .channel-agent
+```
+
+Agents are instructed (in their job prompt) to end long detached background tasks with `&& claude-cron notify <their-channel-id> "..." --root <root>` so you get pinged when the work is done.
 
 ## Useful Commands
 
