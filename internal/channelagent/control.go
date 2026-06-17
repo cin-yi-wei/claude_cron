@@ -361,23 +361,42 @@ func ControlBinding(root string) Binding {
 }
 
 // ControlBindingFor returns the reserved control binding for a given control
-// plane. The discord plane keeps the legacy paths (cc-control, root/control,
-// root/control-workspace) so the running control channel is undisturbed; other
-// planes get a "-<plane>" suffix so their session/root/state never collide.
+// plane. Sessions, roots, and workspaces are fully symmetric per plane using the
+// short code (cc-dc-control + root/control-dc + root/control-dc-workspace,
+// cc-tg-control + root/control-tg + root/control-tg-workspace) so nothing
+// collides. NOTE: the workspace folder is the key auto-resume uses to find a
+// session's transcript — renaming these paths requires migrating the existing
+// dirs AND copying the matching ~/.claude/projects transcript dir, or the
+// control assistant loses its memory.
 func ControlBindingFor(root, planeName string) Binding {
 	if planeName == "" || planeName == PlatformDiscord {
 		return Binding{
 			Name:        "control",
-			TmuxSession: "cc-control",
-			Root:        filepath.Join(root, "control"),
-			Worktree:    filepath.Join(root, "control-workspace"),
+			TmuxSession: "cc-dc-control",
+			Root:        filepath.Join(root, "control-dc"),
+			Worktree:    filepath.Join(root, "control-dc-workspace"),
 		}
 	}
+	short := planeShort(planeName)
 	return Binding{
 		Name:        "control-" + planeName,
-		TmuxSession: "cc-control-" + planeName,
-		Root:        filepath.Join(root, "control-"+planeName),
-		Worktree:    filepath.Join(root, "control-"+planeName+"-workspace"),
+		TmuxSession: "cc-" + short + "-control",
+		Root:        filepath.Join(root, "control-"+short),
+		Worktree:    filepath.Join(root, "control-"+short+"-workspace"),
+	}
+}
+
+// planeShort maps a control-plane name to the short code used in its tmux session
+// name and folder paths, so everything is symmetric: cc-dc-control / cc-tg-control
+// and control-dc / control-tg.
+func planeShort(planeName string) string {
+	switch planeName {
+	case PlatformDiscord:
+		return "dc"
+	case PlatformTelegram:
+		return "tg"
+	default:
+		return planeName
 	}
 }
 

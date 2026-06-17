@@ -182,13 +182,29 @@ func TestControlBindingDerivation(t *testing.T) {
 	if b.Name != "control" {
 		t.Fatalf("Name = %q", b.Name)
 	}
-	if b.TmuxSession != "cc-control" {
+	if b.TmuxSession != "cc-dc-control" {
 		t.Fatalf("TmuxSession = %q", b.TmuxSession)
 	}
-	if b.Root != "/abs/root/control" {
+	if b.Root != "/abs/root/control-dc" {
 		t.Fatalf("Root = %q", b.Root)
 	}
-	if b.Worktree != "/abs/root/control-workspace" {
+	if b.Worktree != "/abs/root/control-dc-workspace" {
+		t.Fatalf("Worktree (workspace) = %q", b.Worktree)
+	}
+}
+
+func TestControlBindingDerivationTelegram(t *testing.T) {
+	b := ControlBindingFor("/abs/root", PlatformTelegram)
+	if b.Name != "control-telegram" {
+		t.Fatalf("Name = %q", b.Name)
+	}
+	if b.TmuxSession != "cc-tg-control" {
+		t.Fatalf("TmuxSession = %q", b.TmuxSession)
+	}
+	if b.Root != "/abs/root/control-tg" {
+		t.Fatalf("Root = %q", b.Root)
+	}
+	if b.Worktree != "/abs/root/control-tg-workspace" {
 		t.Fatalf("Worktree (workspace) = %q", b.Worktree)
 	}
 }

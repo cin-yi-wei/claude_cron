@@ -5,3 +5,7 @@
 .env
 /.channel-agent/
 /.claude/
+
+# one-off migration artifacts
+.migration-*
+.migration-backup/
