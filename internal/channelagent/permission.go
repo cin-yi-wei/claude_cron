@@ -49,14 +49,16 @@ func hookDecisionJSON(allow bool, reason string) string {
 
 // parseDecision interprets a user reply as allow/deny. ok=false if it is not a
 // recognizable decision (so it can be treated as a normal message).
-func parseDecision(content string) (allow bool, ok bool) {
+func parseDecision(content string) (allow, remember, ok bool) {
 	switch strings.ToLower(strings.TrimSpace(content)) {
+	case "ya", "y!", "yy", "always", "y always", "記住", "都允許", "永遠":
+		return true, true, true // allow + remember this category
 	case "y", "yes", "allow", "ok", "准", "允許", "可以", "好":
-		return true, true
+		return true, false, true
 	case "n", "no", "deny", "拒絕", "不", "否":
-		return false, true
+		return false, false, true
 	default:
-		return false, false
+		return false, false, false
 	}
 }
 
@@ -70,10 +72,10 @@ func bashCommand(raw json.RawMessage) string {
 	return ""
 }
 
-// bashNeedsApproval reports whether a bash command is risky enough to ask the
-// user: package installs, downloads, privilege escalation, destructive removes.
-// Everything else (file edits, git, build/test, navigation) is auto-allowed.
-func bashNeedsApproval(cmd string) bool {
+// matchedRiskyPattern returns the risky pattern a bash command matches (install,
+// download, privilege, destructive), or "" if none. The pattern doubles as the
+// "remember" key, so approving once can auto-allow that category later.
+func matchedRiskyPattern(cmd string) string {
 	c := strings.ToLower(cmd)
 	for _, pat := range []string{
 		"npm install", "npm i ", "npm ci", "yarn add", "pnpm add", "pnpm install",
@@ -82,10 +84,60 @@ func bashNeedsApproval(cmd string) bool {
 		"go install", "go get", "curl ", "wget ", "sudo ", "rm -rf", "mkfs", "dd if=",
 	} {
 		if strings.Contains(c, pat) {
+			return pat
+		}
+	}
+	return ""
+}
+
+// bashNeedsApproval reports whether a bash command should be escalated.
+func bashNeedsApproval(cmd string) bool { return matchedRiskyPattern(cmd) != "" }
+
+// gateKey is the "remember" key for a gated tool call: the matched risky pattern
+// for Bash, else the tool name (e.g. an MCP tool).
+func gateKey(toolName string, toolInput json.RawMessage) string {
+	if toolName == "Bash" {
+		if p := matchedRiskyPattern(bashCommand(toolInput)); p != "" {
+			return "bash:" + p
+		}
+		return ""
+	}
+	return "tool:" + toolName
+}
+
+// remembered approvals are stored per binding so an approved category isn't
+// re-asked. Cleared by deleting permissions/allowed.json.
+func allowedKeysPath(root string) string { return pathIn(root, "permissions", "allowed.json") }
+
+func isRemembered(root, key string) bool {
+	if key == "" {
+		return false
+	}
+	var keys []string
+	if err := ReadJSON(allowedKeysPath(root), &keys); err != nil {
+		return false
+	}
+	for _, k := range keys {
+		if k == key {
 			return true
 		}
 	}
 	return false
+}
+
+func rememberKey(root, key string) error {
+	if key == "" {
+		return nil
+	}
+	var keys []string
+	_ = ReadJSON(allowedKeysPath(root), &keys)
+	for _, k := range keys {
+		if k == key {
+			return nil
+		}
+	}
+	keys = append(keys, key)
+	return AtomicWriteJSON(allowedKeysPath(root), keys)
 }
 
 // summarizeToolInput renders a short human description of what's being run.
@@ -143,31 +195,41 @@ func RunPermissionGate(ctx context.Context, registryRoot string, in io.Reader, o
 		return nil
 	}
 
+	// If this category was already approved with "remember", auto-allow it.
+	key := gateKey(hi.ToolName, hi.ToolInput)
+	if isRemembered(b.Root, key) {
+		fmt.Fprint(out, hookDecisionJSON(true, "permission gate: remembered approval ("+key+")"))
+		return nil
+	}
+
 	id := sanitize(hi.ToolName) + "-" + sanitize(strings.ReplaceAll(time.Now().UTC().Format("20060102T150405.000"), ".", ""))
 	detail := summarizeToolInput(hi.ToolName, hi.ToolInput)
 
 	// Record the pending request and post it to the binding's channel.
-	req := map[string]string{"id": id, "tool": hi.ToolName, "detail": detail}
+	req := map[string]string{"id": id, "tool": hi.ToolName, "detail": detail, "key": key}
 	if err := AtomicWriteJSON(pathIn(permPendingDir(b.Root), id+".json"), req); err != nil {
 		fmt.Fprint(out, hookDecisionJSON(false, "permission gate: cannot record request"))
 		return nil
 	}
-	msg := fmt.Sprintf("🔐 權限請求：session 想執行 %s\n```\n%s\n```\n回 y 允許 / n 拒絕（逾時自動拒絕）", hi.ToolName, detail)
+	msg := fmt.Sprintf("🔐 權限請求：session 想執行 %s\n```\n%s\n```\n回 y 允許一次 / ya 允許並記住這類 / n 拒絕（逾時自動拒絕）", hi.ToolName, detail)
 	_ = AtomicWriteJSON(pathIn(b.Root, "outbox", "pending", "perm-"+id+".json"),
 		OutputJob{Schema: 1, JobID: "perm-" + id, Send: true, Text: msg})
 
 	// Block for the decision (written by the worker when the user replies).
-	allow, decided := waitDecision(ctx, b.Root, id, timeout)
+	allow, remember, decided := waitDecision(ctx, b.Root, id, timeout)
 	_ = os.Remove(pathIn(permPendingDir(b.Root), id+".json"))
 	if !decided {
 		fmt.Fprint(out, hookDecisionJSON(false, "權限請求逾時，自動拒絕"))
 		return nil
 	}
+	if allow && remember {
+		_ = rememberKey(b.Root, key)
+	}
 	fmt.Fprint(out, hookDecisionJSON(allow, "由使用者於頻道決定"))
 	return nil
 }
 
-func waitDecision(ctx context.Context, root, id string, timeout time.Duration) (allow bool, decided bool) {
+func waitDecision(ctx context.Context, root, id string, timeout time.Duration) (allow, remember, decided bool) {
 	if timeout <= 0 {
 		timeout = 5 * time.Minute
 	}
@@ -175,21 +237,22 @@ func waitDecision(ctx context.Context, root, id string, timeout time.Duration) (
 	path := pathIn(permDecisionDir(root), id+".json")
 	for time.Now().Before(deadline) {
 		var d struct {
-			Allow bool `json:"allow"`
+			Allow    bool `json:"allow"`
+			Remember bool `json:"remember"`
 		}
 		if err := ReadJSON(path, &d); err == nil {
 			_ = os.Remove(path)
-			return d.Allow, true
+			return d.Allow, d.Remember, true
 		} else if !errors.Is(err, os.ErrNotExist) {
-			return false, false
+			return false, false, false
 		}
 		select {
 		case <-ctx.Done():
-			return false, false
+			return false, false, false
 		case <-time.After(500 * time.Millisecond):
 		}
 	}
-	return false, false
+	return false, false, false
 }
 
 // oldestPendingPermission returns the id of the oldest pending permission
@@ -203,8 +266,8 @@ func oldestPendingPermission(root string) string {
 }
 
 // resolvePermission records the user's decision for a pending request id.
-func resolvePermission(root, id string, allow bool) error {
-	return AtomicWriteJSON(pathIn(permDecisionDir(root), id+".json"), map[string]bool{"allow": allow})
+func resolvePermission(root, id string, allow, remember bool) error {
+	return AtomicWriteJSON(pathIn(permDecisionDir(root), id+".json"), map[string]bool{"allow": allow, "remember": remember})
 }
 
 func bindingByWorktree(reg Registry, cwd string) (Binding, bool) {

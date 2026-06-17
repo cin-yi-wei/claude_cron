@@ -12,17 +12,17 @@ import (
 
 func TestParseDecision(t *testing.T) {
 	for _, c := range []struct {
-		in        string
-		wantAllow bool
-		wantOK    bool
+		in                      string
+		wantAllow, wantRem, wOK bool
 	}{
-		{"y", true, true}, {"YES", true, true}, {"允許", true, true}, {"好", true, true},
-		{"n", false, true}, {"no", false, true}, {"拒絕", false, true},
-		{"maybe", false, false}, {"查 log", false, false}, {"", false, false},
+		{"y", true, false, true}, {"YES", true, false, true}, {"允許", true, false, true}, {"好", true, false, true},
+		{"ya", true, true, true}, {"記住", true, true, true}, {"always", true, true, true},
+		{"n", false, false, true}, {"no", false, false, true}, {"拒絕", false, false, true},
+		{"maybe", false, false, false}, {"查 log", false, false, false}, {"", false, false, false},
 	} {
-		a, ok := parseDecision(c.in)
-		if a != c.wantAllow || ok != c.wantOK {
-			t.Errorf("parseDecision(%q) = %v,%v want %v,%v", c.in, a, ok, c.wantAllow, c.wantOK)
+		a, rem, ok := parseDecision(c.in)
+		if a != c.wantAllow || rem != c.wantRem || ok != c.wOK {
+			t.Errorf("parseDecision(%q) = %v,%v,%v want %v,%v,%v", c.in, a, rem, ok, c.wantAllow, c.wantRem, c.wOK)
 		}
 	}
 }
@@ -66,11 +66,15 @@ func TestPermissionGateApproveFlow(t *testing.T) {
 		t.Fatalf("expected a posted permission request in outbox, got %d", n)
 	}
 	id := oldestPendingPermission(bRoot)
-	if err := resolvePermission(bRoot, id, true); err != nil {
+	if err := resolvePermission(bRoot, id, true, true); err != nil { // allow + remember
 		t.Fatal(err)
 	}
 	<-done
 
+	// Approving with remember should persist the category for auto-allow next time.
+	if !isRemembered(bRoot, "bash:npm install") {
+		t.Fatalf("expected 'bash:npm install' remembered, allowed.json missing it")
+	}
 	if !strings.Contains(out.String(), `"permissionDecision":"allow"`) {
 		t.Fatalf("gate output = %s", out.String())
 	}

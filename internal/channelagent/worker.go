@@ -57,8 +57,8 @@ func RunWorkerOnce(ctx context.Context, root string, injector Injector, timeout 
 	// approval and this message is a y/n decision, resolve it instead of
 	// injecting it into the session (the session is blocked in the hook).
 	if id := oldestPendingPermission(root); id != "" {
-		if allow, ok := parseDecision(job.Source.Content); ok {
-			if err := resolvePermission(root, id, allow); err != nil {
+		if allow, remember, ok := parseDecision(job.Source.Content); ok {
+			if err := resolvePermission(root, id, allow, remember); err != nil {
 				_ = moveFile(processingPath, pathIn(root, "inbox", "failed", name))
 				return true, err
 			}
