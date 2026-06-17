@@ -50,7 +50,18 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 
 	deps := BuildControlDeps(root, cfg)
 
-	controlSource := DiscordSource{BaseURL: cfg.Discord.BaseURL, Token: token, ChannelID: cfg.Discord.ChannelID, Limit: 50}
+	controlPoll := DiscordSource{BaseURL: cfg.Discord.BaseURL, Token: token, ChannelID: cfg.Discord.ChannelID, Limit: 50}
+	var controlSource MessageSource = controlPoll
+	if cfg.Control.Mode == ModePush && push != nil {
+		// Gateway-fed control with poll always-on as backstop (lifeline channel).
+		cs := push.ControlSource(controlPoll)
+		push.Ensure("__control_gw__", cs.gatewayIngester(token, cfg.Discord.ChannelID, cfg.Discord.BaseURL), func(e error) {
+			if e != nil {
+				fmt.Fprintf(stdout, "control gateway exited (poll backstop continues): %v\n", e)
+			}
+		})
+		controlSource = cs
+	}
 	controlSender := DiscordSender{BaseURL: cfg.Discord.BaseURL, Token: token, ChannelID: cfg.Discord.ChannelID}
 	if err := RunControlOnce(ctx, root, ControlBinding(root).Root, deps, &reg, controlSource, controlSender); err != nil {
 		fmt.Fprintf(stdout, "control error: %v\n", err)

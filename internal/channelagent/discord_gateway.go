@@ -56,8 +56,21 @@ type DiscordGatewayIngester struct {
 	ChannelID  string
 	GatewayURL string // optional override (tests / self-host)
 
+	// Sink, when set, receives each captured MESSAGE_CREATE instead of the
+	// default (writing to Root's inbox via IngestMessages). Used by the control
+	// channel to feed a buffer rather than a binding inbox.
+	Sink func(SourceMessage) error
+
 	// dial is injectable for tests; nil uses the real coder/websocket dialer.
 	dial func(ctx context.Context, url string) (gwConn, error)
+}
+
+func (g DiscordGatewayIngester) deliver(ctx context.Context, msg SourceMessage) error {
+	if g.Sink != nil {
+		return g.Sink(msg)
+	}
+	_, err := IngestMessages(ctx, g.Root, []SourceMessage{msg})
+	return err
 }
 
 func (g DiscordGatewayIngester) Run(ctx context.Context) error {
@@ -181,7 +194,7 @@ func (g DiscordGatewayIngester) runLoop(ctx context.Context, conn gwConn) error 
 		case gwDispatch:
 			if ev.T == "MESSAGE_CREATE" {
 				if msg, ok := gatewayMessageToSource(ev.D, g.ChannelID); ok {
-					if _, err := IngestMessages(ctx, g.Root, []SourceMessage{msg}); err != nil {
+					if err := g.deliver(ctx, msg); err != nil {
 						return err
 					}
 				}

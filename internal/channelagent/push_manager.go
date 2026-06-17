@@ -20,6 +20,19 @@ type PushManager struct {
 	parent   context.Context
 	servers  map[string]*webhookServer // by listen addr, shared across bindings
 	webhooks map[string]webhookRoute   // by binding name
+	controlS *ControlGatewaySource     // persistent control-channel gateway source
+}
+
+// ControlSource returns the persistent gateway-backed control source, creating
+// it once with the given poll backstop. Survives across supervisor cycles so
+// its buffer and gateway goroutine persist.
+func (m *PushManager) ControlSource(poll DiscordSource) *ControlGatewaySource {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.controlS == nil {
+		m.controlS = &ControlGatewaySource{Poll: poll}
+	}
+	return m.controlS
 }
 
 type pushHandle struct {
