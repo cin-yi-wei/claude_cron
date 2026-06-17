@@ -60,6 +60,34 @@ func parseDecision(content string) (allow bool, ok bool) {
 	}
 }
 
+// bashCommand extracts the command string from a Bash tool_input.
+func bashCommand(raw json.RawMessage) string {
+	var m map[string]any
+	_ = json.Unmarshal(raw, &m)
+	if c, ok := m["command"].(string); ok {
+		return c
+	}
+	return ""
+}
+
+// bashNeedsApproval reports whether a bash command is risky enough to ask the
+// user: package installs, downloads, privilege escalation, destructive removes.
+// Everything else (file edits, git, build/test, navigation) is auto-allowed.
+func bashNeedsApproval(cmd string) bool {
+	c := strings.ToLower(cmd)
+	for _, pat := range []string{
+		"npm install", "npm i ", "npm ci", "yarn add", "pnpm add", "pnpm install",
+		"pip install", "pip3 install", "gem install", "bundle install", "bundle add",
+		"apt ", "apt-get", "apt-add", "dpkg", "brew install", "cargo install",
+		"go install", "go get", "curl ", "wget ", "sudo ", "rm -rf", "mkfs", "dd if=",
+	} {
+		if strings.Contains(c, pat) {
+			return true
+		}
+	}
+	return false
+}
+
 // summarizeToolInput renders a short human description of what's being run.
 func summarizeToolInput(toolName string, raw json.RawMessage) string {
 	var m map[string]any
@@ -103,6 +131,15 @@ func RunPermissionGate(ctx context.Context, registryRoot string, in io.Reader, o
 	if !ok {
 		// Unknown worktree → don't block a session we can't route for: allow.
 		fmt.Fprint(out, hookDecisionJSON(true, "permission gate: no binding for cwd, allowing"))
+		return nil
+	}
+
+	// Only escalate the things worth a human decision (installs / downloads /
+	// privilege / destructive, and all MCP). Ordinary Bash — file edits via
+	// sed/mv/cat, git, build/test, ls — is auto-allowed so the channel isn't
+	// spammed for every command.
+	if hi.ToolName == "Bash" && !bashNeedsApproval(bashCommand(hi.ToolInput)) {
+		fmt.Fprint(out, hookDecisionJSON(true, "permission gate: ordinary command auto-allowed"))
 		return nil
 	}
 
