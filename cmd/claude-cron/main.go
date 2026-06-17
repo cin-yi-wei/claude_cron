@@ -326,7 +326,16 @@ func runManageCommand(name string, rest []string, stdout, stderr io.Writer) int 
 		cmd.Flags["delete-channel"] = true
 	}
 
-	reply, changed, herr := agent.HandleCommand(context.Background(), deps, &reg, cmd)
+	// --plane selects which control plane this CLI invocation acts as (default
+	// discord). A plane's control assistant passes --plane so its bindings are
+	// tagged + filtered correctly.
+	planeName := opts["plane"]
+	if planeName == "" {
+		planeName = agent.PlatformDiscord
+	}
+	plane := agent.ControlPlane{Name: planeName, Platform: planeName}
+
+	reply, changed, herr := agent.HandleCommand(context.Background(), deps, &reg, cmd, plane)
 	if changed {
 		if serr := agent.SaveRegistry(root, reg); serr != nil {
 			fmt.Fprintln(stderr, serr)

@@ -74,20 +74,20 @@ const controlUsage = "指令: /bind <name> <project-dir> <branch> [--platform=dc
 // HandleCommand executes a parsed control command against the registry, using
 // deps for side effects. Returns a reply to post to the control channel and
 // whether the registry changed (caller persists it).
-func HandleCommand(ctx context.Context, deps ControlDeps, reg *Registry, cmd Command) (string, bool, error) {
+func HandleCommand(ctx context.Context, deps ControlDeps, reg *Registry, cmd Command, plane ControlPlane) (string, bool, error) {
 	switch cmd.Name {
 	case "bind":
-		return handleBind(ctx, deps, reg, cmd)
+		return handleBind(ctx, deps, reg, cmd, plane)
 	case "unbind":
-		return handleUnbind(ctx, deps, reg, cmd)
+		return handleUnbind(ctx, deps, reg, cmd, plane)
 	case "pause":
-		return handlePause(ctx, deps, reg, cmd)
+		return handlePause(ctx, deps, reg, cmd, plane)
 	case "resume":
-		return handleResume(reg, cmd)
+		return handleResume(reg, cmd, plane)
 	case "list":
-		return handleList(reg), false, nil
+		return handleList(reg, plane), false, nil
 	case "status":
-		return handleStatus(reg, cmd), false, nil
+		return handleStatus(reg, cmd, plane), false, nil
 	case "help":
 		return controlUsage, false, nil
 	default:
@@ -95,7 +95,21 @@ func HandleCommand(ctx context.Context, deps ControlDeps, reg *Registry, cmd Com
 	}
 }
 
-func handleBind(ctx context.Context, deps ControlDeps, reg *Registry, cmd Command) (string, bool, error) {
+// planeName returns the plane's namespace name, defaulting to discord when the
+// zero value is passed (e.g. older call sites / tests).
+func (p ControlPlane) planeName() string {
+	if p.Name == "" {
+		return PlatformDiscord
+	}
+	return p.Name
+}
+
+// ownsBinding reports whether b belongs to this control plane.
+func (p ControlPlane) ownsBinding(b Binding) bool {
+	return b.PlaneOf() == p.planeName()
+}
+
+func handleBind(ctx context.Context, deps ControlDeps, reg *Registry, cmd Command, plane ControlPlane) (string, bool, error) {
 	if len(cmd.Args) != 3 {
 		return "用法: /bind <name> <project-dir> <branch>", false, nil
 	}
@@ -106,6 +120,8 @@ func handleBind(ctx context.Context, deps ControlDeps, reg *Registry, cmd Comman
 	if name == "control" {
 		return `name "control" 為保留字 (控管助理專用)，請換別的名稱`, false, nil
 	}
+	// Names are globally unique across planes (an existing binding in any plane
+	// blocks reuse), so a plain Get is the right collision check.
 	if _, ok := reg.Get(name); ok {
 		return fmt.Sprintf("binding %q 已存在", name), false, nil
 	}
@@ -120,7 +136,14 @@ func handleBind(ctx context.Context, deps ControlDeps, reg *Registry, cmd Comman
 		}
 	}
 
-	platform, perr := normalizePlatform(cmd.opt("platform"))
+	// Default the worker platform to the control plane's own platform (a TG
+	// control plane binds TG workers unless told otherwise), still overridable
+	// with --platform.
+	platformOpt := cmd.opt("platform")
+	if platformOpt == "" && plane.Platform != "" {
+		platformOpt = plane.Platform
+	}
+	platform, perr := normalizePlatform(platformOpt)
 	if perr != nil {
 		return perr.Error(), false, nil
 	}
@@ -132,6 +155,7 @@ func handleBind(ctx context.Context, deps ControlDeps, reg *Registry, cmd Comman
 	b := BindingDefaults(deps.Root, name, projectDir, branch)
 	b.Platform = platform
 	b.Mode = mode
+	b.Plane = plane.planeName()
 
 	// The worktree is a sibling of the project dir named after the binding; if
 	// they resolve to the same path (name == repo dir name) we'd run inside the
@@ -215,13 +239,13 @@ func normalizeMode(s string) (string, error) {
 	}
 }
 
-func handleUnbind(ctx context.Context, deps ControlDeps, reg *Registry, cmd Command) (string, bool, error) {
+func handleUnbind(ctx context.Context, deps ControlDeps, reg *Registry, cmd Command, plane ControlPlane) (string, bool, error) {
 	if len(cmd.Args) != 1 {
 		return "用法: /unbind <name> [--delete-channel]", false, nil
 	}
 	name := cmd.Args[0]
 	b, ok := reg.Get(name)
-	if !ok {
+	if !ok || !plane.ownsBinding(b) {
 		return fmt.Sprintf("找不到 binding %q", name), false, nil
 	}
 	_ = deps.StopSession(ctx, b.TmuxSession)
@@ -245,13 +269,13 @@ func handleUnbind(ctx context.Context, deps ControlDeps, reg *Registry, cmd Comm
 // handlePause hot-stops a binding: kills its tmux session to free memory but
 // keeps the binding, worktree, and transcript. The supervisor skips it until
 // /resume. Idempotent.
-func handlePause(ctx context.Context, deps ControlDeps, reg *Registry, cmd Command) (string, bool, error) {
+func handlePause(ctx context.Context, deps ControlDeps, reg *Registry, cmd Command, plane ControlPlane) (string, bool, error) {
 	if len(cmd.Args) != 1 {
 		return "用法: /pause <name>", false, nil
 	}
 	name := cmd.Args[0]
 	b, ok := reg.Get(name)
-	if !ok {
+	if !ok || !plane.ownsBinding(b) {
 		return fmt.Sprintf("找不到 binding %q", name), false, nil
 	}
 	if b.Paused {
@@ -264,13 +288,13 @@ func handlePause(ctx context.Context, deps ControlDeps, reg *Registry, cmd Comma
 
 // handleResume clears the paused flag; the next supervisor cycle recreates the
 // session and auto-resumes the transcript. Pure registry mutation.
-func handleResume(reg *Registry, cmd Command) (string, bool, error) {
+func handleResume(reg *Registry, cmd Command, plane ControlPlane) (string, bool, error) {
 	if len(cmd.Args) != 1 {
 		return "用法: /resume <name>", false, nil
 	}
 	name := cmd.Args[0]
 	b, ok := reg.Get(name)
-	if !ok {
+	if !ok || !plane.ownsBinding(b) {
 		return fmt.Sprintf("找不到 binding %q", name), false, nil
 	}
 	if !b.Paused {
@@ -280,27 +304,32 @@ func handleResume(reg *Registry, cmd Command) (string, bool, error) {
 	return fmt.Sprintf("▶️ 已恢復 %s（下個 cycle 重開 session %s 並 resume 對話）", name, b.TmuxSession), true, nil
 }
 
-func handleList(reg *Registry) string {
-	if len(reg.Bindings) == 0 {
-		return "(無綁定)"
-	}
+func handleList(reg *Registry, plane ControlPlane) string {
 	var sb strings.Builder
+	n := 0
 	for _, b := range reg.Bindings {
+		if !plane.ownsBinding(b) {
+			continue
+		}
+		n++
 		state := ""
 		if b.Paused {
 			state = " ⏸️paused"
 		}
 		fmt.Fprintf(&sb, "• %s [%s/%s]%s → channel %s | branch %s | session %s\n", b.Name, b.PlatformOf(), b.ModeOf(), state, b.ChannelID, b.Branch, b.TmuxSession)
 	}
+	if n == 0 {
+		return "(無綁定)"
+	}
 	return strings.TrimRight(sb.String(), "\n")
 }
 
-func handleStatus(reg *Registry, cmd Command) string {
+func handleStatus(reg *Registry, cmd Command, plane ControlPlane) string {
 	if len(cmd.Args) != 1 {
 		return "用法: /status <name>"
 	}
 	b, ok := reg.Get(cmd.Args[0])
-	if !ok {
+	if !ok || !plane.ownsBinding(b) {
 		return fmt.Sprintf("找不到 binding %q", cmd.Args[0])
 	}
 	pending := countJSON(pathIn(b.Root, "inbox", "pending"))
@@ -328,28 +357,53 @@ func countJSON(dir string) int {
 // field is reused as the session's working directory (a plain sandbox dir, not
 // a git worktree).
 func ControlBinding(root string) Binding {
+	return ControlBindingFor(root, PlatformDiscord)
+}
+
+// ControlBindingFor returns the reserved control binding for a given control
+// plane. The discord plane keeps the legacy paths (cc-control, root/control,
+// root/control-workspace) so the running control channel is undisturbed; other
+// planes get a "-<plane>" suffix so their session/root/state never collide.
+func ControlBindingFor(root, planeName string) Binding {
+	if planeName == "" || planeName == PlatformDiscord {
+		return Binding{
+			Name:        "control",
+			TmuxSession: "cc-control",
+			Root:        filepath.Join(root, "control"),
+			Worktree:    filepath.Join(root, "control-workspace"),
+		}
+	}
 	return Binding{
-		Name:        "control",
-		TmuxSession: "cc-control",
-		Root:        filepath.Join(root, "control"),
-		Worktree:    filepath.Join(root, "control-workspace"),
+		Name:        "control-" + planeName,
+		TmuxSession: "cc-control-" + planeName,
+		Root:        filepath.Join(root, "control-"+planeName),
+		Worktree:    filepath.Join(root, "control-"+planeName+"-workspace"),
 	}
 }
 
-// controlSystemPrompt is appended to the cc-control Claude session so it knows
-// its role, its workspace, and how to manage bindings.
-func controlSystemPrompt(root, workspace string) string {
-	return fmt.Sprintf(`你是 claude_cron 的控管助理，透過 Discord 控管頻道與使用者對話。
+// controlSystemPrompt is appended to a control assistant's Claude session so it
+// knows its role, workspace, and how to manage bindings. planeName scopes the
+// assistant to one control plane: non-discord planes must pass --plane on every
+// management command so the bindings they create are tagged + filtered to that
+// plane (the CLI defaults to the discord plane otherwise).
+func controlSystemPrompt(root, workspace, planeName string) string {
+	planeFlag := ""
+	planeNote := ""
+	if planeName != "" && planeName != PlatformDiscord {
+		planeFlag = " --plane=" + planeName
+		planeNote = fmt.Sprintf("\n你管理的是 %q 這個 control plane：每個 claude-cron 管理指令都要帶 --plane=%s，你只看得到/能管自己 plane 的 binding，建立 binding 預設平台為 %s。", planeName, planeName, planeName)
+	}
+	return fmt.Sprintf(`你是 claude_cron 的控管助理，透過控管頻道與使用者對話。
 你的工作目錄（沙盒）是：%s
 你可以在這裡執行 shell 指令、建立檔案/資料夾、回答關於這個系統的問題。
 
-要管理「Discord 頻道 ↔ Claude session」綁定時，用以下 CLI（root 用絕對路徑 %s）：
-  claude-cron bind <name> <project-dir> <branch> --root %s
-  claude-cron unbind <name> [--delete-channel] --root %s
-  claude-cron list --root %s
+要管理「頻道 ↔ Claude session」綁定時，用以下 CLI（root 用絕對路徑 %s）：
+  claude-cron bind <name> <project-dir> <branch> --root %s%s
+  claude-cron unbind <name> [--delete-channel] --root %s%s
+  claude-cron list --root %s%s
 
-name 只能用小寫字母、數字、減號。回覆使用者時直接用一般文字即可。`,
-		workspace, root, root, root, root)
+name 只能用小寫字母、數字、減號。回覆使用者時直接用一般文字即可。%s`,
+		workspace, root, root, planeFlag, root, planeFlag, root, planeFlag, planeNote)
 }
 
 // BuildControlDeps assembles a ControlDeps wired to the real Discord/worktree/
@@ -377,7 +431,7 @@ func BuildControlDeps(root string, cfg Config) ControlDeps {
 // persists the registry when it changed, and records processed message IDs so
 // they are not handled twice. Dedup reuses the watcher's seen-state pattern
 // under a control-specific state file.
-func RunControlOnce(ctx context.Context, root, controlRoot string, deps ControlDeps, reg *Registry, source MessageSource, sender Sender) error {
+func RunControlOnce(ctx context.Context, root, controlRoot string, deps ControlDeps, reg *Registry, source MessageSource, sender Sender, plane ControlPlane) error {
 	if err := Init(root); err != nil {
 		return err
 	}
@@ -387,7 +441,14 @@ func RunControlOnce(ctx context.Context, root, controlRoot string, deps ControlD
 	}
 	sort.SliceStable(messages, func(i, j int) bool { return messages[i].CreatedAt < messages[j].CreatedAt })
 
-	statePath := pathIn(root, "state", "control_seen.json")
+	// Per-plane seen-state so two control planes don't share a dedup file. The
+	// discord plane keeps the legacy filename so the running control channel's
+	// dedup history is preserved (a rename would reprocess old messages).
+	seenFile := "control_seen.json"
+	if plane.planeName() != PlatformDiscord {
+		seenFile = "control_seen_" + plane.planeName() + ".json"
+	}
+	statePath := pathIn(root, "state", seenFile)
 	state, err := readSeenState(statePath)
 	if err != nil {
 		return err
@@ -409,7 +470,7 @@ func RunControlOnce(ctx context.Context, root, controlRoot string, deps ControlD
 			state.MessageIDs[key] = true
 			continue
 		}
-		reply, regChanged, herr := HandleCommand(ctx, deps, reg, cmd)
+		reply, regChanged, herr := HandleCommand(ctx, deps, reg, cmd, plane)
 		if herr != nil {
 			// Leave unseen so a transient failure can be retried next poll.
 			_ = sender.Send(ctx, OutputJob{Send: true, Text: "⚠️ " + herr.Error()})

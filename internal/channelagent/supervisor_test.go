@@ -33,7 +33,7 @@ func TestRunControlOnceExecutesCommandAndReplies(t *testing.T) {
 	}}}
 	sender := &capSender{}
 
-	if err := RunControlOnce(context.Background(), root, ControlBinding(root).Root, deps, &reg, src, sender); err != nil {
+	if err := RunControlOnce(context.Background(), root, ControlBinding(root).Root, deps, &reg, src, sender, ControlPlane{}); err != nil {
 		t.Fatalf("RunControlOnce: %v", err)
 	}
 	if _, ok := reg.Get("proj-a"); !ok {
@@ -45,7 +45,7 @@ func TestRunControlOnceExecutesCommandAndReplies(t *testing.T) {
 
 	sender2 := &capSender{}
 	reg2, _ := LoadRegistry(root)
-	if err := RunControlOnce(context.Background(), root, ControlBinding(root).Root, deps, &reg2, src, sender2); err != nil {
+	if err := RunControlOnce(context.Background(), root, ControlBinding(root).Root, deps, &reg2, src, sender2, ControlPlane{}); err != nil {
 		t.Fatalf("RunControlOnce 2: %v", err)
 	}
 	if len(sender2.sent) != 0 {
@@ -73,7 +73,7 @@ func TestRunControlAssistantProcessesQueuedJob(t *testing.T) {
 	}}
 	sender := &capSender{}
 
-	if err := runControlAssistant(context.Background(), root, "DISCORD_BOT_TOKEN", "tok", injector, sender, time.Second); err != nil {
+	if err := runControlAssistant(context.Background(), ControlBinding(root), injector, sender, time.Second); err != nil {
 		t.Fatalf("runControlAssistant: %v", err)
 	}
 	if len(sender.sent) != 1 || sender.sent[0] != "你好" {

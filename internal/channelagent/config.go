@@ -20,8 +20,34 @@ type Config struct {
 // ControlConfig configures the control channel's own ingestion. Mode "push"
 // adds a Discord Gateway feed on top of polling (poll always runs as a backstop
 // — the control channel is the lifeline); empty/"poll" is plain polling.
+//
+// TelegramChatID, when set, enables a SECOND, isolated control plane on Telegram
+// (same bot as worker bindings, distinguished by chat id). A user talking to that
+// chat can /bind /list /pause etc. but only sees bindings their own plane owns.
 type ControlConfig struct {
-	Mode string `json:"mode,omitempty"`
+	Mode           string `json:"mode,omitempty"`
+	TelegramChatID string `json:"telegram_chat_id,omitempty"`
+}
+
+// ControlPlane identifies one control entrance: its namespace Name (used to tag
+// and filter the bindings it owns), the Platform new bindings default to, and the
+// channel/chat id it listens on. The Discord plane is named "discord" and keeps
+// the legacy cc-control session + root/control paths; others are suffixed.
+type ControlPlane struct {
+	Name      string
+	Platform  string
+	ChannelID string
+}
+
+// ControlPlanes returns the configured control entrances: always the Discord
+// plane (back-compat), plus a Telegram plane when ControlConfig.TelegramChatID is
+// set. Token resolution and source/sender selection happen in the supervisor.
+func (c Config) ControlPlanes() []ControlPlane {
+	planes := []ControlPlane{{Name: PlatformDiscord, Platform: PlatformDiscord, ChannelID: c.Discord.ChannelID}}
+	if c.Control.TelegramChatID != "" {
+		planes = append(planes, ControlPlane{Name: PlatformTelegram, Platform: PlatformTelegram, ChannelID: c.Control.TelegramChatID})
+	}
+	return planes
 }
 
 // AdminConfig configures the admin HTTP API. Token, when set, is required as a
