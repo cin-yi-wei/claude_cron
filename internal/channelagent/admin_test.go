@@ -81,10 +81,11 @@ func TestAdminBindingStatusAndNotFound(t *testing.T) {
 	}
 }
 
-func TestAdminRejectsNonGet(t *testing.T) {
+func TestAdminRejectsUnsupportedMethod(t *testing.T) {
 	h := AdminHandler{Root: t.TempDir()}
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/bindings", nil))
+	// PUT is not supported on /api/bindings (GET list, POST create only).
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPut, "/api/bindings", nil))
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("status = %d, want 405", rec.Code)
 	}
