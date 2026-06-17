@@ -212,13 +212,16 @@ func handleUnbind(ctx context.Context, deps ControlDeps, reg *Registry, cmd Comm
 		return fmt.Sprintf("找不到 binding %q", name), false, nil
 	}
 	_ = deps.StopSession(ctx, b.TmuxSession)
-	_ = deps.RemoveWorktree(ctx, b.ProjectDir, b.Worktree)
+	var warn string
+	if err := deps.RemoveWorktree(ctx, b.ProjectDir, b.Worktree); err != nil {
+		warn = "（⚠️ worktree 清理可能不完全: " + err.Error() + "）"
+	}
 	if cmd.Flags["delete-channel"] {
 		_ = deps.DeleteChannel(ctx, b.ChannelID)
 	}
 	_ = os.RemoveAll(b.Root)
 	reg.Remove(name)
-	return fmt.Sprintf("🗑️ 解綁 %s 完成", name), true, nil
+	return fmt.Sprintf("🗑️ 解綁 %s 完成%s（git 分支保留）", name, warn), true, nil
 }
 
 func handleList(reg *Registry) string {
