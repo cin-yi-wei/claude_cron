@@ -69,7 +69,18 @@ func EnsureWorktree(ctx context.Context, projectDir, branch, worktreePath string
 // RemoveWorktree removes a git worktree. Force is used so dirty worktrees are
 // still cleaned up on /unbind.
 func RemoveWorktree(ctx context.Context, projectDir, worktreePath string) error {
-	return runExternalCommand(ctx, "git", "-C", projectDir, "worktree", "remove", "--force", worktreePath)
+	err := runExternalCommand(ctx, "git", "-C", projectDir, "worktree", "remove", "--force", worktreePath)
+	// Prune any stale registration, then make sure the directory is actually
+	// gone — `git worktree remove` can leave the dir/registration behind (busy
+	// session, gitdir pointer issues), which used to orphan worktrees on unbind.
+	_ = runExternalCommand(ctx, "git", "-C", projectDir, "worktree", "prune")
+	if _, statErr := os.Stat(worktreePath); statErr == nil {
+		if rmErr := os.RemoveAll(worktreePath); rmErr != nil && err == nil {
+			err = rmErr
+		}
+		_ = runExternalCommand(ctx, "git", "-C", projectDir, "worktree", "prune")
+	}
+	return err
 }
 
 // StartTmuxClaude ensures a detached tmux session named session is running
