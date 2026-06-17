@@ -14,6 +14,14 @@ type Config struct {
 	Claude       ClaudeConfig   `json:"claude"`
 	Push         PushConfig     `json:"push,omitempty"`
 	Admin        AdminConfig    `json:"admin,omitempty"`
+	Control      ControlConfig  `json:"control,omitempty"`
+}
+
+// ControlConfig configures the control channel's own ingestion. Mode "push"
+// adds a Discord Gateway feed on top of polling (poll always runs as a backstop
+// — the control channel is the lifeline); empty/"poll" is plain polling.
+type ControlConfig struct {
+	Mode string `json:"mode,omitempty"`
 }
 
 // AdminConfig configures the admin HTTP API. Token, when set, is required as a
