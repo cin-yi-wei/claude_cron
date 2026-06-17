@@ -50,6 +50,12 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 
 	deps := BuildControlDeps(root, cfg)
 
+	// activePush tracks every push ingester that should stay alive this cycle, so
+	// Reconcile (at the end) doesn't cancel them. The control gateway uses a
+	// reserved key and must be included, or it would be killed+reconnected every
+	// cycle (churning Discord IDENTIFYs).
+	activePush := map[string]bool{}
+
 	controlPoll := DiscordSource{BaseURL: cfg.Discord.BaseURL, Token: token, ChannelID: cfg.Discord.ChannelID, Limit: 50}
 	var controlSource MessageSource = controlPoll
 	if cfg.Control.Mode == ModePush && push != nil {
@@ -60,6 +66,7 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 				fmt.Fprintf(stdout, "control gateway exited (poll backstop continues): %v\n", e)
 			}
 		})
+		activePush["__control_gw__"] = true
 		controlSource = cs
 	}
 	controlSender := DiscordSender{BaseURL: cfg.Discord.BaseURL, Token: token, ChannelID: cfg.Discord.ChannelID}
@@ -85,7 +92,6 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 		}
 	}
 
-	activePush := map[string]bool{}
 	for _, b := range reg.Bindings {
 		if err := EnsureWorktree(ctx, b.ProjectDir, b.Branch, b.Worktree); err != nil {
 			fmt.Fprintf(stdout, "binding %s worktree error: %v\n", b.Name, err)
