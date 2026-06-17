@@ -83,6 +83,15 @@ var runExternalCommand = func(ctx context.Context, name string, args ...string) 
 	return cmd.Run()
 }
 
+// runExternalCommandOutput is like runExternalCommand but returns stdout. Used
+// to read `tmux list-sessions`. Injectable for tests.
+var runExternalCommandOutput = func(ctx context.Context, name string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Env = envWithout(os.Environ(), "TMUX", "TMUX_PANE")
+	out, err := cmd.Output()
+	return string(out), err
+}
+
 func envWithout(env []string, drop ...string) []string {
 	out := env[:0:0]
 	for _, kv := range env {

@@ -169,5 +169,14 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 	if push != nil {
 		push.Reconcile(activePush)
 	}
+	// Reap orphan cc-* tmux sessions (e.g. an unbind that raced with this cycle's
+	// StartTmuxClaude). Valid = control session + one per current binding.
+	valid := map[string]bool{ControlBinding(root).TmuxSession: true}
+	for _, b := range reg.Bindings {
+		valid[b.TmuxSession] = true
+	}
+	if orphans := reapOrphanSessions(ctx, valid); len(orphans) > 0 {
+		fmt.Fprintf(stdout, "reaped orphan sessions: %v\n", orphans)
+	}
 	return nil
 }
