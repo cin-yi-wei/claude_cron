@@ -74,29 +74,37 @@ func (s TelegramSource) Fetch(ctx context.Context) ([]SourceMessage, error) {
 	return messages, nil
 }
 
-// telegramUpdateToMessage maps a Telegram update to a SourceMessage, keeping
-// only messages for chatID. Returns ok=false for non-message updates or other
-// chats. Shared by getUpdates (poll) and the webhook handler (push).
-func telegramUpdateToMessage(update telegramUpdate, chatID string) (SourceMessage, bool) {
+// telegramExtract maps a Telegram update to a SourceMessage tagged with its own
+// chat id (no filtering). Returns ok=false for non-message updates. Used by the
+// shared reader, which routes by chat id rather than pre-filtering per consumer.
+func telegramExtract(update telegramUpdate) (SourceMessage, bool) {
 	if update.Message == nil {
 		return SourceMessage{}, false
 	}
 	message := update.Message
-	if strconv.FormatInt(message.Chat.ID, 10) != chatID {
-		return SourceMessage{}, false
-	}
 	content := message.Text
 	if content == "" {
 		content = message.Caption
 	}
 	return SourceMessage{
 		Platform:  "telegram",
-		ChannelID: chatID,
+		ChannelID: strconv.FormatInt(message.Chat.ID, 10),
 		MessageID: strconv.FormatInt(update.UpdateID, 10),
 		AuthorID:  strconv.FormatInt(message.From.ID, 10),
 		CreatedAt: time.Unix(message.Date, 0).UTC().Format(time.RFC3339),
 		Content:   content,
 	}, true
+}
+
+// telegramUpdateToMessage maps a Telegram update to a SourceMessage, keeping
+// only messages for chatID. Returns ok=false for non-message updates or other
+// chats. Shared by getUpdates (poll) and the webhook handler (push).
+func telegramUpdateToMessage(update telegramUpdate, chatID string) (SourceMessage, bool) {
+	msg, ok := telegramExtract(update)
+	if !ok || msg.ChannelID != chatID {
+		return SourceMessage{}, false
+	}
+	return msg, true
 }
 
 type TelegramSender struct {
