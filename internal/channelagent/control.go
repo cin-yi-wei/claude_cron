@@ -120,6 +120,13 @@ func handleBind(ctx context.Context, deps ControlDeps, reg *Registry, cmd Comman
 	b.Platform = platform
 	b.Mode = mode
 
+	// The worktree is a sibling of the project dir named after the binding; if
+	// they resolve to the same path (name == repo dir name) we'd run inside the
+	// main repo instead of an isolated worktree. Reject it.
+	if absPD, err := filepath.Abs(projectDir); err == nil && filepath.Clean(b.Worktree) == filepath.Clean(absPD) {
+		return fmt.Sprintf("name %q 會跟主專案目錄同路徑，換個名稱（慣例用 <repo>-<branch>）", name), false, nil
+	}
+
 	// Provision the channel/chat. Discord auto-creates a channel; Telegram reuses
 	// an existing chat, so the chat id must be supplied via --chat-id.
 	var channelID string

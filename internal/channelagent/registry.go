@@ -66,10 +66,21 @@ func BindingDefaults(root, name, projectDir, branch string) Binding {
 		Name:        name,
 		ProjectDir:  projectDir,
 		Branch:      branch,
-		Worktree:    filepath.Join(root, "worktrees", name),
+		Worktree:    WorktreePath(projectDir, name),
 		TmuxSession: "cc-" + name,
 		Root:        filepath.Join(root, "bindings", name),
 	}
+}
+
+// WorktreePath places a binding's git worktree as a sibling of the main project
+// directory (the conventional layout: project repo and its worktrees live
+// side-by-side under the same parent), named after the binding. Runtime state
+// (inbox/outbox) still lives under root/bindings/<name>, separate from the code.
+func WorktreePath(projectDir, name string) string {
+	if abs, err := filepath.Abs(projectDir); err == nil {
+		projectDir = abs
+	}
+	return filepath.Join(filepath.Dir(projectDir), name)
 }
 
 func RegistryPath(root string) string {
