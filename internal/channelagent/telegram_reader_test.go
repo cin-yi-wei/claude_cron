@@ -1,10 +1,12 @@
 package channelagent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -109,5 +111,65 @@ func TestTelegramBufferSourceFetchClears(t *testing.T) {
 	got2, _ := src.Fetch(context.Background())
 	if len(got2) != 0 {
 		t.Fatalf("buffer not cleared: %#v", got2)
+	}
+}
+
+func TestTelegramDemuxHandlerRoutes(t *testing.T) {
+	root := t.TempDir()
+	// One telegram worker binding (chat 111) + a telegram control plane (chat 222).
+	reg := Registry{Bindings: []Binding{{
+		Name: "w", ChannelID: "111", Platform: PlatformTelegram, Plane: PlatformTelegram,
+		Root: filepath.Join(root, "bindings", "w"),
+	}}}
+	if err := SaveRegistry(root, reg); err != nil {
+		t.Fatalf("SaveRegistry: %v", err)
+	}
+	var cfg Config
+	cfg.Discord.ChannelID = "dc"
+	cfg.Control.TelegramChatID = "222"
+
+	h := TelegramDemuxHandler{Root: root, Cfg: cfg, Secret: "s3cr3t"}
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	post := func(chatID int, secret string) int {
+		body, _ := json.Marshal(map[string]any{
+			"update_id": 500 + chatID,
+			"message":   map[string]any{"message_id": 1, "date": 1781568000, "text": "hi", "chat": map[string]any{"id": chatID}, "from": map[string]any{"id": 7}},
+		})
+		req, _ := http.NewRequest(http.MethodPost, srv.URL, bytes.NewReader(body))
+		if secret != "" {
+			req.Header.Set("X-Telegram-Bot-Api-Secret-Token", secret)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	// Wrong secret → 403.
+	if code := post(222, "wrong"); code != http.StatusForbidden {
+		t.Fatalf("wrong secret status = %d, want 403", code)
+	}
+
+	// Control-plane chat → routed to that plane's buffer.
+	if code := post(222, "s3cr3t"); code != http.StatusOK {
+		t.Fatalf("control post status = %d, want 200", code)
+	}
+	bufPath := pathIn(ControlBindingFor(root, PlatformTelegram).Root, "state", "tg_buffer.json")
+	var buf []SourceMessage
+	if err := ReadJSON(bufPath, &buf); err != nil || len(buf) != 1 || buf[0].Content != "hi" {
+		t.Fatalf("control buffer = %#v err=%v", buf, err)
+	}
+
+	// Worker chat → routed to that binding's inbox.
+	if code := post(111, "s3cr3t"); code != http.StatusOK {
+		t.Fatalf("worker post status = %d, want 200", code)
+	}
+	entries, _ := os.ReadDir(pathIn(filepath.Join(root, "bindings", "w"), "inbox", "pending"))
+	if len(entries) != 1 {
+		t.Fatalf("worker inbox pending = %d, want 1", len(entries))
 	}
 }

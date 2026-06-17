@@ -49,32 +49,22 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 
 	deps := BuildControlDeps(root, cfg)
 
+	// activePush tracks every push ingester/webhook that should stay alive this
+	// cycle, so Reconcile (at the end) doesn't cancel them. The control gateway and
+	// the telegram demux webhook use reserved keys and must be included, or they'd
+	// be killed+restarted every cycle.
+	activePush := map[string]bool{}
+
 	// Shared Telegram reader: one offset-advancing getUpdates for the bot token,
 	// routing each message to its chat's destination — a poll binding's inbox or a
 	// control plane's buffer. Runs before control + binding processing so their
 	// inboxes/buffers are filled. Replaces per-consumer getUpdates (which 409'd and
 	// re-fetched the 24h backlog). Push (webhook) bindings are fed separately.
 	tgToken := os.Getenv(cfg.Telegram.TokenEnv)
-	if tgToken != "" {
-		routes := map[string]func(context.Context, SourceMessage) error{}
-		for _, b := range reg.Bindings {
-			if b.PlatformOf() == PlatformTelegram && b.ModeOf() == ModePoll {
-				broot := b.Root
-				routes[b.ChannelID] = func(ctx context.Context, msg SourceMessage) error {
-					_, err := IngestMessages(ctx, broot, []SourceMessage{msg})
-					return err
-				}
-			}
-		}
-		for _, plane := range cfg.ControlPlanes() {
-			if plane.Platform != PlatformTelegram || plane.ChannelID == "" {
-				continue
-			}
-			buf := pathIn(ControlBindingFor(root, plane.Name).Root, "state", "tg_buffer.json")
-			routes[plane.ChannelID] = func(_ context.Context, msg SourceMessage) error {
-				return appendTelegramBuffer(buf, msg)
-			}
-		}
+	if tgToken != "" && !cfg.Telegram.Webhook {
+		// Poll mode: single getUpdates reader, route by chat id. (Webhook mode feeds
+		// the same routes via the demux handler below instead — they're exclusive.)
+		routes := telegramRoutes(root, cfg, reg)
 		if len(routes) > 0 {
 			reader := TelegramReader{BaseURL: cfg.Telegram.BaseURL, Token: tgToken, OffsetPath: pathIn(root, "state", "tg_offset.json")}
 			if err := reader.Drain(ctx, routes); err != nil {
@@ -82,12 +72,23 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 			}
 		}
 	}
-
-	// activePush tracks every push ingester that should stay alive this cycle, so
-	// Reconcile (at the end) doesn't cancel them. The control gateway uses a
-	// reserved key and must be included, or it would be killed+reconnected every
-	// cycle (churning Discord IDENTIFYs).
-	activePush := map[string]bool{}
+	if tgToken != "" && cfg.Telegram.Webhook && push != nil {
+		// Webhook mode: one shared demux endpoint for the whole bot, routing by chat
+		// id (reloads the registry per request). setWebhook runs once on first mount.
+		h := TelegramDemuxHandler{Root: root, Cfg: cfg, Secret: cfg.Push.Secret}
+		push.EnsureWebhook("__tg_demux__", cfg.Push.Listen, "/tg", h, func() error {
+			if cfg.Push.PublicURL == "" {
+				return nil
+			}
+			url := strings.TrimRight(cfg.Push.PublicURL, "/") + "/tg"
+			if err := SetWebhook(ctx, cfg.Telegram.BaseURL, tgToken, url, cfg.Push.Secret, nil); err != nil {
+				fmt.Fprintf(stdout, "telegram setWebhook error: %v\n", err)
+				return err
+			}
+			return nil
+		})
+		activePush["__tg_demux__"] = true
+	}
 
 	controlPoll := DiscordSource{BaseURL: cfg.Discord.BaseURL, Token: token, ChannelID: cfg.Discord.ChannelID, Limit: 50}
 	var controlSource MessageSource = controlPoll
