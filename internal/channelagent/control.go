@@ -62,12 +62,14 @@ type ControlDeps struct {
 	DeleteChannel  func(ctx context.Context, channelID string) error
 	EnsureWorktree func(ctx context.Context, projectDir, branch, worktree string) error
 	RemoveWorktree func(ctx context.Context, projectDir, worktree string) error
+	InitProject    func(ctx context.Context, projectDir string) error
+	WipCommit      func(ctx context.Context, worktree string) error
 	StartSession   func(ctx context.Context, session, cwd string) error
 	StopSession    func(ctx context.Context, session string) error
 	InitRoot       func(root string) error
 }
 
-const controlUsage = "指令: /bind <name> <project-dir> <branch> [--platform=dc|tg] [--mode=poll|push] [--chat-id=<id> (tg)] | /unbind <name> [--delete-channel] | /list | /status <name> | /help"
+const controlUsage = "指令: /bind <name> <project-dir> <branch> [--platform=dc|tg] [--mode=poll|push] [--chat-id=<id> (tg)] | /unbind <name> [--delete-channel] | /pause <name> | /resume <name> | /list | /status <name> | /help"
 
 // HandleCommand executes a parsed control command against the registry, using
 // deps for side effects. Returns a reply to post to the control channel and
@@ -78,6 +80,10 @@ func HandleCommand(ctx context.Context, deps ControlDeps, reg *Registry, cmd Com
 		return handleBind(ctx, deps, reg, cmd)
 	case "unbind":
 		return handleUnbind(ctx, deps, reg, cmd)
+	case "pause":
+		return handlePause(ctx, deps, reg, cmd)
+	case "resume":
+		return handleResume(reg, cmd)
 	case "list":
 		return handleList(reg), false, nil
 	case "status":
@@ -103,8 +109,15 @@ func handleBind(ctx context.Context, deps ControlDeps, reg *Registry, cmd Comman
 	if _, ok := reg.Get(name); ok {
 		return fmt.Sprintf("binding %q 已存在", name), false, nil
 	}
+	// A missing project dir is auto-provisioned as a fresh git repo (init -b dev +
+	// README initial commit) so a branch exists for the worktree to fork from.
 	if _, err := os.Stat(projectDir); err != nil {
-		return fmt.Sprintf("project-dir %q 不存在", projectDir), false, nil
+		if deps.InitProject == nil {
+			return fmt.Sprintf("project-dir %q 不存在", projectDir), false, nil
+		}
+		if ierr := deps.InitProject(ctx, projectDir); ierr != nil {
+			return "", false, fmt.Errorf("init project 失敗: %w", ierr)
+		}
 	}
 
 	platform, perr := normalizePlatform(cmd.opt("platform"))
@@ -212,6 +225,11 @@ func handleUnbind(ctx context.Context, deps ControlDeps, reg *Registry, cmd Comm
 		return fmt.Sprintf("找不到 binding %q", name), false, nil
 	}
 	_ = deps.StopSession(ctx, b.TmuxSession)
+	// Preserve in-flight work: commit any uncommitted changes onto the branch
+	// (which lives in the shared main repo) before the worktree is removed.
+	if deps.WipCommit != nil {
+		_ = deps.WipCommit(ctx, b.Worktree)
+	}
 	var warn string
 	if err := deps.RemoveWorktree(ctx, b.ProjectDir, b.Worktree); err != nil {
 		warn = "（⚠️ worktree 清理可能不完全: " + err.Error() + "）"
@@ -224,13 +242,55 @@ func handleUnbind(ctx context.Context, deps ControlDeps, reg *Registry, cmd Comm
 	return fmt.Sprintf("🗑️ 解綁 %s 完成%s（git 分支保留）", name, warn), true, nil
 }
 
+// handlePause hot-stops a binding: kills its tmux session to free memory but
+// keeps the binding, worktree, and transcript. The supervisor skips it until
+// /resume. Idempotent.
+func handlePause(ctx context.Context, deps ControlDeps, reg *Registry, cmd Command) (string, bool, error) {
+	if len(cmd.Args) != 1 {
+		return "用法: /pause <name>", false, nil
+	}
+	name := cmd.Args[0]
+	b, ok := reg.Get(name)
+	if !ok {
+		return fmt.Sprintf("找不到 binding %q", name), false, nil
+	}
+	if b.Paused {
+		return fmt.Sprintf("binding %q 已是暫停狀態", name), false, nil
+	}
+	_ = deps.StopSession(ctx, b.TmuxSession)
+	reg.SetPaused(name, true)
+	return fmt.Sprintf("⏸️ 已暫停 %s（session %s 已關，worktree/對話保留，訊息會留在頻道，/resume 接回）", name, b.TmuxSession), true, nil
+}
+
+// handleResume clears the paused flag; the next supervisor cycle recreates the
+// session and auto-resumes the transcript. Pure registry mutation.
+func handleResume(reg *Registry, cmd Command) (string, bool, error) {
+	if len(cmd.Args) != 1 {
+		return "用法: /resume <name>", false, nil
+	}
+	name := cmd.Args[0]
+	b, ok := reg.Get(name)
+	if !ok {
+		return fmt.Sprintf("找不到 binding %q", name), false, nil
+	}
+	if !b.Paused {
+		return fmt.Sprintf("binding %q 不在暫停狀態", name), false, nil
+	}
+	reg.SetPaused(name, false)
+	return fmt.Sprintf("▶️ 已恢復 %s（下個 cycle 重開 session %s 並 resume 對話）", name, b.TmuxSession), true, nil
+}
+
 func handleList(reg *Registry) string {
 	if len(reg.Bindings) == 0 {
 		return "(無綁定)"
 	}
 	var sb strings.Builder
 	for _, b := range reg.Bindings {
-		fmt.Fprintf(&sb, "• %s [%s/%s] → channel %s | branch %s | session %s\n", b.Name, b.PlatformOf(), b.ModeOf(), b.ChannelID, b.Branch, b.TmuxSession)
+		state := ""
+		if b.Paused {
+			state = " ⏸️paused"
+		}
+		fmt.Fprintf(&sb, "• %s [%s/%s]%s → channel %s | branch %s | session %s\n", b.Name, b.PlatformOf(), b.ModeOf(), state, b.ChannelID, b.Branch, b.TmuxSession)
 	}
 	return strings.TrimRight(sb.String(), "\n")
 }
@@ -305,6 +365,8 @@ func BuildControlDeps(root string, cfg Config) ControlDeps {
 		DeleteChannel:  admin.DeleteChannel,
 		EnsureWorktree: EnsureWorktree,
 		RemoveWorktree: RemoveWorktree,
+		InitProject:    EnsureProjectRepo,
+		WipCommit:      WipCommit,
 		StartSession:   func(ctx context.Context, session, cwd string) error { return StartTmuxClaude(ctx, session, cwd, root) },
 		StopSession:    StopTmuxSession,
 		InitRoot:       Init,

@@ -3,6 +3,7 @@ package channelagent
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -116,5 +117,54 @@ func TestEnsureAgentSettingsWritesAllowlist(t *testing.T) {
 	data2, _ := os.ReadFile(path)
 	if string(data2) != `{"custom":true}` {
 		t.Fatalf("existing settings should be preserved, got: %s", data2)
+	}
+}
+
+func TestEnsureProjectRepoAndWipCommitRealGit(t *testing.T) {
+	if _, err := os.Stat("/usr/bin/git"); err != nil {
+		if _, err2 := exec.LookPath("git"); err2 != nil {
+			t.Skip("git not available")
+		}
+	}
+	ctx := context.Background()
+	proj := filepath.Join(t.TempDir(), "fresh-proj")
+
+	// First call provisions a repo with an initial commit on branch dev.
+	if err := EnsureProjectRepo(ctx, proj); err != nil {
+		t.Fatalf("EnsureProjectRepo: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(proj, "README.md")); err != nil {
+		t.Fatalf("README not created: %v", err)
+	}
+	out, err := exec.Command("git", "-C", proj, "rev-parse", "--abbrev-ref", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+	if got := strings.TrimSpace(string(out)); got != "dev" {
+		t.Fatalf("branch = %q, want dev", got)
+	}
+	// Idempotent: a second call on an existing repo is a no-op (no error).
+	if err := EnsureProjectRepo(ctx, proj); err != nil {
+		t.Fatalf("EnsureProjectRepo (idempotent): %v", err)
+	}
+
+	// WipCommit with no changes is a no-op; with changes it commits.
+	before, _ := exec.Command("git", "-C", proj, "rev-list", "--count", "HEAD").Output()
+	if err := WipCommit(ctx, proj); err != nil {
+		t.Fatalf("WipCommit (clean): %v", err)
+	}
+	mid, _ := exec.Command("git", "-C", proj, "rev-list", "--count", "HEAD").Output()
+	if strings.TrimSpace(string(before)) != strings.TrimSpace(string(mid)) {
+		t.Fatal("WipCommit on clean tree should not add a commit")
+	}
+	if err := os.WriteFile(filepath.Join(proj, "scratch.txt"), []byte("wip\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := WipCommit(ctx, proj); err != nil {
+		t.Fatalf("WipCommit (dirty): %v", err)
+	}
+	after, _ := exec.Command("git", "-C", proj, "rev-list", "--count", "HEAD").Output()
+	if strings.TrimSpace(string(mid)) == strings.TrimSpace(string(after)) {
+		t.Fatal("WipCommit on dirty tree should add a commit")
 	}
 }

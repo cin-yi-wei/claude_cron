@@ -269,7 +269,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 0
 	case "notify":
 		return runNotifyCommand(args[1:], stdout, stderr)
-	case "bind", "unbind", "list":
+	case "bind", "unbind", "pause", "resume", "list":
 		return runManageCommand(args[0], args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown command %q\n", args[0])

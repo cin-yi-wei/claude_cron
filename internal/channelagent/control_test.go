@@ -55,6 +55,14 @@ func newTestDeps(root string, created *[]string) ControlDeps {
 			*created = append(*created, "rmworktree:"+wt)
 			return nil
 		},
+		InitProject: func(_ context.Context, projectDir string) error {
+			*created = append(*created, "initproject:"+projectDir)
+			return os.MkdirAll(projectDir, 0o755)
+		},
+		WipCommit: func(_ context.Context, wt string) error {
+			*created = append(*created, "wip:"+wt)
+			return nil
+		},
 		StartSession: func(_ context.Context, session, cwd string) error {
 			*created = append(*created, "start:"+session)
 			return nil
@@ -266,5 +274,123 @@ func TestRunControlOnceRoutesFreeTextToInbox(t *testing.T) {
 	pending2, _ := os.ReadDir(pathIn(controlRoot, "inbox", "pending"))
 	if len(pending2) != 1 {
 		t.Fatalf("free-text message re-enqueued, pending=%d", len(pending2))
+	}
+}
+
+func TestHandleBindAutoInitsMissingProject(t *testing.T) {
+	root := filepath.Join(t.TempDir(), ".channel-agent")
+	if err := Init(root); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	var actions []string
+	deps := newTestDeps(root, &actions)
+	reg := Registry{}
+
+	// Point at a path that does not exist yet; bind should auto-provision it.
+	missing := filepath.Join(t.TempDir(), "brand-new-proj")
+	cmd, _ := ParseCommand("/bind newproj " + missing + " dev")
+	_, changed, err := HandleCommand(context.Background(), deps, &reg, cmd)
+	if err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+	if !changed {
+		t.Fatal("bind on auto-init should change registry")
+	}
+	if !containsStr(actions, "initproject:"+missing) {
+		t.Fatalf("expected initproject action, got %#v", actions)
+	}
+}
+
+func TestHandleUnbindWipsBeforeRemove(t *testing.T) {
+	root := filepath.Join(t.TempDir(), ".channel-agent")
+	if err := Init(root); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	var actions []string
+	deps := newTestDeps(root, &actions)
+	reg := Registry{}
+	projectDir := t.TempDir()
+	bindCmd, _ := ParseCommand("/bind proj-w " + projectDir + " feat-x")
+	if _, _, err := HandleCommand(context.Background(), deps, &reg, bindCmd); err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+	b, _ := reg.Get("proj-w")
+
+	actions = nil
+	unbindCmd, _ := ParseCommand("/unbind proj-w")
+	if _, _, err := HandleCommand(context.Background(), deps, &reg, unbindCmd); err != nil {
+		t.Fatalf("unbind: %v", err)
+	}
+	// gwip must run, and must come before the worktree removal.
+	wipIdx, rmIdx := -1, -1
+	for i, a := range actions {
+		if a == "wip:"+b.Worktree {
+			wipIdx = i
+		}
+		if a == "rmworktree:"+b.Worktree {
+			rmIdx = i
+		}
+	}
+	if wipIdx < 0 {
+		t.Fatalf("expected wip action, got %#v", actions)
+	}
+	if rmIdx < 0 || wipIdx > rmIdx {
+		t.Fatalf("wip must precede rmworktree: %#v", actions)
+	}
+}
+
+func TestHandlePauseResume(t *testing.T) {
+	root := filepath.Join(t.TempDir(), ".channel-agent")
+	if err := Init(root); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	var actions []string
+	deps := newTestDeps(root, &actions)
+	reg := Registry{}
+	projectDir := t.TempDir()
+	bindCmd, _ := ParseCommand("/bind proj-p " + projectDir + " dev")
+	if _, _, err := HandleCommand(context.Background(), deps, &reg, bindCmd); err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+
+	actions = nil
+	pauseCmd, _ := ParseCommand("/pause proj-p")
+	reply, changed, err := HandleCommand(context.Background(), deps, &reg, pauseCmd)
+	if err != nil {
+		t.Fatalf("pause: %v", err)
+	}
+	if !changed {
+		t.Fatal("pause should change registry")
+	}
+	if b, _ := reg.Get("proj-p"); !b.Paused {
+		t.Fatal("binding should be paused")
+	}
+	if !containsStr(actions, "stop:cc-proj-p") {
+		t.Fatalf("pause should stop session, got %#v", actions)
+	}
+	if !strings.Contains(reply, "proj-p") {
+		t.Fatalf("reply = %q", reply)
+	}
+
+	// Double pause is a no-op (no registry change).
+	if _, changed2, _ := HandleCommand(context.Background(), deps, &reg, pauseCmd); changed2 {
+		t.Fatal("second pause should not change registry")
+	}
+
+	resumeCmd, _ := ParseCommand("/resume proj-p")
+	_, changed3, err := HandleCommand(context.Background(), deps, &reg, resumeCmd)
+	if err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if !changed3 {
+		t.Fatal("resume should change registry")
+	}
+	if b, _ := reg.Get("proj-p"); b.Paused {
+		t.Fatal("binding should be un-paused")
+	}
+
+	// Resume when not paused is a no-op.
+	if _, changed4, _ := HandleCommand(context.Background(), deps, &reg, resumeCmd); changed4 {
+		t.Fatal("resume on active binding should not change registry")
 	}
 }

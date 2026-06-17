@@ -93,6 +93,13 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 	}
 
 	for _, b := range reg.Bindings {
+		// Paused (hot-stopped) bindings: don't recreate the session or ingest.
+		// The session was killed on /pause; any stray copy is reaped below
+		// (excluded from the valid set). Messages stay in the channel until
+		// /resume (poll bindings backfill via the unadvanced cursor).
+		if b.Paused {
+			continue
+		}
 		if err := EnsureWorktree(ctx, b.ProjectDir, b.Branch, b.Worktree); err != nil {
 			fmt.Fprintf(stdout, "binding %s worktree error: %v\n", b.Name, err)
 			continue
@@ -173,6 +180,11 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 	// StartTmuxClaude). Valid = control session + one per current binding.
 	valid := map[string]bool{ControlBinding(root).TmuxSession: true}
 	for _, b := range reg.Bindings {
+		// Paused bindings intentionally have no session; leaving them out of the
+		// valid set lets the reaper kill any session that lingers after /pause.
+		if b.Paused {
+			continue
+		}
 		valid[b.TmuxSession] = true
 	}
 	if orphans := reapOrphanSessions(ctx, valid); len(orphans) > 0 {
