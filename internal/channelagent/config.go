@@ -13,6 +13,15 @@ type Config struct {
 	Telegram     TelegramConfig `json:"telegram"`
 	Claude       ClaudeConfig   `json:"claude"`
 	Push         PushConfig     `json:"push,omitempty"`
+	Admin        AdminConfig    `json:"admin,omitempty"`
+}
+
+// AdminConfig configures the admin HTTP API. Token, when set, is required as a
+// Bearer token on every request. Binding a non-loopback Listen without a Token
+// is refused (the API can create/delete shell-capable sessions).
+type AdminConfig struct {
+	Listen string `json:"listen,omitempty"`
+	Token  string `json:"token,omitempty"`
 }
 
 // PushConfig configures push-mode (active) ingestion. Listen is the local

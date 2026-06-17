@@ -79,7 +79,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fs := flag.NewFlagSet("admin", flag.ContinueOnError)
 		fs.SetOutput(stderr)
 		root := fs.String("root", ".channel-agent", "runtime root")
-		listen := fs.String("listen", "127.0.0.1:8787", "admin API listen address (keep loopback until auth exists)")
+		listen := fs.String("listen", "", "admin API listen address (default from config admin.listen or 127.0.0.1:8787)")
+		readonly := fs.Bool("readonly", false, "disable write endpoints (bind/unbind/restart)")
 		if err := fs.Parse(args[1:]); err != nil {
 			return 2
 		}
@@ -87,8 +88,26 @@ func run(args []string, stdout, stderr io.Writer) int {
 		if a, err := filepath.Abs(absRoot); err == nil {
 			absRoot = a
 		}
-		fmt.Fprintf(stdout, "admin API (read-only) listening on %s\n", *listen)
-		if err := agent.RunAdminServer(context.Background(), absRoot, *listen); err != nil && err != context.Canceled {
+		loadDotEnv(absRoot)
+		cfg, err := agent.LoadConfig(absRoot)
+		if err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		addr := *listen
+		if addr == "" {
+			addr = cfg.Admin.Listen
+		}
+		if addr == "" {
+			addr = "127.0.0.1:8787"
+		}
+		var deps *agent.ControlDeps
+		if !*readonly {
+			d := agent.BuildControlDeps(absRoot, cfg)
+			deps = &d
+		}
+		fmt.Fprintf(stdout, "admin API listening on %s (writes=%t)\n", addr, !*readonly)
+		if err := agent.RunAdminServer(context.Background(), absRoot, addr, cfg.Admin.Token, deps, cfg.Discord.GuildID); err != nil && err != context.Canceled {
 			fmt.Fprintln(stderr, err)
 			return 1
 		}
