@@ -21,7 +21,13 @@ var sessionBootDelay = 6 * time.Second
 // tmux-driven session cannot answer). Scoped to the tools the agent prompt uses.
 const agentSettings = `{
   "permissions": {
-    "allow": ["Read", "Write", "Edit", "Bash"]
+    "allow": ["Read", "Write", "Edit"]
+  },
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "Bash", "hooks": [ { "type": "command", "command": "claude-cron permission-gate" } ] },
+      { "matcher": "mcp__.*", "hooks": [ { "type": "command", "command": "claude-cron permission-gate" } ] }
+    ]
   }
 }
 `
@@ -68,14 +74,17 @@ func RemoveWorktree(ctx context.Context, projectDir, worktreePath string) error 
 
 // StartTmuxClaude ensures a detached tmux session named session is running
 // `claude` with its working directory set to cwd. No-op if it already exists.
-func StartTmuxClaude(ctx context.Context, session, cwd string) error {
+func StartTmuxClaude(ctx context.Context, session, cwd, registryRoot string) error {
 	if err := EnsureAgentSettings(cwd); err != nil {
 		return err
 	}
 	if runExternalCommand(ctx, "tmux", "has-session", "-t", session) == nil {
 		return nil
 	}
-	if err := runExternalCommand(ctx, "tmux", "new-session", "-d", "-s", session, "-c", cwd, "claude"); err != nil {
+	// CC_REGISTRY_ROOT lets the PreToolUse permission-gate hook find the registry
+	// (to resolve this worktree's binding + channel) without per-binding config.
+	if err := runExternalCommand(ctx, "tmux", "new-session", "-d", "-s", session,
+		"-c", cwd, "-e", "CC_REGISTRY_ROOT="+registryRoot, "claude"); err != nil {
 		return err
 	}
 	time.Sleep(sessionBootDelay)

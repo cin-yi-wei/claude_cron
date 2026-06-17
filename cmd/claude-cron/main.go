@@ -75,6 +75,28 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 		fmt.Fprintln(stdout, "doctor=ok")
 		return 0
+	case "permission-gate":
+		fs := flag.NewFlagSet("permission-gate", flag.ContinueOnError)
+		fs.SetOutput(stderr)
+		root := fs.String("root", ".channel-agent", "runtime root (registry)")
+		timeoutStr := fs.String("timeout", "300s", "how long to wait for the user's y/n")
+		if err := fs.Parse(args[1:]); err != nil {
+			return 2
+		}
+		absRoot := *root
+		if env := os.Getenv("CC_REGISTRY_ROOT"); env != "" {
+			absRoot = env // set by the session launcher; the hook has no flags
+		}
+		if a, err := filepath.Abs(absRoot); err == nil {
+			absRoot = a
+		}
+		to, err := time.ParseDuration(*timeoutStr)
+		if err != nil {
+			to = 5 * time.Minute
+		}
+		// Output is the hook decision JSON on stdout; always exit 0 so Claude reads it.
+		_ = agent.RunPermissionGate(context.Background(), absRoot, os.Stdin, stdout, to)
+		return 0
 	case "admin":
 		fs := flag.NewFlagSet("admin", flag.ContinueOnError)
 		fs.SetOutput(stderr)

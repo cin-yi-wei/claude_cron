@@ -302,7 +302,7 @@ func BuildControlDeps(root string, cfg Config) ControlDeps {
 		DeleteChannel:  admin.DeleteChannel,
 		EnsureWorktree: EnsureWorktree,
 		RemoveWorktree: RemoveWorktree,
-		StartSession:   StartTmuxClaude,
+		StartSession:   func(ctx context.Context, session, cwd string) error { return StartTmuxClaude(ctx, session, cwd, root) },
 		StopSession:    StopTmuxSession,
 		InitRoot:       Init,
 	}
