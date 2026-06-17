@@ -20,7 +20,7 @@ func TestUnbindSurfacesWorktreeError(t *testing.T) {
 		RemoveWorktree: func(context.Context, string, string) error { return errors.New("boom") },
 		DeleteChannel:  func(context.Context, string) error { return nil },
 	}
-	reply, changed, err := HandleCommand(context.Background(), deps, &reg, Command{Name: "unbind", Args: []string{"x"}, Flags: map[string]bool{}})
+	reply, changed, err := HandleCommand(context.Background(), deps, &reg, Command{Name: "unbind", Args: []string{"x"}, Flags: map[string]bool{}}, ControlPlane{})
 	if err != nil || !changed {
 		t.Fatalf("unbind: changed=%v err=%v", changed, err)
 	}

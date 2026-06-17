@@ -14,8 +14,7 @@ import (
 // one worker+sender cycle for any queued free-text control jobs. injector and
 // sender are parameterized for testing; in production the supervisor passes a
 // TmuxInjector bound to cc-control and a DiscordSender for the control channel.
-func runControlAssistant(ctx context.Context, root, tokenEnv, tokenValue string, injector Injector, sender Sender, timeout time.Duration) error {
-	cb := ControlBinding(root)
+func runControlAssistant(ctx context.Context, cb Binding, injector Injector, sender Sender, timeout time.Duration) error {
 	if err := os.MkdirAll(cb.Worktree, 0o755); err != nil {
 		return err
 	}
@@ -69,8 +68,9 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 		activePush["__control_gw__"] = true
 		controlSource = cs
 	}
+	discordPlane := ControlPlane{Name: PlatformDiscord, Platform: PlatformDiscord, ChannelID: cfg.Discord.ChannelID}
 	controlSender := DiscordSender{BaseURL: cfg.Discord.BaseURL, Token: token, ChannelID: cfg.Discord.ChannelID}
-	if err := RunControlOnce(ctx, root, ControlBinding(root).Root, deps, &reg, controlSource, controlSender); err != nil {
+	if err := RunControlOnce(ctx, root, ControlBinding(root).Root, deps, &reg, controlSource, controlSender, discordPlane); err != nil {
 		fmt.Fprintf(stdout, "control error: %v\n", err)
 	}
 
@@ -82,13 +82,45 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 
 	// Control assistant: start its session and drive any queued free-text jobs.
 	cb := ControlBinding(root)
-	if err := StartControlSession(ctx, cb.TmuxSession, cb.Worktree, cfg.Discord.TokenEnv, token, controlSystemPrompt(root, cb.Worktree)); err != nil {
+	if err := StartControlSession(ctx, cb.TmuxSession, cb.Worktree, cfg.Discord.TokenEnv, token, controlSystemPrompt(root, cb.Worktree, PlatformDiscord)); err != nil {
 		fmt.Fprintf(stdout, "control session error: %v\n", err)
 	} else {
 		controlInjector := TmuxInjector{Session: cb.TmuxSession, Root: cb.Root, AutoStart: false}
 		controlChatSender := DiscordSender{BaseURL: cfg.Discord.BaseURL, Token: token, ChannelID: cfg.Discord.ChannelID}
-		if err := runControlAssistant(ctx, root, cfg.Discord.TokenEnv, token, controlInjector, controlChatSender, timeout); err != nil {
+		if err := runControlAssistant(ctx, cb, controlInjector, controlChatSender, timeout); err != nil {
 			fmt.Fprintf(stdout, "control assistant error: %v\n", err)
+		}
+	}
+
+	// Extra (isolated) control planes — currently a Telegram plane when
+	// configured. Each runs the same control pipeline against its own chat,
+	// reserved session (cc-control-<plane>), root, and seen-state; it only
+	// sees/manages bindings tagged with its own plane.
+	tgControlPlanes := cfg.ControlPlanes()
+	tgToken := os.Getenv(cfg.Telegram.TokenEnv)
+	for _, plane := range tgControlPlanes {
+		if plane.Name == PlatformDiscord {
+			continue // handled above
+		}
+		if plane.Platform != PlatformTelegram || tgToken == "" {
+			continue
+		}
+		pcb := ControlBindingFor(root, plane.Name)
+		src := TelegramSource{BaseURL: cfg.Telegram.BaseURL, Token: tgToken, ChatID: plane.ChannelID}
+		snd := TelegramSender{BaseURL: cfg.Telegram.BaseURL, Token: tgToken, ChatID: plane.ChannelID}
+		if err := RunControlOnce(ctx, root, pcb.Root, deps, &reg, src, snd, plane); err != nil {
+			fmt.Fprintf(stdout, "control[%s] error: %v\n", plane.Name, err)
+		}
+		if reg, err = LoadRegistry(root); err != nil {
+			return err
+		}
+		if err := StartControlSession(ctx, pcb.TmuxSession, pcb.Worktree, cfg.Telegram.TokenEnv, tgToken, controlSystemPrompt(root, pcb.Worktree, plane.Name)); err != nil {
+			fmt.Fprintf(stdout, "control[%s] session error: %v\n", plane.Name, err)
+			continue
+		}
+		inj := TmuxInjector{Session: pcb.TmuxSession, Root: pcb.Root, AutoStart: false}
+		if err := runControlAssistant(ctx, pcb, inj, snd, timeout); err != nil {
+			fmt.Fprintf(stdout, "control[%s] assistant error: %v\n", plane.Name, err)
 		}
 	}
 
@@ -179,6 +211,10 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 	// Reap orphan cc-* tmux sessions (e.g. an unbind that raced with this cycle's
 	// StartTmuxClaude). Valid = control session + one per current binding.
 	valid := map[string]bool{ControlBinding(root).TmuxSession: true}
+	// Keep every configured control plane's reserved session alive.
+	for _, plane := range cfg.ControlPlanes() {
+		valid[ControlBindingFor(root, plane.Name).TmuxSession] = true
+	}
 	for _, b := range reg.Bindings {
 		// Paused bindings intentionally have no session; leaving them out of the
 		// valid set lets the reaper kill any session that lingers after /pause.

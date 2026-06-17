@@ -217,7 +217,10 @@ func (h AdminHandler) runWrite(w http.ResponseWriter, cmd Command, okStatus int)
 		http.Error(w, "registry error", http.StatusInternalServerError)
 		return
 	}
-	reply, changed, herr := HandleCommand(context.Background(), *h.Deps, &reg, cmd)
+	// Admin acts as the discord (default) plane for now; cross-plane god-mode
+	// writes are a later step. Reads (the bindings list) already show all planes.
+	adminPlane := ControlPlane{Name: PlatformDiscord, Platform: PlatformDiscord}
+	reply, changed, herr := HandleCommand(context.Background(), *h.Deps, &reg, cmd, adminPlane)
 	if herr != nil {
 		writeJSONStatus(w, http.StatusBadGateway, map[string]string{"error": herr.Error()})
 		return

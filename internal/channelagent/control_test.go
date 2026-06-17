@@ -86,7 +86,7 @@ func TestHandleBindThenUnbind(t *testing.T) {
 
 	projectDir := t.TempDir()
 	cmd, _ := ParseCommand("/bind proj-a " + projectDir + " ticket-1")
-	reply, changed, err := HandleCommand(context.Background(), deps, &reg, cmd)
+	reply, changed, err := HandleCommand(context.Background(), deps, &reg, cmd, ControlPlane{})
 	if err != nil {
 		t.Fatalf("bind: %v", err)
 	}
@@ -108,7 +108,7 @@ func TestHandleBindThenUnbind(t *testing.T) {
 	}
 
 	cmd2, _ := ParseCommand("/unbind proj-a")
-	_, changed2, err := HandleCommand(context.Background(), deps, &reg, cmd2)
+	_, changed2, err := HandleCommand(context.Background(), deps, &reg, cmd2, ControlPlane{})
 	if err != nil {
 		t.Fatalf("unbind: %v", err)
 	}
@@ -133,7 +133,7 @@ func TestHandleBindRejectsReservedControlName(t *testing.T) {
 	deps := newTestDeps(root, &actions)
 	reg := Registry{}
 	cmd, _ := ParseCommand("/bind control " + t.TempDir() + " dev")
-	reply, changed, err := HandleCommand(context.Background(), deps, &reg, cmd)
+	reply, changed, err := HandleCommand(context.Background(), deps, &reg, cmd, ControlPlane{})
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
@@ -156,7 +156,7 @@ func TestHandleBindRejectsBadName(t *testing.T) {
 	reg := Registry{}
 	projectDir := t.TempDir()
 	cmd, _ := ParseCommand("/bind Bad_Name " + projectDir + " ticket-1")
-	reply, changed, err := HandleCommand(context.Background(), deps, &reg, cmd)
+	reply, changed, err := HandleCommand(context.Background(), deps, &reg, cmd, ControlPlane{})
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
@@ -194,11 +194,20 @@ func TestControlBindingDerivation(t *testing.T) {
 }
 
 func TestControlSystemPromptMentionsCommands(t *testing.T) {
-	p := controlSystemPrompt("/abs/root", "/abs/root/control-workspace")
+	p := controlSystemPrompt("/abs/root", "/abs/root/control-workspace", PlatformDiscord)
 	for _, want := range []string{"claude-cron bind", "claude-cron unbind", "claude-cron list", "/abs/root/control-workspace"} {
 		if !strings.Contains(p, want) {
 			t.Fatalf("system prompt missing %q:\n%s", want, p)
 		}
+	}
+	// Discord (default) plane prompt carries no --plane flag.
+	if strings.Contains(p, "--plane") {
+		t.Fatalf("discord prompt should not mention --plane:\n%s", p)
+	}
+	// A non-discord plane prompt instructs --plane on every command.
+	tg := controlSystemPrompt("/abs/root", "/abs/root/control-telegram-workspace", PlatformTelegram)
+	if !strings.Contains(tg, "--plane=telegram") {
+		t.Fatalf("telegram prompt must mention --plane=telegram:\n%s", tg)
 	}
 }
 
@@ -233,9 +242,9 @@ func TestRunControlOnceRetriesFailedCommand(t *testing.T) {
 	reg := Registry{}
 	src := stubSource{msgs: []SourceMessage{{Platform: "discord", ChannelID: "ctl", MessageID: "m1", AuthorID: "u1", CreatedAt: "2026-06-16T00:00:00Z", Content: "/bind proj-a " + t.TempDir() + " ticket-1"}}}
 	sender := &capSender{}
-	_ = RunControlOnce(context.Background(), root, ControlBinding(root).Root, deps, &reg, src, sender)
+	_ = RunControlOnce(context.Background(), root, ControlBinding(root).Root, deps, &reg, src, sender, ControlPlane{})
 	reg2, _ := LoadRegistry(root)
-	_ = RunControlOnce(context.Background(), root, ControlBinding(root).Root, deps, &reg2, src, sender)
+	_ = RunControlOnce(context.Background(), root, ControlBinding(root).Root, deps, &reg2, src, sender, ControlPlane{})
 	if calls != 2 {
 		t.Fatalf("expected failed command retried (calls=2), got calls=%d", calls)
 	}
@@ -260,7 +269,7 @@ func TestRunControlOnceRoutesFreeTextToInbox(t *testing.T) {
 	}}}
 	sender := &capSender{}
 
-	if err := RunControlOnce(context.Background(), root, controlRoot, deps, &reg, src, sender); err != nil {
+	if err := RunControlOnce(context.Background(), root, controlRoot, deps, &reg, src, sender, ControlPlane{}); err != nil {
 		t.Fatalf("RunControlOnce: %v", err)
 	}
 	pending, _ := os.ReadDir(pathIn(controlRoot, "inbox", "pending"))
@@ -268,7 +277,7 @@ func TestRunControlOnceRoutesFreeTextToInbox(t *testing.T) {
 		t.Fatalf("expected 1 queued control job, got %d", len(pending))
 	}
 
-	if err := RunControlOnce(context.Background(), root, controlRoot, deps, &reg, src, sender); err != nil {
+	if err := RunControlOnce(context.Background(), root, controlRoot, deps, &reg, src, sender, ControlPlane{}); err != nil {
 		t.Fatalf("RunControlOnce 2: %v", err)
 	}
 	pending2, _ := os.ReadDir(pathIn(controlRoot, "inbox", "pending"))
@@ -289,7 +298,7 @@ func TestHandleBindAutoInitsMissingProject(t *testing.T) {
 	// Point at a path that does not exist yet; bind should auto-provision it.
 	missing := filepath.Join(t.TempDir(), "brand-new-proj")
 	cmd, _ := ParseCommand("/bind newproj " + missing + " dev")
-	_, changed, err := HandleCommand(context.Background(), deps, &reg, cmd)
+	_, changed, err := HandleCommand(context.Background(), deps, &reg, cmd, ControlPlane{})
 	if err != nil {
 		t.Fatalf("bind: %v", err)
 	}
@@ -311,14 +320,14 @@ func TestHandleUnbindWipsBeforeRemove(t *testing.T) {
 	reg := Registry{}
 	projectDir := t.TempDir()
 	bindCmd, _ := ParseCommand("/bind proj-w " + projectDir + " feat-x")
-	if _, _, err := HandleCommand(context.Background(), deps, &reg, bindCmd); err != nil {
+	if _, _, err := HandleCommand(context.Background(), deps, &reg, bindCmd, ControlPlane{}); err != nil {
 		t.Fatalf("bind: %v", err)
 	}
 	b, _ := reg.Get("proj-w")
 
 	actions = nil
 	unbindCmd, _ := ParseCommand("/unbind proj-w")
-	if _, _, err := HandleCommand(context.Background(), deps, &reg, unbindCmd); err != nil {
+	if _, _, err := HandleCommand(context.Background(), deps, &reg, unbindCmd, ControlPlane{}); err != nil {
 		t.Fatalf("unbind: %v", err)
 	}
 	// gwip must run, and must come before the worktree removal.
@@ -349,13 +358,13 @@ func TestHandlePauseResume(t *testing.T) {
 	reg := Registry{}
 	projectDir := t.TempDir()
 	bindCmd, _ := ParseCommand("/bind proj-p " + projectDir + " dev")
-	if _, _, err := HandleCommand(context.Background(), deps, &reg, bindCmd); err != nil {
+	if _, _, err := HandleCommand(context.Background(), deps, &reg, bindCmd, ControlPlane{}); err != nil {
 		t.Fatalf("bind: %v", err)
 	}
 
 	actions = nil
 	pauseCmd, _ := ParseCommand("/pause proj-p")
-	reply, changed, err := HandleCommand(context.Background(), deps, &reg, pauseCmd)
+	reply, changed, err := HandleCommand(context.Background(), deps, &reg, pauseCmd, ControlPlane{})
 	if err != nil {
 		t.Fatalf("pause: %v", err)
 	}
@@ -373,12 +382,12 @@ func TestHandlePauseResume(t *testing.T) {
 	}
 
 	// Double pause is a no-op (no registry change).
-	if _, changed2, _ := HandleCommand(context.Background(), deps, &reg, pauseCmd); changed2 {
+	if _, changed2, _ := HandleCommand(context.Background(), deps, &reg, pauseCmd, ControlPlane{}); changed2 {
 		t.Fatal("second pause should not change registry")
 	}
 
 	resumeCmd, _ := ParseCommand("/resume proj-p")
-	_, changed3, err := HandleCommand(context.Background(), deps, &reg, resumeCmd)
+	_, changed3, err := HandleCommand(context.Background(), deps, &reg, resumeCmd, ControlPlane{})
 	if err != nil {
 		t.Fatalf("resume: %v", err)
 	}
@@ -390,7 +399,80 @@ func TestHandlePauseResume(t *testing.T) {
 	}
 
 	// Resume when not paused is a no-op.
-	if _, changed4, _ := HandleCommand(context.Background(), deps, &reg, resumeCmd); changed4 {
+	if _, changed4, _ := HandleCommand(context.Background(), deps, &reg, resumeCmd, ControlPlane{}); changed4 {
 		t.Fatal("resume on active binding should not change registry")
+	}
+}
+
+func TestControlPlanesIsolation(t *testing.T) {
+	root := filepath.Join(t.TempDir(), ".channel-agent")
+	if err := Init(root); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	var actions []string
+	deps := newTestDeps(root, &actions)
+	reg := Registry{}
+
+	dc := ControlPlane{Name: PlatformDiscord, Platform: PlatformDiscord}
+	tg := ControlPlane{Name: PlatformTelegram, Platform: PlatformTelegram}
+
+	// Bind one binding from each plane.
+	dcCmd, _ := ParseCommand("/bind dcproj " + t.TempDir() + " feat")
+	if _, _, err := HandleCommand(context.Background(), deps, &reg, dcCmd, dc); err != nil {
+		t.Fatalf("dc bind: %v", err)
+	}
+	tgCmd, _ := ParseCommand("/bind tgproj " + t.TempDir() + " feat --chat-id=42")
+	if _, _, err := HandleCommand(context.Background(), deps, &reg, tgCmd, tg); err != nil {
+		t.Fatalf("tg bind: %v", err)
+	}
+
+	// Plane stamping + platform defaulting.
+	if b, _ := reg.Get("dcproj"); b.PlaneOf() != PlatformDiscord || b.PlatformOf() != PlatformDiscord {
+		t.Fatalf("dcproj plane/platform wrong: %#v", b)
+	}
+	if b, _ := reg.Get("tgproj"); b.PlaneOf() != PlatformTelegram || b.PlatformOf() != PlatformTelegram {
+		t.Fatalf("tgproj should default to telegram plane+platform: %#v", b)
+	}
+
+	// list is plane-scoped.
+	if got := handleList(&reg, dc); !strings.Contains(got, "dcproj") || strings.Contains(got, "tgproj") {
+		t.Fatalf("discord list should show only dcproj: %q", got)
+	}
+	if got := handleList(&reg, tg); !strings.Contains(got, "tgproj") || strings.Contains(got, "dcproj") {
+		t.Fatalf("telegram list should show only tgproj: %q", got)
+	}
+
+	// Cross-plane unbind is refused (not found), and leaves the binding intact.
+	xCmd, _ := ParseCommand("/unbind tgproj")
+	reply, changed, _ := HandleCommand(context.Background(), deps, &reg, xCmd, dc)
+	if changed || !strings.Contains(reply, "找不到") {
+		t.Fatalf("discord must not see tgproj: reply=%q changed=%v", reply, changed)
+	}
+	if _, ok := reg.Get("tgproj"); !ok {
+		t.Fatal("tgproj should still exist after cross-plane unbind attempt")
+	}
+
+	// Same-plane unbind works.
+	if _, changed, _ := HandleCommand(context.Background(), deps, &reg, xCmd, tg); !changed {
+		t.Fatal("same-plane unbind should succeed")
+	}
+
+	// Global-unique names: a second plane can't reuse a name.
+	dupCmd, _ := ParseCommand("/bind dcproj " + t.TempDir() + " feat --chat-id=9")
+	if reply, changed, _ := HandleCommand(context.Background(), deps, &reg, dupCmd, tg); changed || !strings.Contains(reply, "已存在") {
+		t.Fatalf("name must be globally unique: reply=%q changed=%v", reply, changed)
+	}
+}
+
+func TestConfigControlPlanes(t *testing.T) {
+	var c Config
+	c.Discord.ChannelID = "dc1"
+	if p := c.ControlPlanes(); len(p) != 1 || p[0].Name != PlatformDiscord || p[0].ChannelID != "dc1" {
+		t.Fatalf("default planes = %#v", p)
+	}
+	c.Control.TelegramChatID = "tg1"
+	p := c.ControlPlanes()
+	if len(p) != 2 || p[1].Name != PlatformTelegram || p[1].Platform != PlatformTelegram || p[1].ChannelID != "tg1" {
+		t.Fatalf("with tg planes = %#v", p)
 	}
 }

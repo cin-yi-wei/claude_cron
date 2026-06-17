@@ -27,6 +27,19 @@ type Binding struct {
 	// starting the session and ingesting messages while paused; /resume clears it
 	// and the next cycle recreates the session (auto-resuming the transcript).
 	Paused bool `json:"paused,omitempty"`
+	// Plane is the control plane that owns this binding (e.g. "discord" or
+	// "telegram"). Each control plane only sees/manages its own bindings. Empty
+	// means the legacy default plane ("discord"), so existing registries keep
+	// working. Names remain globally unique across planes.
+	Plane string `json:"plane,omitempty"`
+}
+
+// PlaneOf returns the owning control plane, defaulting to "discord" when unset.
+func (b Binding) PlaneOf() string {
+	if b.Plane == "" {
+		return PlatformDiscord
+	}
+	return b.Plane
 }
 
 // Platform and Mode values. Empty string is treated as the default
