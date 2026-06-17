@@ -111,6 +111,72 @@ func (r TelegramReader) Drain(ctx context.Context, routes map[string]func(contex
 	return nil
 }
 
+// telegramRoutes builds the chat-id → delivery map shared by the poll reader and
+// the webhook demux handler: every Telegram binding's chat delivers to that
+// binding's inbox, and every Telegram control plane's chat delivers to that
+// plane's buffer. Same routing whether updates arrive by getUpdates or webhook.
+func telegramRoutes(root string, cfg Config, reg Registry) map[string]func(context.Context, SourceMessage) error {
+	routes := map[string]func(context.Context, SourceMessage) error{}
+	for _, b := range reg.Bindings {
+		if b.PlatformOf() != PlatformTelegram {
+			continue
+		}
+		broot := b.Root
+		routes[b.ChannelID] = func(ctx context.Context, msg SourceMessage) error {
+			_, err := IngestMessages(ctx, broot, []SourceMessage{msg})
+			return err
+		}
+	}
+	for _, plane := range cfg.ControlPlanes() {
+		if plane.Platform != PlatformTelegram || plane.ChannelID == "" {
+			continue
+		}
+		buf := pathIn(ControlBindingFor(root, plane.Name).Root, "state", "tg_buffer.json")
+		routes[plane.ChannelID] = func(_ context.Context, msg SourceMessage) error {
+			return appendTelegramBuffer(buf, msg)
+		}
+	}
+	return routes
+}
+
+// TelegramDemuxHandler is the webhook counterpart to TelegramReader: Telegram
+// POSTs every update for the bot to one endpoint, and this handler routes each
+// by chat id (reloading the registry per request so new bindings are picked up).
+// Used when the whole bot is in webhook mode (webhook ⊥ getUpdates per bot).
+type TelegramDemuxHandler struct {
+	Root   string
+	Cfg    Config
+	Secret string
+}
+
+func (h TelegramDemuxHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if h.Secret != "" && r.Header.Get("X-Telegram-Bot-Api-Secret-Token") != h.Secret {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	var update telegramUpdate
+	if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if msg, ok := telegramExtract(update); ok {
+		reg, _ := LoadRegistry(h.Root)
+		if route, ok := telegramRoutes(h.Root, h.Cfg, reg)[msg.ChannelID]; ok {
+			if err := route(r.Context(), msg); err != nil {
+				http.Error(w, "deliver failed", http.StatusInternalServerError)
+				return
+			}
+		}
+	}
+	// Always 200 for an authorized, well-formed post (even if unrouted) so
+	// Telegram does not retry indefinitely.
+	w.WriteHeader(http.StatusOK)
+}
+
 // TelegramBufferSource is a MessageSource backed by a file the TelegramReader
 // appends routed control-plane messages to. Fetch returns and clears the buffer,
 // so a control plane consumes its messages without doing its own getUpdates.

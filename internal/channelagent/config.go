@@ -86,6 +86,11 @@ type TelegramConfig struct {
 	TokenEnv string `json:"token_env"`
 	ChatID   string `json:"chat_id"`
 	BaseURL  string `json:"base_url,omitempty"`
+	// Webhook switches the whole bot to webhook mode: Telegram POSTs every update
+	// to one demux endpoint (Push.PublicURL + "/tg") instead of getUpdates. webhook
+	// and getUpdates are mutually exclusive per bot, so this disables the shared
+	// poll reader. Requires Push.Listen + Push.PublicURL.
+	Webhook bool `json:"webhook,omitempty"`
 }
 
 type ClaudeConfig struct {
