@@ -40,7 +40,7 @@ func TestRegistryAddGetRemoveRoundTrip(t *testing.T) {
 	if got.TmuxSession != "cc-proj-a" {
 		t.Fatalf("TmuxSession = %q, want cc-proj-a", got.TmuxSession)
 	}
-	if got.Worktree != filepath.Join(root, "worktrees", "proj-a") {
+	if got.Worktree != "/home/u/proj-a" { // sibling of project dir /home/u/a
 		t.Fatalf("Worktree = %q", got.Worktree)
 	}
 	if got.Root != filepath.Join(root, "bindings", "proj-a") {
