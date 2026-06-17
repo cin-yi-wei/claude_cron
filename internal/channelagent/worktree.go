@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -94,12 +95,71 @@ func StartTmuxClaude(ctx context.Context, session, cwd, registryRoot string) err
 	}
 	// CC_REGISTRY_ROOT lets the PreToolUse permission-gate hook find the registry
 	// (to resolve this worktree's binding + channel) without per-binding config.
-	if err := runExternalCommand(ctx, "tmux", "new-session", "-d", "-s", session,
-		"-c", cwd, "-e", "CC_REGISTRY_ROOT="+registryRoot, "claude"); err != nil {
+	// claudeArgs resumes the latest transcript so a (re)created session — on
+	// reap, serve restart, or reboot — keeps its prior conversation.
+	args := append([]string{"new-session", "-d", "-s", session, "-c", cwd, "-e", "CC_REGISTRY_ROOT=" + registryRoot}, claudeArgs(cwd)...)
+	if err := runExternalCommand(ctx, "tmux", args...); err != nil {
 		return err
 	}
 	time.Sleep(sessionBootDelay)
 	return nil
+}
+
+// encodeProjectDir maps an absolute path to Claude Code's project-history dir
+// name: every non-alphanumeric character becomes '-'.
+func encodeProjectDir(p string) string {
+	var b strings.Builder
+	for _, r := range p {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		} else {
+			b.WriteRune('-')
+		}
+	}
+	return b.String()
+}
+
+// latestTranscript returns the id of the most recent Claude transcript for a
+// session whose cwd is worktree, or "" if none.
+func latestTranscript(worktree string) string {
+	abs := worktree
+	if a, err := filepath.Abs(worktree); err == nil {
+		abs = a
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	entries, err := os.ReadDir(filepath.Join(home, ".claude", "projects", encodeProjectDir(abs)))
+	if err != nil {
+		return ""
+	}
+	var newest string
+	var newestT time.Time
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if newest == "" || info.ModTime().After(newestT) {
+			newestT = info.ModTime()
+			newest = strings.TrimSuffix(e.Name(), ".jsonl")
+		}
+	}
+	return newest
+}
+
+// claudeArgs builds the `claude ...` tail for a tmux launch, resuming the latest
+// transcript for cwd when one exists. extra is appended after (e.g. flags).
+func claudeArgs(cwd string, extra ...string) []string {
+	args := []string{"claude"}
+	if id := latestTranscript(cwd); id != "" {
+		args = append(args, "--resume", id)
+	}
+	return append(args, extra...)
 }
 
 // StartControlSession starts the control channel's AI assistant session: a
@@ -114,9 +174,9 @@ func StartControlSession(ctx context.Context, session, cwd, tokenEnv, tokenValue
 	if runExternalCommand(ctx, "tmux", "has-session", "-t", session) == nil {
 		return nil
 	}
-	if err := runExternalCommand(ctx, "tmux", "new-session", "-d", "-s", session,
-		"-c", cwd, "-e", tokenEnv+"="+tokenValue,
-		"claude", "--append-system-prompt", systemPrompt); err != nil {
+	args := append([]string{"new-session", "-d", "-s", session, "-c", cwd, "-e", tokenEnv + "=" + tokenValue},
+		claudeArgs(cwd, "--append-system-prompt", systemPrompt)...)
+	if err := runExternalCommand(ctx, "tmux", args...); err != nil {
 		return err
 	}
 	time.Sleep(sessionBootDelay)
