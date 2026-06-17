@@ -75,6 +75,24 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 		fmt.Fprintln(stdout, "doctor=ok")
 		return 0
+	case "admin":
+		fs := flag.NewFlagSet("admin", flag.ContinueOnError)
+		fs.SetOutput(stderr)
+		root := fs.String("root", ".channel-agent", "runtime root")
+		listen := fs.String("listen", "127.0.0.1:8787", "admin API listen address (keep loopback until auth exists)")
+		if err := fs.Parse(args[1:]); err != nil {
+			return 2
+		}
+		absRoot := *root
+		if a, err := filepath.Abs(absRoot); err == nil {
+			absRoot = a
+		}
+		fmt.Fprintf(stdout, "admin API (read-only) listening on %s\n", *listen)
+		if err := agent.RunAdminServer(context.Background(), absRoot, *listen); err != nil && err != context.Canceled {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		return 0
 	case "serve":
 		fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 		fs.SetOutput(stderr)
