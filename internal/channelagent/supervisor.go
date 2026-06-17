@@ -49,6 +49,40 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 
 	deps := BuildControlDeps(root, cfg)
 
+	// Shared Telegram reader: one offset-advancing getUpdates for the bot token,
+	// routing each message to its chat's destination — a poll binding's inbox or a
+	// control plane's buffer. Runs before control + binding processing so their
+	// inboxes/buffers are filled. Replaces per-consumer getUpdates (which 409'd and
+	// re-fetched the 24h backlog). Push (webhook) bindings are fed separately.
+	tgToken := os.Getenv(cfg.Telegram.TokenEnv)
+	if tgToken != "" {
+		routes := map[string]func(context.Context, SourceMessage) error{}
+		for _, b := range reg.Bindings {
+			if b.PlatformOf() == PlatformTelegram && b.ModeOf() == ModePoll {
+				broot := b.Root
+				routes[b.ChannelID] = func(ctx context.Context, msg SourceMessage) error {
+					_, err := IngestMessages(ctx, broot, []SourceMessage{msg})
+					return err
+				}
+			}
+		}
+		for _, plane := range cfg.ControlPlanes() {
+			if plane.Platform != PlatformTelegram || plane.ChannelID == "" {
+				continue
+			}
+			buf := pathIn(ControlBindingFor(root, plane.Name).Root, "state", "tg_buffer.json")
+			routes[plane.ChannelID] = func(_ context.Context, msg SourceMessage) error {
+				return appendTelegramBuffer(buf, msg)
+			}
+		}
+		if len(routes) > 0 {
+			reader := TelegramReader{BaseURL: cfg.Telegram.BaseURL, Token: tgToken, OffsetPath: pathIn(root, "state", "tg_offset.json")}
+			if err := reader.Drain(ctx, routes); err != nil {
+				fmt.Fprintf(stdout, "telegram reader error: %v\n", err)
+			}
+		}
+	}
+
 	// activePush tracks every push ingester that should stay alive this cycle, so
 	// Reconcile (at the end) doesn't cancel them. The control gateway uses a
 	// reserved key and must be included, or it would be killed+reconnected every
@@ -97,7 +131,6 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 	// reserved session (cc-control-<plane>), root, and seen-state; it only
 	// sees/manages bindings tagged with its own plane.
 	tgControlPlanes := cfg.ControlPlanes()
-	tgToken := os.Getenv(cfg.Telegram.TokenEnv)
 	for _, plane := range tgControlPlanes {
 		if plane.Name == PlatformDiscord {
 			continue // handled above
@@ -106,7 +139,9 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 			continue
 		}
 		pcb := ControlBindingFor(root, plane.Name)
-		src := TelegramSource{BaseURL: cfg.Telegram.BaseURL, Token: tgToken, ChatID: plane.ChannelID}
+		// Source = the buffer the shared reader routed this plane's messages into
+		// (the reader owns the single getUpdates cursor); sender still posts直接.
+		src := TelegramBufferSource{Path: pathIn(pcb.Root, "state", "tg_buffer.json")}
 		snd := TelegramSender{BaseURL: cfg.Telegram.BaseURL, Token: tgToken, ChatID: plane.ChannelID}
 		if err := RunControlOnce(ctx, root, pcb.Root, deps, &reg, src, snd, plane); err != nil {
 			fmt.Fprintf(stdout, "control[%s] error: %v\n", plane.Name, err)
@@ -187,6 +222,10 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 				})
 			}
 			activePush[name] = true
+			ingester = noopIngester{}
+		} else if b.PlatformOf() == PlatformTelegram {
+			// tg-poll bindings are fed out-of-band by the shared TelegramReader
+			// (which filled this binding's inbox above); just drain here.
 			ingester = noopIngester{}
 		} else {
 			ingester, err = SelectIngester(b, cfg, tokens)
