@@ -47,6 +47,56 @@ func EnsureAgentSettings(dir string) error {
 	return os.WriteFile(settingsPath, []byte(agentSettings), 0o644)
 }
 
+// gitIdentity supplies a fallback committer so commits work even when the host
+// has no global git user configured. Real per-repo identity, if set, wins.
+var gitIdentity = []string{"-c", "user.name=claude_cron", "-c", "user.email=claude_cron@localhost"}
+
+// EnsureProjectRepo makes sure projectDir exists and is a git repo, so a binding
+// can be created against a brand-new project. Existing repos are a no-op. A fresh
+// project is created with `git init -b dev`, seeded with a README, and given one
+// initial commit so a branch (and HEAD) exists for `git worktree add` to fork.
+func EnsureProjectRepo(ctx context.Context, projectDir string) error {
+	if runExternalCommand(ctx, "git", "-C", projectDir, "rev-parse", "--git-dir") == nil {
+		return nil
+	}
+	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+		return err
+	}
+	if err := runExternalCommand(ctx, "git", "-C", projectDir, "init", "-b", "dev"); err != nil {
+		return err
+	}
+	readme := filepath.Join(projectDir, "README.md")
+	if _, err := os.Stat(readme); err != nil {
+		if werr := os.WriteFile(readme, []byte("# "+filepath.Base(projectDir)+"\n"), 0o644); werr != nil {
+			return werr
+		}
+	}
+	if err := runExternalCommand(ctx, "git", "-C", projectDir, "add", "-A"); err != nil {
+		return err
+	}
+	args := append([]string{"-c", "core.hooksPath=/dev/null"}, gitIdentity...)
+	args = append(args, "-C", projectDir, "commit", "-m", "chore: init project (claude_cron)")
+	return runExternalCommand(ctx, "git", args...)
+}
+
+// WipCommit commits any uncommitted changes in worktree onto its current branch
+// before the worktree is removed on /unbind, so in-flight work is preserved on
+// the branch (which lives in the shared main repo). No-op if the worktree is gone
+// or has nothing to commit.
+func WipCommit(ctx context.Context, worktree string) error {
+	if _, err := os.Stat(worktree); err != nil {
+		return nil
+	}
+	_ = runExternalCommand(ctx, "git", "-C", worktree, "add", "-A")
+	// diff --cached --quiet exits 0 when nothing is staged → nothing to commit.
+	if runExternalCommand(ctx, "git", "-C", worktree, "diff", "--cached", "--quiet") == nil {
+		return nil
+	}
+	args := append([]string{"-c", "core.hooksPath=/dev/null"}, gitIdentity...)
+	args = append(args, "-C", worktree, "commit", "-m", "wip: claude_cron unbind snapshot")
+	return runExternalCommand(ctx, "git", args...)
+}
+
 // EnsureWorktree makes sure worktreePath is a git worktree of branch, checked
 // out from projectDir. Idempotent: if worktreePath already exists it is a no-op.
 // If the branch does not exist yet it is created from current HEAD.

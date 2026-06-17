@@ -22,6 +22,11 @@ type Binding struct {
 	// legacy default (discord/poll), so existing registries keep working.
 	Platform string `json:"platform,omitempty"`
 	Mode     string `json:"mode,omitempty"`
+	// Paused marks a binding as "hot-stopped": its tmux session is killed to free
+	// memory but the binding + worktree + transcript are kept. The supervisor skips
+	// starting the session and ingesting messages while paused; /resume clears it
+	// and the next cycle recreates the session (auto-resuming the transcript).
+	Paused bool `json:"paused,omitempty"`
 }
 
 // Platform and Mode values. Empty string is treated as the default
@@ -117,6 +122,18 @@ func (r *Registry) Add(b Binding) error {
 	}
 	r.Bindings = append(r.Bindings, b)
 	return nil
+}
+
+// SetPaused flips the paused flag on a binding by name. Returns false if no such
+// binding exists. The caller persists the registry.
+func (r *Registry) SetPaused(name string, paused bool) bool {
+	for i := range r.Bindings {
+		if r.Bindings[i].Name == name {
+			r.Bindings[i].Paused = paused
+			return true
+		}
+	}
+	return false
 }
 
 func (r *Registry) Remove(name string) bool {
