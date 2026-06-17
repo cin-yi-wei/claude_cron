@@ -97,7 +97,7 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 			fmt.Fprintf(stdout, "binding %s worktree error: %v\n", b.Name, err)
 			continue
 		}
-		if err := StartTmuxClaude(ctx, b.TmuxSession, b.Worktree); err != nil {
+		if err := StartTmuxClaude(ctx, b.TmuxSession, b.Worktree, root); err != nil {
 			fmt.Fprintf(stdout, "binding %s session error: %v\n", b.Name, err)
 			continue
 		}

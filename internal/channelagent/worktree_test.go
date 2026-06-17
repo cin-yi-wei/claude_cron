@@ -46,10 +46,10 @@ func TestStartTmuxClaudeStartsWhenMissing(t *testing.T) {
 		return nil
 	}
 	cwd := t.TempDir()
-	if err := StartTmuxClaude(context.Background(), "cc-proj", cwd); err != nil {
+	if err := StartTmuxClaude(context.Background(), "cc-proj", cwd, "/reg/root"); err != nil {
 		t.Fatalf("StartTmuxClaude: %v", err)
 	}
-	wantStart := []string{"tmux", "new-session", "-d", "-s", "cc-proj", "-c", cwd, "claude"}
+	wantStart := []string{"tmux", "new-session", "-d", "-s", "cc-proj", "-c", cwd, "-e", "CC_REGISTRY_ROOT=/reg/root", "claude"}
 	if len(calls) != 2 || !reflect.DeepEqual(calls[1], wantStart) {
 		t.Fatalf("calls = %#v", calls)
 	}

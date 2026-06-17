@@ -52,6 +52,21 @@ func RunWorkerOnce(ctx context.Context, root string, injector Injector, timeout 
 		_ = moveFile(processingPath, pathIn(root, "inbox", "failed", name))
 		return true, err
 	}
+
+	// Permission-gate side-route: if a tool is waiting on the channel for
+	// approval and this message is a y/n decision, resolve it instead of
+	// injecting it into the session (the session is blocked in the hook).
+	if id := oldestPendingPermission(root); id != "" {
+		if allow, ok := parseDecision(job.Source.Content); ok {
+			if err := resolvePermission(root, id, allow); err != nil {
+				_ = moveFile(processingPath, pathIn(root, "inbox", "failed", name))
+				return true, err
+			}
+			_ = moveFile(processingPath, pathIn(root, "inbox", "done", name))
+			return true, nil
+		}
+	}
+
 	if err := AtomicWriteJSON(pathIn(root, "current_job.json"), job); err != nil {
 		_ = moveFile(processingPath, pathIn(root, "inbox", "failed", name))
 		return true, err
