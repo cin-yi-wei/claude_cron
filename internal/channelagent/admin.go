@@ -53,19 +53,24 @@ type AdminHandler struct {
 }
 
 func (h AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if !h.authorized(r) {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
 	path := r.URL.Path
-	switch {
-	case path == "/" || path == "/index.html":
+	// The UI page is static (no data) and must load without a bearer token —
+	// a browser navigating to the URL cannot send one. It then prompts for the
+	// token and sends it on the API calls, which ARE gated below.
+	if path == "/" || path == "/index.html" {
 		if r.Method != http.MethodGet {
 			methodNotAllowed(w)
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = w.Write([]byte(adminIndexHTML))
+		return
+	}
+	if !h.authorized(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	switch {
 	case path == "/api/healthz":
 		writeJSONResponse(w, map[string]string{"status": "ok"})
 	case path == "/api/bindings":
