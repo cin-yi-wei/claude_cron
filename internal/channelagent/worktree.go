@@ -8,13 +8,41 @@ import (
 	"time"
 )
 
-// sessionBootDelay is how long to wait after creating a NEW tmux Claude session
-// before returning, giving the Claude TUI time to finish booting. Without it the
-// first prompt injected into a freshly-created session races the boot and is
-// dropped (the keystrokes land before the input is interactive), so that job
-// stalls until it times out. Only paid once per session creation. Overridable
-// in tests.
-var sessionBootDelay = 6 * time.Second
+// sessionBootDelay bounds how long waitSessionReady probes a freshly-created
+// tmux Claude session for input readiness. A blind fixed delay was too short on
+// cold start: the first injected prompt raced the Claude TUI boot splash, the
+// keystrokes dropped, and the job stalled until its 120s timeout. waitSessionReady
+// returns as soon as the session echoes a sentinel (usually a few seconds), so
+// this is an upper bound, not a fixed cost. Set to 0 in tests to skip probing.
+var sessionBootDelay = 30 * time.Second
+
+// readyProbeSettle is the pause between typing the readiness sentinel and
+// capturing the pane to look for its echo.
+var readyProbeSettle = 500 * time.Millisecond
+
+// waitSessionReady blocks until a freshly-created tmux Claude session is actually
+// accepting keystrokes, by repeatedly typing a sentinel and checking it echoes in
+// the pane, then clearing it. This replaces a blind boot delay that dropped the
+// first inject on cold start. No-op when sessionBootDelay <= 0 (tests).
+func waitSessionReady(ctx context.Context, session string) {
+	if sessionBootDelay <= 0 {
+		return
+	}
+	const sentinel = "__cc_ready_probe__"
+	start := time.Now()
+	for time.Since(start) < sessionBootDelay {
+		time.Sleep(readyProbeSettle)
+		_ = runExternalCommand(ctx, "tmux", "send-keys", "-t", session, "-l", sentinel)
+		time.Sleep(readyProbeSettle)
+		pane, err := runExternalCommandOutput(ctx, "tmux", "capture-pane", "-pt", session)
+		if err == nil && strings.Contains(pane, sentinel) {
+			// Ready: clear the sentinel so it doesn't pollute the first prompt.
+			_ = runExternalCommand(ctx, "tmux", "send-keys", "-t", session, "C-c")
+			time.Sleep(readyProbeSettle)
+			return
+		}
+	}
+}
 
 // agentSettings is the Claude Code permission allowlist written into each
 // binding's worktree so the driven agent can read the job, write its reply, and
@@ -151,7 +179,7 @@ func StartTmuxClaude(ctx context.Context, session, cwd, registryRoot string) err
 	if err := runExternalCommand(ctx, "tmux", args...); err != nil {
 		return err
 	}
-	time.Sleep(sessionBootDelay)
+	waitSessionReady(ctx, session)
 	return nil
 }
 
@@ -229,7 +257,7 @@ func StartControlSession(ctx context.Context, session, cwd, tokenEnv, tokenValue
 	if err := runExternalCommand(ctx, "tmux", args...); err != nil {
 		return err
 	}
-	time.Sleep(sessionBootDelay)
+	waitSessionReady(ctx, session)
 	return nil
 }
 

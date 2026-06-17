@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestEnsureWorktreeCreatesBranchWhenMissing(t *testing.T) {
@@ -166,5 +167,65 @@ func TestEnsureProjectRepoAndWipCommitRealGit(t *testing.T) {
 	after, _ := exec.Command("git", "-C", proj, "rev-list", "--count", "HEAD").Output()
 	if strings.TrimSpace(string(mid)) == strings.TrimSpace(string(after)) {
 		t.Fatal("WipCommit on dirty tree should add a commit")
+	}
+}
+
+func TestWaitSessionReadyProbesUntilEcho(t *testing.T) {
+	oldRun, oldOut := runExternalCommand, runExternalCommandOutput
+	oldDelay, oldSettle := sessionBootDelay, readyProbeSettle
+	defer func() {
+		runExternalCommand = oldRun
+		runExternalCommandOutput = oldOut
+		sessionBootDelay = oldDelay
+		readyProbeSettle = oldSettle
+	}()
+	sessionBootDelay = 5 * time.Second
+	readyProbeSettle = time.Millisecond
+
+	var sawClear bool
+	captures := 0
+	runExternalCommand = func(_ context.Context, name string, args ...string) error {
+		// Detect the sentinel-clearing C-c after readiness.
+		for _, a := range args {
+			if a == "C-c" {
+				sawClear = true
+			}
+		}
+		return nil
+	}
+	runExternalCommandOutput = func(_ context.Context, _ string, _ ...string) (string, error) {
+		captures++
+		// Not ready for the first two probes, then the sentinel echoes.
+		if captures < 3 {
+			return "booting...", nil
+		}
+		return "some pane __cc_ready_probe__ here", nil
+	}
+
+	waitSessionReady(context.Background(), "cc-x")
+	if captures < 3 {
+		t.Fatalf("expected at least 3 capture probes, got %d", captures)
+	}
+	if !sawClear {
+		t.Fatal("expected a C-c to clear the sentinel once ready")
+	}
+}
+
+func TestWaitSessionReadySkippedWhenDelayZero(t *testing.T) {
+	oldOut := runExternalCommandOutput
+	oldDelay := sessionBootDelay
+	defer func() {
+		runExternalCommandOutput = oldOut
+		sessionBootDelay = oldDelay
+	}()
+	sessionBootDelay = 0
+	called := false
+	runExternalCommandOutput = func(_ context.Context, _ string, _ ...string) (string, error) {
+		called = true
+		return "", nil
+	}
+	waitSessionReady(context.Background(), "cc-x")
+	if called {
+		t.Fatal("waitSessionReady must not probe when sessionBootDelay <= 0")
 	}
 }
