@@ -41,21 +41,32 @@ func (i TmuxInjector) Inject(ctx context.Context, job InputJob, outputPath strin
 	// input prematurely and fragment the prompt. A single line submits cleanly.
 	prompt := collapseWhitespace(BuildClaudePrompt(i.Root, job, outputPath))
 
-	// Clear any leftover text in the input box before typing. A single Ctrl-C in
-	// the Claude TUI clears the current input line (two in quick succession would
-	// quit, but one is safe). Without this, a partially-typed prompt left from a
-	// prior injection is concatenated with this one and the combined garbage
-	// fails to produce a valid response. (C-u and Escape do NOT clear the box.)
+	// The Enter occasionally fails to submit (drops), leaving the prompt sitting
+	// in the input box and never processed. So submit, then VERIFY the input box
+	// is empty; if not, re-run the full recipe. Retry a few times.
+	var lastErr error
+	for attempt := 0; attempt < injectMaxAttempts; attempt++ {
+		if err := i.typeAndSubmit(ctx, prompt); err != nil {
+			lastErr = err
+			continue
+		}
+		time.Sleep(injectVerifyDelay)
+		pane, err := runExternalCommandOutput(ctx, "tmux", "capture-pane", "-pt", i.Session)
+		if err != nil || !inputBoxHasText(pane) {
+			return nil // can't verify, or input box is empty → submitted
+		}
+		lastErr = fmt.Errorf("inject: prompt still in input box after attempt %d", attempt+1)
+	}
+	return lastErr
+}
+
+// typeAndSubmit runs the one recipe observed to reliably submit in the Claude
+// TUI: Ctrl-C to clear the box, the prompt as a literal paste, a pause for the
+// long paste to settle, then a SEPARATE Enter.
+func (i TmuxInjector) typeAndSubmit(ctx context.Context, prompt string) error {
 	if err := runExternalCommand(ctx, "tmux", "send-keys", "-t", i.Session, "C-c"); err != nil {
 		return err
 	}
-	// Send the prompt literally (-l) so it is inserted as text rather than
-	// interpreted as key names. Then submit with a SEPARATE Enter after a delay
-	// long enough for the TUI to finish inserting a long prompt before it is
-	// submitted. This two-step recipe (literal text, pause, Enter) is the only
-	// one observed to reliably land and submit a multi-hundred-character prompt
-	// in the Claude TUI; sending the Enter in the same call, or with too short a
-	// delay, drops the input.
 	if err := runExternalCommand(ctx, "tmux", "send-keys", "-t", i.Session, "-l", prompt); err != nil {
 		return err
 	}
@@ -63,9 +74,28 @@ func (i TmuxInjector) Inject(ctx context.Context, job InputJob, outputPath strin
 	return runExternalCommand(ctx, "tmux", "send-keys", "-t", i.Session, "Enter")
 }
 
+// inputBoxHasText reports whether the Claude TUI's input box (the bottom-most
+// "❯" line) still holds unsent text. The echoed sent message also starts with
+// "❯" but appears above; only the LAST such line is the live input box.
+func inputBoxHasText(pane string) bool {
+	lines := strings.Split(pane, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		l := strings.TrimLeft(lines[i], " \t")
+		if strings.HasPrefix(l, "❯") {
+			return strings.TrimSpace(strings.TrimPrefix(l, "❯")) != ""
+		}
+	}
+	return false // no prompt line seen → don't loop
+}
+
 // injectSubmitDelay is the pause between inserting the prompt text and pressing
-// Enter, giving the TUI time to finish accepting a long literal paste.
-var injectSubmitDelay = 800 * time.Millisecond
+// Enter; injectVerifyDelay is the settle before checking the box; injectMaxAttempts
+// bounds the resubmit retries.
+var (
+	injectSubmitDelay = 1200 * time.Millisecond
+	injectVerifyDelay = 1200 * time.Millisecond
+	injectMaxAttempts = 3
+)
 
 // collapseWhitespace replaces all runs of whitespace (including newlines) with a
 // single space and trims the result, producing a single-line string.
