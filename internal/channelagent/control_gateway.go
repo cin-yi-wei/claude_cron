@@ -53,3 +53,29 @@ func (s *ControlGatewaySource) Fetch(ctx context.Context) ([]SourceMessage, erro
 func (s *ControlGatewaySource) gatewayIngester(token, channelID, baseURL string) DiscordGatewayIngester {
 	return DiscordGatewayIngester{Token: token, ChannelID: channelID, Sink: s.push}
 }
+
+// BufferPollSource is the control source used when the shared Discord Gateway
+// demux feeds the control channel (phase C): the demux writes the control
+// channel's messages to a file buffer, and Fetch returns that buffer PLUS a poll
+// backstop. Same lifeline guarantee as ControlGatewaySource — if the demux misses
+// or its connection drops, the always-run poll still delivers; control_seen dedups
+// any overlap — but with no separate per-control Gateway connection.
+type BufferPollSource struct {
+	BufferPath string
+	Poll       MessageSource // backstop, always run (nil = buffer only)
+}
+
+func (s BufferPollSource) Fetch(ctx context.Context) ([]SourceMessage, error) {
+	buffered, _ := TelegramBufferSource{Path: s.BufferPath}.Fetch(ctx) // read + clear
+	if s.Poll == nil {
+		return buffered, nil
+	}
+	polled, err := s.Poll.Fetch(ctx)
+	if err != nil {
+		if len(buffered) > 0 {
+			return buffered, nil // poll hiccup, buffered still good
+		}
+		return nil, err
+	}
+	return append(buffered, polled...), nil
+}

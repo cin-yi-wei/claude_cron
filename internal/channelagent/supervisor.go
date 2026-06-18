@@ -91,15 +91,15 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 	}
 
 	// Single shared Discord Gateway demux (opt-in): one websocket for the whole
-	// bot, routing each MESSAGE_CREATE to the matching WORKER binding's inbox
-	// (resolved fresh per message so new/removed/paused bindings are honoured).
-	// The control channel keeps its own path (handled below). Replaces per-binding
-	// poll/Gateway for Discord workers.
+	// bot, routing each MESSAGE_CREATE by channel id — to the matching WORKER
+	// binding's inbox, or (phase C) to a control plane's buffer. Resolved fresh per
+	// message so new/removed/paused bindings are honoured. Replaces per-binding
+	// poll/Gateway for workers AND the separate per-control Gateway.
 	if cfg.Discord.GatewayDemux && token != "" && push != nil {
 		dcRoute := func(ctx context.Context, msg SourceMessage) error {
 			reg2, err := LoadRegistry(root)
 			if err != nil {
-				return nil // transient; Discord will not redeliver, but next msg retries routing
+				return nil // transient; next msg retries routing
 			}
 			for _, b := range reg2.Bindings {
 				if b.PlatformOf() == PlatformDiscord && !b.Paused && b.ChannelID == msg.ChannelID {
@@ -107,7 +107,13 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 					return e
 				}
 			}
-			return nil // control channel or unknown → not a worker; dropped here
+			// Control plane channel → its buffer (drained by BufferPollSource).
+			for _, plane := range cfg.ControlPlanes() {
+				if plane.Platform == PlatformDiscord && plane.ChannelID == msg.ChannelID {
+					return appendTelegramBuffer(controlBufferPath(root, plane.Name), msg)
+				}
+			}
+			return nil // unknown channel → dropped
 		}
 		push.Ensure("__dc_demux__", DiscordGatewayIngester{Token: token, Route: dcRoute}, func(e error) {
 			if e != nil {
@@ -119,7 +125,12 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 
 	controlPoll := DiscordSource{BaseURL: cfg.Discord.BaseURL, Token: token, ChannelID: cfg.Discord.ChannelID, Limit: 50}
 	var controlSource MessageSource = controlPoll
-	if cfg.Control.Mode == ModePush && push != nil {
+	if cfg.Discord.GatewayDemux {
+		// Phase C: control is fed by the shared demux buffer + poll backstop; no
+		// separate __control_gw__ connection. The always-run poll keeps the lifeline
+		// safe if the demux drops.
+		controlSource = BufferPollSource{BufferPath: controlBufferPath(root, PlatformDiscord), Poll: controlPoll}
+	} else if cfg.Control.Mode == ModePush && push != nil {
 		// Gateway-fed control with poll always-on as backstop (lifeline channel).
 		cs := push.ControlSource(controlPoll)
 		push.Ensure("__control_gw__", cs.gatewayIngester(token, cfg.Discord.ChannelID, cfg.Discord.BaseURL), func(e error) {
