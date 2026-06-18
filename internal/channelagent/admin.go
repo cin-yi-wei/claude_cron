@@ -244,6 +244,7 @@ type adminBindRequest struct {
 	Platform   string `json:"platform"`
 	Mode       string `json:"mode"`
 	ChatID     string `json:"chat_id"`
+	Control    bool   `json:"control"`
 }
 
 func (h AdminHandler) createBinding(w http.ResponseWriter, r *http.Request) {
@@ -257,9 +258,15 @@ func (h AdminHandler) createBinding(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cmd := Command{
-		Name: "bind",
-		Args: []string{req.Name, req.ProjectDir, req.Branch},
-		Opts: map[string]string{},
+		Name:  "bind",
+		Args:  []string{req.Name, req.ProjectDir, req.Branch},
+		Flags: map[string]bool{},
+		Opts:  map[string]string{},
+	}
+	if req.Control {
+		// Control bindings take only a name (no dir/branch); bind reads Args[0].
+		cmd.Args = []string{req.Name}
+		cmd.Flags["control"] = true
 	}
 	if req.Platform != "" {
 		cmd.Opts["platform"] = req.Platform
@@ -372,6 +379,13 @@ func (h AdminHandler) restartBinding(w http.ResponseWriter, r *http.Request, nam
 	}
 	ctx := context.Background()
 	_ = h.Deps.StopSession(ctx, b.TmuxSession)
+	// Control bindings must be recreated with their control system prompt, which
+	// only the supervisor's StartControlSession knows. Just stop here and let the
+	// next cycle recreate it correctly (worker-style StartSession would lose it).
+	if b.Control {
+		writeJSONResponse(w, map[string]string{"result": "restarting " + name + " (next cycle)"})
+		return
+	}
 	if err := h.Deps.StartSession(ctx, b.TmuxSession, b.Worktree); err != nil {
 		writeJSONStatus(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 		return
