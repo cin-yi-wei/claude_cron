@@ -66,13 +66,17 @@ func (h AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(adminIndexHTML))
 		return
 	}
+	// Health check is unauthenticated (monitoring/uptime probes can't carry the
+	// bearer token); it exposes no data. Both /healthz and /api/healthz work.
+	if path == "/healthz" || path == "/api/healthz" {
+		writeJSONResponse(w, map[string]string{"status": "ok"})
+		return
+	}
 	if !h.authorized(r) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 	switch {
-	case path == "/api/healthz":
-		writeJSONResponse(w, map[string]string{"status": "ok"})
 	case path == "/api/bindings":
 		switch r.Method {
 		case http.MethodGet:
