@@ -55,6 +55,10 @@ type AdminHandler struct {
 	SessionAlive func(session string) bool
 	Deps         *ControlDeps
 	GuildID      string
+	// RestartServe, when set, is called after a config change to apply it (config
+	// is read at serve startup). In production it triggers `systemctl --user
+	// restart` asynchronously; nil = no auto-restart (a manual restart is needed).
+	RestartServe func()
 }
 
 func (h AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -82,6 +86,15 @@ func (h AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch {
+	case path == "/api/config":
+		switch r.Method {
+		case http.MethodGet:
+			h.getConfig(w)
+		case http.MethodPut:
+			h.putConfig(w, r)
+		default:
+			methodNotAllowed(w)
+		}
 	case path == "/api/bindings":
 		switch r.Method {
 		case http.MethodGet:
@@ -365,7 +378,7 @@ func subtleEqual(a, b string) bool {
 
 // RunAdminServer serves the admin API on addr until ctx is cancelled. token,
 // when empty, is allowed only for loopback addresses. deps enables writes.
-func RunAdminServer(ctx context.Context, root, addr, token string, deps *ControlDeps, guildID string) error {
+func RunAdminServer(ctx context.Context, root, addr, token string, deps *ControlDeps, guildID string, restartServe func()) error {
 	if token == "" && !isLoopbackAddr(addr) {
 		return fmt.Errorf("admin: refusing to listen on non-loopback %q without a token", addr)
 	}
@@ -375,8 +388,9 @@ func RunAdminServer(ctx context.Context, root, addr, token string, deps *Control
 		SessionAlive: func(session string) bool {
 			return runExternalCommand(ctx, "tmux", "has-session", "-t", session) == nil
 		},
-		Deps:    deps,
-		GuildID: guildID,
+		Deps:         deps,
+		GuildID:      guildID,
+		RestartServe: restartServe,
 	}
 	srv := &http.Server{Addr: addr, Handler: h}
 	errc := make(chan error, 1)

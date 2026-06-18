@@ -34,6 +34,20 @@ const adminIndexHTML = `<!doctype html>
   <th>name</th><th>platform/mode</th><th>channel</th><th>branch</th><th>session</th><th>queue</th><th></th>
 </tr></thead><tbody></tbody></table>
 
+<h2 style="font-size:1rem">Settings</h2>
+<div id="settings">
+  discord transport:
+  <select id="s_dc"><option value="gateway">gateway</option><option value="poll">poll</option></select>
+  &nbsp; telegram transport:
+  <select id="s_tg"><option value="webhook">webhook</option><option value="poll">poll</option></select><br>
+  push listen: <input id="s_listen" size="18">
+  public_url: <input id="s_url" size="28">
+  secret: <input id="s_secret" type="password" size="18" placeholder="(unchanged)">
+  tg control chat-id: <input id="s_chat" size="14"><br>
+  <button onclick="saveSettings()">Save &amp; Restart serve</button>
+  <span id="s_msg"></span>
+</div>
+
 <h2 style="font-size:1rem">Create binding</h2>
 <div>
   <input id="c_name" placeholder="name">
@@ -111,7 +125,38 @@ async function act(name, action) {
     setMsg(j.result || (action + ' ok'), true); refresh();
   } catch (e) { setErr(String(e)); }
 }
+async function loadSettings() {
+  try {
+    var c = await (await fetch('/api/config', { headers: hdr() })).json();
+    document.getElementById('s_dc').value = c.discord_transport;
+    document.getElementById('s_tg').value = c.telegram_transport;
+    document.getElementById('s_listen').value = c.push_listen || '';
+    document.getElementById('s_url').value = c.push_public_url || '';
+    document.getElementById('s_secret').placeholder = c.push_secret_set ? '(set — blank=keep)' : '(none)';
+    document.getElementById('s_chat').value = c.telegram_chat_id || '';
+  } catch (e) { /* settings optional; ignore */ }
+}
+async function saveSettings() {
+  setErr('');
+  var body = {
+    discord_transport: document.getElementById('s_dc').value,
+    telegram_transport: document.getElementById('s_tg').value,
+    push_listen: document.getElementById('s_listen').value,
+    push_public_url: document.getElementById('s_url').value,
+    telegram_chat_id: document.getElementById('s_chat').value
+  };
+  var sec = document.getElementById('s_secret').value;
+  if (sec) body.push_secret = sec;
+  if (!confirm('Save settings and restart serve?')) return;
+  try {
+    var r = await fetch('/api/config', { method: 'PUT', headers: Object.assign({'Content-Type':'application/json'}, hdr()), body: JSON.stringify(body) });
+    var j = await r.json();
+    if (!r.ok) throw new Error(j.error || ('status ' + r.status));
+    setMsg(j.restarting ? 'saved — restarting serve…' : 'saved (restart manually)', true);
+  } catch (e) { setErr(String(e)); }
+}
 refresh();
+loadSettings();
 </script>
 </body>
 </html>`
