@@ -3,6 +3,7 @@ package channelagent
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"testing"
 )
 
@@ -70,3 +71,45 @@ func TestControlGatewayIngesterWiring(t *testing.T) {
 		t.Fatalf("sink did not buffer: %#v", got)
 	}
 }
+
+func TestBufferPollSourceMergesBufferAndPoll(t *testing.T) {
+	dir := t.TempDir()
+	buf := filepath.Join(dir, "inbound_buffer.json")
+	if err := appendTelegramBuffer(buf, SourceMessage{ChannelID: "c", MessageID: "1", Content: "from-demux"}); err != nil {
+		t.Fatal(err)
+	}
+	s := BufferPollSource{BufferPath: buf, Poll: stubFetchSource{msgs: []SourceMessage{{ChannelID: "c", MessageID: "2", Content: "from-poll"}}}}
+	got, err := s.Fetch(context.Background())
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if len(got) != 2 || got[0].Content != "from-demux" || got[1].Content != "from-poll" {
+		t.Fatalf("merge = %#v", got)
+	}
+	// Buffer cleared after fetch.
+	got2, _ := s.Fetch(context.Background())
+	if len(got2) != 1 || got2[0].Content != "from-poll" {
+		t.Fatalf("after clear = %#v", got2)
+	}
+}
+
+func TestBufferPollSourceFallsBackOnPollError(t *testing.T) {
+	dir := t.TempDir()
+	buf := filepath.Join(dir, "inbound_buffer.json")
+	_ = appendTelegramBuffer(buf, SourceMessage{ChannelID: "c", MessageID: "1", Content: "buffered"})
+	s := BufferPollSource{BufferPath: buf, Poll: stubFetchSource{err: context.DeadlineExceeded}}
+	got, err := s.Fetch(context.Background())
+	if err != nil {
+		t.Fatalf("should not error when buffer has messages: %v", err)
+	}
+	if len(got) != 1 || got[0].Content != "buffered" {
+		t.Fatalf("fallback = %#v", got)
+	}
+}
+
+type stubFetchSource struct {
+	msgs []SourceMessage
+	err  error
+}
+
+func (s stubFetchSource) Fetch(context.Context) ([]SourceMessage, error) { return s.msgs, s.err }
