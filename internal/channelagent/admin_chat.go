@@ -33,8 +33,10 @@ func (h AdminHandler) chatAuthorized(r *http.Request) bool {
 	return subtleEqual(r.URL.Query().Get("token"), h.Token)
 }
 
-// webBinding loads the named binding and verifies it is a web-platform binding.
-func (h AdminHandler) webBinding(name string) (Binding, bool) {
+// chatBinding loads the named binding. Any platform is chattable from the
+// browser: replies are teed to the ChatHub by the sender (see TeeSender), and a
+// browser message is injected into the binding's inbox like any other arrival.
+func (h AdminHandler) chatBinding(name string) (Binding, bool) {
 	if !validBindingName(name) {
 		return Binding{}, false
 	}
@@ -42,15 +44,11 @@ func (h AdminHandler) webBinding(name string) (Binding, bool) {
 	if err != nil {
 		return Binding{}, false
 	}
-	b, ok := reg.Get(name)
-	if !ok || b.PlatformOf() != PlatformWeb {
-		return Binding{}, false
-	}
-	return b, true
+	return reg.Get(name)
 }
 
 func (h AdminHandler) streamChat(w http.ResponseWriter, r *http.Request, name string) {
-	if _, ok := h.webBinding(name); !ok {
+	if _, ok := h.chatBinding(name); !ok {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
@@ -99,7 +97,7 @@ type chatSendRequest struct {
 }
 
 func (h AdminHandler) sendChat(w http.ResponseWriter, r *http.Request, name string) {
-	b, ok := h.webBinding(name)
+	b, ok := h.chatBinding(name)
 	if !ok {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
@@ -142,7 +140,7 @@ func newWebMessageID() string {
 // (outbox/sent, plus outbox/pending). Ordered by file mtime — a user message is
 // moved to done right before its reply is written, so the order comes out right.
 func (h AdminHandler) historyChat(w http.ResponseWriter, name string) {
-	b, ok := h.webBinding(name)
+	b, ok := h.chatBinding(name)
 	if !ok {
 		http.Error(w, "not found", http.StatusNotFound)
 		return

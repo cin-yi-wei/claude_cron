@@ -87,20 +87,57 @@ func TestChatSendIngestsAndEchoes(t *testing.T) {
 	}
 }
 
-func TestChatSendRejectsNonWebBinding(t *testing.T) {
+func TestChatSendAnyBinding(t *testing.T) {
+	// Any platform is chattable from the browser (replies are teed to the hub).
 	root := t.TempDir()
 	if err := Init(root); err != nil {
 		t.Fatal(err)
 	}
-	seedBinding(t, root, Binding{Name: "dcx", ChannelID: "c1", TmuxSession: "cc-dcx"}) // discord default
+	bRoot := pathIn(root, "bindings", "dcx")
+	if err := Init(bRoot); err != nil {
+		t.Fatal(err)
+	}
+	seedBinding(t, root, Binding{Name: "dcx", ChannelID: "c1", TmuxSession: "cc-dcx", Root: bRoot}) // discord default
 	h := AdminHandler{Root: root}
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/api/chat/dcx/send", strings.NewReader(`{"text":"x"}`))
 	h.ServeHTTP(rec, req)
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("non-web send status = %d, want 404", rec.Code)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("discord send status = %d, want 200 (any binding chattable)", rec.Code)
+	}
+	if n := countJSON(pathIn(bRoot, "inbox", "pending")); n != 1 {
+		t.Fatalf("inbox pending = %d, want 1", n)
+	}
+	// A truly missing binding still 404s.
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, httptest.NewRequest(http.MethodPost, "/api/chat/ghost/send", strings.NewReader(`{"text":"x"}`)))
+	if rec2.Code != http.StatusNotFound {
+		t.Fatalf("missing binding send status = %d, want 404", rec2.Code)
 	}
 }
+
+func TestTeeSenderPublishes(t *testing.T) {
+	hub := NewChatHub()
+	ch, unsub := hub.Subscribe("dcx")
+	defer unsub()
+	var got OutputJob
+	inner := senderFunc(func(_ context.Context, o OutputJob) error { got = o; return nil })
+	tee := TeeSender{Inner: inner, Hub: hub, Key: "dcx"}
+	if err := tee.Send(context.Background(), OutputJob{Text: "hi", Send: true}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if got.Text != "hi" {
+		t.Fatalf("inner not called: %#v", got)
+	}
+	if ev := <-ch; ev.Role != "assistant" || ev.Text != "hi" {
+		t.Fatalf("hub event = %#v", ev)
+	}
+}
+
+// senderFunc adapts a func to the Sender interface for tests.
+type senderFunc func(context.Context, OutputJob) error
+
+func (f senderFunc) Send(ctx context.Context, o OutputJob) error { return f(ctx, o) }
 
 func TestChatHistoryReplaysThread(t *testing.T) {
 	root := t.TempDir()

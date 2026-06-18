@@ -220,6 +220,11 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 			fmt.Fprintf(stdout, "binding %s sender error: %v\n", b.Name, err)
 			continue
 		}
+		// Tee non-web replies to the ChatHub so any active binding is observable
+		// from a browser chat window. Web bindings already publish via WebSender.
+		if b.PlatformOf() != PlatformWeb {
+			sender = TeeSender{Inner: sender, Hub: DefaultChatHub, Key: b.Name}
+		}
 
 		// Pick the per-cycle ingester. Poll bindings ingest each cycle; push
 		// bindings ingest out-of-band via a persistent ingester (started once,

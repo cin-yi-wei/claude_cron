@@ -2,6 +2,7 @@ package channelagent
 
 import (
 	"context"
+	"strings"
 	"sync"
 )
 
@@ -95,4 +96,22 @@ func (s WebSender) Send(ctx context.Context, out OutputJob) error {
 		s.Hub.Publish(s.Key, ChatEvent{Role: "assistant", Text: out.Text})
 	}
 	return nil
+}
+
+// TeeSender wraps a real Sender (Discord/Telegram) and, on a successful send,
+// also publishes the reply to the ChatHub. This makes ANY binding observable
+// from a browser chat window — the reply still goes to its real channel, and a
+// copy streams to subscribers keyed by binding name.
+type TeeSender struct {
+	Inner Sender
+	Hub   *ChatHub
+	Key   string
+}
+
+func (t TeeSender) Send(ctx context.Context, out OutputJob) error {
+	err := t.Inner.Send(ctx, out)
+	if err == nil && t.Hub != nil && out.Send && strings.TrimSpace(out.Text) != "" {
+		t.Hub.Publish(t.Key, ChatEvent{Role: "assistant", Text: out.Text})
+	}
+	return err
 }

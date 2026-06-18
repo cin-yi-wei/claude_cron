@@ -4,10 +4,18 @@
   let bindings = $state([]);
   let err = $state('');
   let loading = $state(false);
-  let webBindings = $derived(bindings.filter((b) => b.platform === 'web'));
+  let open = $state([]); // names of bindings whose chat window is open
 
   function hdr() {
     return token ? { Authorization: 'Bearer ' + token } : {};
+  }
+
+  function active(b) {
+    return !b.paused && b._alive;
+  }
+
+  function toggleChat(name) {
+    open = open.includes(name) ? open.filter((n) => n !== name) : [...open, name];
   }
 
   async function refresh() {
@@ -25,6 +33,9 @@
         } catch { b._q = '?'; }
       }
       bindings = rows;
+      // Drop chats for bindings that vanished.
+      const names = new Set(rows.map((b) => b.name));
+      open = open.filter((n) => names.has(n));
     } catch (e) { err = String(e); }
     loading = false;
   }
@@ -50,7 +61,7 @@
     <header><strong>Bindings</strong> ({bindings.length})</header>
     <div style="overflow-x:auto">
       <table>
-        <thead><tr><th>name</th><th>transport</th><th>plane</th><th>session</th><th>queue</th></tr></thead>
+        <thead><tr><th>name</th><th>transport</th><th>plane</th><th>session</th><th>queue</th><th></th></tr></thead>
         <tbody>
           {#each bindings as b}
             <tr>
@@ -59,31 +70,39 @@
               <td>{b.plane}</td>
               <td>{#if b.paused}<span class="muted">⏸ paused</span>{:else}{b.tmux_session} {b._alive ? '🟢' : '🔴'}{/if}</td>
               <td>{b._q || ''}</td>
+              <td>
+                {#if active(b)}
+                  <button class="chat-btn {open.includes(b.name) ? '' : 'outline'}" onclick={() => toggleChat(b.name)}>
+                    💬 {open.includes(b.name) ? '關閉' : '聊天'}
+                  </button>
+                {:else}
+                  <span class="muted" title="session 未啟動">—</span>
+                {/if}
+              </td>
             </tr>
           {/each}
           {#if bindings.length === 0}
-            <tr><td colspan="5"><em>none (check token)</em></td></tr>
+            <tr><td colspan="6"><em>none (check token)</em></td></tr>
           {/if}
         </tbody>
       </table>
     </div>
   </article>
 
-  <section class="chats">
-    <h2>Chat <small>(platform=web bindings)</small></h2>
-    {#each webBindings as b (b.name)}
-      <Chat name={b.name} {token} />
-    {/each}
-    {#if webBindings.length === 0}
-      <p class="muted"><em>沒有 web binding。建一個：<code>/bind &lt;name&gt; &lt;dir&gt; &lt;branch&gt; --platform web</code>，重整後這裡會出現聊天窗。</em></p>
-    {/if}
-  </section>
+  {#if open.length > 0}
+    <section class="chats">
+      {#each open as name (name)}
+        <Chat {name} {token} />
+      {/each}
+    </section>
+  {/if}
 
-  <p><small>settings / create 仍在舊版 / (Pico)，之後搬過來</small></p>
+  <p><small>active session 按「聊天」開窗。settings / create 仍在舊版 / (Pico)，之後搬過來。</small></p>
 </main>
 
 <style>
   .badge { font-size: .72rem; padding: .1rem .5rem; border-radius: 1rem; background: var(--pico-secondary-background); color: var(--pico-secondary-inverse); }
   .muted { color: var(--pico-muted-color); }
   table { font-size: .85rem; }
+  .chat-btn { width: auto; padding: .15rem .55rem; font-size: .75rem; margin: 0; }
 </style>
