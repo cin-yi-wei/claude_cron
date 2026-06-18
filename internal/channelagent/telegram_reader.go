@@ -111,14 +111,16 @@ func (r TelegramReader) Drain(ctx context.Context, routes map[string]func(contex
 	return nil
 }
 
-// telegramRoutes builds the chat-id → delivery map shared by the poll reader and
-// the webhook demux handler: every Telegram binding's chat delivers to that
-// binding's inbox, and every Telegram control plane's chat delivers to that
-// plane's buffer. Same routing whether updates arrive by getUpdates or webhook.
-func telegramRoutes(root string, cfg Config, reg Registry) map[string]func(context.Context, SourceMessage) error {
+// inboundRoutes builds the channel/chat-id → delivery map for ONE platform's
+// single-connection ingest: every binding of that platform delivers to its own
+// inbox, every control plane of that platform delivers to its buffer. This is the
+// shared router both transports feed — the Telegram reader/webhook today, and
+// (Phase B) a single Discord Gateway demux — so the routing logic is identical
+// across platforms; only the connect+decode layer differs per platform.
+func inboundRoutes(root string, cfg Config, reg Registry, platform string) map[string]func(context.Context, SourceMessage) error {
 	routes := map[string]func(context.Context, SourceMessage) error{}
 	for _, b := range reg.Bindings {
-		if b.PlatformOf() != PlatformTelegram {
+		if b.PlatformOf() != platform {
 			continue
 		}
 		broot := b.Root
@@ -128,15 +130,32 @@ func telegramRoutes(root string, cfg Config, reg Registry) map[string]func(conte
 		}
 	}
 	for _, plane := range cfg.ControlPlanes() {
-		if plane.Platform != PlatformTelegram || plane.ChannelID == "" {
+		if plane.Platform != platform || plane.ChannelID == "" {
 			continue
 		}
-		buf := pathIn(ControlBindingFor(root, plane.Name).Root, "state", "tg_buffer.json")
+		buf := controlBufferPath(root, plane.Name)
 		routes[plane.ChannelID] = func(_ context.Context, msg SourceMessage) error {
 			return appendTelegramBuffer(buf, msg)
 		}
 	}
 	return routes
+}
+
+// controlBufferPath is where a control plane's inbound messages are buffered by
+// the shared router for the plane's BufferSource to drain. The telegram plane
+// keeps its existing filename (tg_buffer.json) for back-compat.
+func controlBufferPath(root, planeName string) string {
+	name := "inbound_buffer.json"
+	if planeName == PlatformTelegram {
+		name = "tg_buffer.json"
+	}
+	return pathIn(ControlBindingFor(root, planeName).Root, "state", name)
+}
+
+// telegramRoutes is the Telegram-specific view of inboundRoutes, used by the poll
+// reader and the webhook demux handler.
+func telegramRoutes(root string, cfg Config, reg Registry) map[string]func(context.Context, SourceMessage) error {
+	return inboundRoutes(root, cfg, reg, PlatformTelegram)
 }
 
 // TelegramDemuxHandler is the webhook counterpart to TelegramReader: Telegram
