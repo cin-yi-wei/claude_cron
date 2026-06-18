@@ -61,7 +61,7 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 	// inboxes/buffers are filled. Replaces per-consumer getUpdates (which 409'd and
 	// re-fetched the 24h backlog). Push (webhook) bindings are fed separately.
 	tgToken := os.Getenv(cfg.Telegram.TokenEnv)
-	if tgToken != "" && !cfg.Telegram.Webhook {
+	if tgToken != "" && cfg.TelegramTransport() != TransportWebhook {
 		// Poll mode: single getUpdates reader, route by chat id. (Webhook mode feeds
 		// the same routes via the demux handler below instead — they're exclusive.)
 		routes := telegramRoutes(root, cfg, reg)
@@ -72,7 +72,7 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 			}
 		}
 	}
-	if tgToken != "" && cfg.Telegram.Webhook && push != nil {
+	if tgToken != "" && cfg.TelegramTransport() == TransportWebhook && push != nil {
 		// Webhook mode: one shared demux endpoint for the whole bot, routing by chat
 		// id (reloads the registry per request). setWebhook runs once on first mount.
 		h := TelegramDemuxHandler{Root: root, Cfg: cfg, Secret: cfg.Push.Secret}
@@ -95,7 +95,7 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 	// binding's inbox, or (phase C) to a control plane's buffer. Resolved fresh per
 	// message so new/removed/paused bindings are honoured. Replaces per-binding
 	// poll/Gateway for workers AND the separate per-control Gateway.
-	if cfg.Discord.GatewayDemux && token != "" && push != nil {
+	if cfg.DiscordTransport() == TransportGateway && token != "" && push != nil {
 		dcRoute := func(ctx context.Context, msg SourceMessage) error {
 			reg2, err := LoadRegistry(root)
 			if err != nil {
@@ -125,7 +125,7 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 
 	controlPoll := DiscordSource{BaseURL: cfg.Discord.BaseURL, Token: token, ChannelID: cfg.Discord.ChannelID, Limit: 50}
 	var controlSource MessageSource = controlPoll
-	if cfg.Discord.GatewayDemux {
+	if cfg.DiscordTransport() == TransportGateway {
 		// Phase C: control is fed by the shared demux buffer + poll backstop; no
 		// separate __control_gw__ connection. The always-run poll keeps the lifeline
 		// safe if the demux drops.
@@ -225,7 +225,7 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 		// bindings ingest out-of-band via a persistent ingester (started once,
 		// kept alive by the PushManager) and only drain here.
 		var ingester Ingester
-		if cfg.Discord.GatewayDemux && b.PlatformOf() == PlatformDiscord {
+		if cfg.DiscordTransport() == TransportGateway && b.PlatformOf() == PlatformDiscord {
 			// Fed by the single shared Discord Gateway demux (started below); just
 			// drain the inbox here. No per-binding poll or Gateway connection.
 			ingester = noopIngester{}

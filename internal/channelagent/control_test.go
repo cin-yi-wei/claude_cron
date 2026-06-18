@@ -495,20 +495,31 @@ func TestConfigControlPlanes(t *testing.T) {
 
 func TestConfigTransport(t *testing.T) {
 	var c Config
-	// demux off → falls back to the legacy per-binding mode.
-	if got := c.Transport(Binding{Platform: PlatformDiscord, Mode: ModePush}); got != "push" {
-		t.Fatalf("discord demux-off = %q, want push", got)
+	// Transport is per-platform now (not per-binding mode). Discord defaults to
+	// gateway; telegram defaults to poll.
+	if got := c.Transport(Binding{Platform: PlatformDiscord}); got != TransportGateway {
+		t.Fatalf("discord default = %q, want gateway", got)
 	}
-	if got := c.Transport(Binding{Platform: PlatformDiscord}); got != "poll" {
-		t.Fatalf("discord default = %q, want poll", got)
+	if got := c.Transport(Binding{Platform: PlatformTelegram}); got != TransportPoll {
+		t.Fatalf("telegram default = %q, want poll", got)
 	}
-	// demux on → real transport regardless of stored mode.
-	c.Discord.GatewayDemux = true
-	if got := c.Transport(Binding{Platform: PlatformDiscord, Mode: ModePoll}); got != "gateway" {
-		t.Fatalf("discord demux-on = %q, want gateway", got)
+	// Explicit enum wins.
+	c.Discord.Transport = TransportPoll
+	if got := c.Transport(Binding{Platform: PlatformDiscord}); got != TransportPoll {
+		t.Fatalf("discord transport=poll = %q", got)
 	}
-	c.Telegram.Webhook = true
-	if got := c.Transport(Binding{Platform: PlatformTelegram, Mode: ModePoll}); got != "webhook" {
-		t.Fatalf("telegram webhook = %q, want webhook", got)
+	c.Telegram.Transport = TransportWebhook
+	if got := c.Transport(Binding{Platform: PlatformTelegram}); got != TransportWebhook {
+		t.Fatalf("telegram transport=webhook = %q", got)
+	}
+	// Legacy boolean still honoured as fallback when enum empty.
+	var c2 Config
+	c2.Discord.GatewayDemux = true
+	if got := c2.DiscordTransport(); got != TransportGateway {
+		t.Fatalf("legacy gateway_demux fallback = %q", got)
+	}
+	c2.Telegram.Webhook = true
+	if got := c2.TelegramTransport(); got != TransportWebhook {
+		t.Fatalf("legacy webhook fallback = %q", got)
 	}
 }

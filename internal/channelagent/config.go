@@ -47,15 +47,11 @@ type ControlPlane struct {
 func (c Config) Transport(b Binding) string {
 	switch b.PlatformOf() {
 	case PlatformDiscord:
-		if c.Discord.GatewayDemux {
-			return "gateway"
-		}
+		return c.DiscordTransport()
 	case PlatformTelegram:
-		if c.Telegram.Webhook {
-			return "webhook"
-		}
+		return c.TelegramTransport()
 	}
-	return b.ModeOf() // poll/push — only meaningful when demux is off
+	return b.ModeOf()
 }
 
 // ControlPlanes returns the configured control entrances: always the Discord
@@ -99,23 +95,55 @@ type DiscordConfig struct {
 	ChannelID string `json:"channel_id"`
 	GuildID   string `json:"guild_id,omitempty"`
 	BaseURL   string `json:"base_url,omitempty"`
-	// GatewayDemux opts into a single shared Gateway connection for all Discord
-	// WORKER bindings: one websocket receives the whole bot's MESSAGE_CREATE and
-	// routes by channel id, replacing per-binding poll/Gateway (no IDENTIFY
-	// contention, no per-binding op9 churn). The control channel keeps its own
-	// path. Off by default.
+	// Transport selects how the whole bot ingests: "gateway" (single shared
+	// Gateway websocket, demuxed by channel id) or "poll" (per-binding REST poll).
+	// This is the authoritative knob; GatewayDemux is the legacy boolean kept only
+	// as a fallback for old configs (see DiscordTransport).
+	Transport string `json:"transport,omitempty"`
+	// Deprecated: use Transport. Read only as a fallback when Transport is empty.
 	GatewayDemux bool `json:"gateway_demux,omitempty"`
+}
+
+const (
+	TransportGateway = "gateway"
+	TransportWebhook = "webhook"
+	TransportPoll    = "poll"
+)
+
+// DiscordTransport resolves the Discord ingestion transport: the explicit
+// Transport enum if set, else the legacy GatewayDemux boolean, else "gateway"
+// (the demux model is the default).
+func (c Config) DiscordTransport() string {
+	if c.Discord.Transport != "" {
+		return c.Discord.Transport
+	}
+	if c.Discord.GatewayDemux {
+		return TransportGateway
+	}
+	return TransportGateway
 }
 
 type TelegramConfig struct {
 	TokenEnv string `json:"token_env"`
 	ChatID   string `json:"chat_id"`
 	BaseURL  string `json:"base_url,omitempty"`
-	// Webhook switches the whole bot to webhook mode: Telegram POSTs every update
-	// to one demux endpoint (Push.PublicURL + "/tg") instead of getUpdates. webhook
-	// and getUpdates are mutually exclusive per bot, so this disables the shared
-	// poll reader. Requires Push.Listen + Push.PublicURL.
+	// Transport: "webhook" (single demux endpoint) or "poll" (shared getUpdates
+	// reader). Authoritative; Webhook is the legacy boolean fallback.
+	Transport string `json:"transport,omitempty"`
+	// Deprecated: use Transport. Read only as a fallback when Transport is empty.
 	Webhook bool `json:"webhook,omitempty"`
+}
+
+// TelegramTransport resolves the Telegram ingestion transport: the explicit
+// Transport enum if set, else the legacy Webhook boolean, else "poll".
+func (c Config) TelegramTransport() string {
+	if c.Telegram.Transport != "" {
+		return c.Telegram.Transport
+	}
+	if c.Telegram.Webhook {
+		return TransportWebhook
+	}
+	return TransportPoll
 }
 
 type ClaudeConfig struct {
