@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -55,6 +56,9 @@ type AdminHandler struct {
 	SessionAlive func(session string) bool
 	Deps         *ControlDeps
 	GuildID      string
+	// EnvPath is the dotenv file where bot tokens are persisted (settings page).
+	// Empty disables token editing.
+	EnvPath string
 	// RestartServe, when set, is called after a config change to apply it (config
 	// is read at serve startup). In production it triggers `systemctl --user
 	// restart` asynchronously; nil = no auto-restart (a manual restart is needed).
@@ -390,6 +394,7 @@ func RunAdminServer(ctx context.Context, root, addr, token string, deps *Control
 		},
 		Deps:         deps,
 		GuildID:      guildID,
+		EnvPath:      filepath.Join(filepath.Dir(root), ".env"),
 		RestartServe: restartServe,
 	}
 	srv := &http.Server{Addr: addr, Handler: h}

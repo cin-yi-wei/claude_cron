@@ -44,6 +44,8 @@ const adminIndexHTML = `<!doctype html>
   public_url: <input id="s_url" size="28">
   secret: <input id="s_secret" type="password" size="18" placeholder="(unchanged)">
   tg control chat-id: <input id="s_chat" size="14"><br>
+  discord token: <input id="s_dctok" type="password" size="22" placeholder="(unchanged)">
+  telegram token: <input id="s_tgtok" type="password" size="22" placeholder="(unchanged)"><br>
   <button onclick="saveSettings()">Save &amp; Restart serve</button>
   <span id="s_msg"></span>
 </div>
@@ -134,6 +136,8 @@ async function loadSettings() {
     document.getElementById('s_url').value = c.push_public_url || '';
     document.getElementById('s_secret').placeholder = c.push_secret_set ? '(set — blank=keep)' : '(none)';
     document.getElementById('s_chat').value = c.telegram_chat_id || '';
+    document.getElementById('s_dctok').placeholder = c.discord_token_set ? '(set — blank=keep)' : '(none)';
+    document.getElementById('s_tgtok').placeholder = c.telegram_token_set ? '(set — blank=keep)' : '(none)';
   } catch (e) { /* settings optional; ignore */ }
 }
 async function saveSettings() {
@@ -147,6 +151,10 @@ async function saveSettings() {
   };
   var sec = document.getElementById('s_secret').value;
   if (sec) body.push_secret = sec;
+  var dctok = document.getElementById('s_dctok').value;
+  if (dctok) body.discord_token = dctok;
+  var tgtok = document.getElementById('s_tgtok').value;
+  if (tgtok) body.telegram_token = tgtok;
   if (!confirm('Save settings and restart serve?')) return;
   try {
     var r = await fetch('/api/config', { method: 'PUT', headers: Object.assign({'Content-Type':'application/json'}, hdr()), body: JSON.stringify(body) });
