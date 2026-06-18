@@ -9,3 +9,7 @@
 # one-off migration artifacts
 .migration-*
 .migration-backup/
+
+# Svelte admin SPA deps (dist is committed for go:embed)
+web/admin/node_modules/
+web/admin/dist/

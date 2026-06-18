@@ -1,0 +1,8 @@
+/* Layout/typography come from Pico.css (loaded in index.html). Only
+   app-specific overrides live here. */
+:root {
+  --pico-font-size: 92%;
+}
+main.container {
+  max-width: 1100px;
+}

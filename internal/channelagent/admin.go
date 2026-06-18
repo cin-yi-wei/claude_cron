@@ -79,6 +79,16 @@ func (h AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(adminIndexHTML))
 		return
 	}
+	// The v2 Svelte SPA at /app/ is static (no data); served unauth like / so a
+	// browser can load it, then it prompts for the token and gates /api/* calls.
+	if path == "/app" || strings.HasPrefix(path, "/app/") {
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w)
+			return
+		}
+		adminSPA.ServeHTTP(w, r)
+		return
+	}
 	// Health check is unauthenticated (monitoring/uptime probes can't carry the
 	// bearer token); it exposes no data. Both /healthz and /api/healthz work.
 	if path == "/healthz" || path == "/api/healthz" {
