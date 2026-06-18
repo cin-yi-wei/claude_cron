@@ -80,6 +80,12 @@ type DiscordConfig struct {
 	ChannelID string `json:"channel_id"`
 	GuildID   string `json:"guild_id,omitempty"`
 	BaseURL   string `json:"base_url,omitempty"`
+	// GatewayDemux opts into a single shared Gateway connection for all Discord
+	// WORKER bindings: one websocket receives the whole bot's MESSAGE_CREATE and
+	// routes by channel id, replacing per-binding poll/Gateway (no IDENTIFY
+	// contention, no per-binding op9 churn). The control channel keeps its own
+	// path. Off by default.
+	GatewayDemux bool `json:"gateway_demux,omitempty"`
 }
 
 type TelegramConfig struct {

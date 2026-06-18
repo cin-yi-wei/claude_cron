@@ -61,6 +61,13 @@ type DiscordGatewayIngester struct {
 	// channel to feed a buffer rather than a binding inbox.
 	Sink func(SourceMessage) error
 
+	// Route, when set, switches this ingester to DEMUX mode: one Gateway
+	// connection for the whole bot, routing every MESSAGE_CREATE by its own
+	// channel id (ChannelID/Sink are ignored). The closure resolves + delivers
+	// (e.g. via inboundRoutes); unrouted channels return nil (dropped). This is
+	// the single-connection counterpart to per-binding ingesters.
+	Route func(ctx context.Context, msg SourceMessage) error
+
 	// dial is injectable for tests; nil uses the real coder/websocket dialer.
 	dial func(ctx context.Context, url string) (gwConn, error)
 }
@@ -193,7 +200,14 @@ func (g DiscordGatewayIngester) runLoop(ctx context.Context, conn gwConn) error 
 			return fmt.Errorf("discord gateway: server asked to reconnect (op %d)", ev.Op)
 		case gwDispatch:
 			if ev.T == "MESSAGE_CREATE" {
-				if msg, ok := gatewayMessageToSource(ev.D, g.ChannelID); ok {
+				if g.Route != nil {
+					// Demux mode: route every channel by id.
+					if msg, ok := gatewayExtract(ev.D); ok {
+						if err := g.Route(ctx, msg); err != nil {
+							return err
+						}
+					}
+				} else if msg, ok := gatewayMessageToSource(ev.D, g.ChannelID); ok {
 					if err := g.deliver(ctx, msg); err != nil {
 						return err
 					}
@@ -222,14 +236,15 @@ type gatewayMessage struct {
 	} `json:"author"`
 }
 
-// gatewayMessageToSource maps a MESSAGE_CREATE payload to a SourceMessage,
-// keeping only non-bot messages for channelID.
-func gatewayMessageToSource(raw json.RawMessage, channelID string) (SourceMessage, bool) {
+// gatewayExtract maps a MESSAGE_CREATE payload to a SourceMessage tagged with its
+// own channel id (no channel filter), dropping bot messages. Used by demux mode,
+// which routes by channel id rather than pre-filtering to one channel.
+func gatewayExtract(raw json.RawMessage) (SourceMessage, bool) {
 	var m gatewayMessage
 	if err := json.Unmarshal(raw, &m); err != nil {
 		return SourceMessage{}, false
 	}
-	if m.ChannelID != channelID || m.Author.Bot {
+	if m.Author.Bot {
 		return SourceMessage{}, false
 	}
 	created := m.Timestamp
@@ -238,10 +253,20 @@ func gatewayMessageToSource(raw json.RawMessage, channelID string) (SourceMessag
 	}
 	return SourceMessage{
 		Platform:  "discord",
-		ChannelID: channelID,
+		ChannelID: m.ChannelID,
 		MessageID: m.ID,
 		AuthorID:  m.Author.ID,
 		CreatedAt: created,
 		Content:   m.Content,
 	}, true
+}
+
+// gatewayMessageToSource maps a MESSAGE_CREATE payload to a SourceMessage,
+// keeping only non-bot messages for channelID.
+func gatewayMessageToSource(raw json.RawMessage, channelID string) (SourceMessage, bool) {
+	msg, ok := gatewayExtract(raw)
+	if !ok || msg.ChannelID != channelID {
+		return SourceMessage{}, false
+	}
+	return msg, true
 }

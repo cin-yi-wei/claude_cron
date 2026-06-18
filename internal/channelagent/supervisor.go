@@ -90,6 +90,33 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 		activePush["__tg_demux__"] = true
 	}
 
+	// Single shared Discord Gateway demux (opt-in): one websocket for the whole
+	// bot, routing each MESSAGE_CREATE to the matching WORKER binding's inbox
+	// (resolved fresh per message so new/removed/paused bindings are honoured).
+	// The control channel keeps its own path (handled below). Replaces per-binding
+	// poll/Gateway for Discord workers.
+	if cfg.Discord.GatewayDemux && token != "" && push != nil {
+		dcRoute := func(ctx context.Context, msg SourceMessage) error {
+			reg2, err := LoadRegistry(root)
+			if err != nil {
+				return nil // transient; Discord will not redeliver, but next msg retries routing
+			}
+			for _, b := range reg2.Bindings {
+				if b.PlatformOf() == PlatformDiscord && !b.Paused && b.ChannelID == msg.ChannelID {
+					_, e := IngestMessages(ctx, b.Root, []SourceMessage{msg})
+					return e
+				}
+			}
+			return nil // control channel or unknown → not a worker; dropped here
+		}
+		push.Ensure("__dc_demux__", DiscordGatewayIngester{Token: token, Route: dcRoute}, func(e error) {
+			if e != nil {
+				fmt.Fprintf(stdout, "discord gateway demux exited (restarts next cycle): %v\n", e)
+			}
+		})
+		activePush["__dc_demux__"] = true
+	}
+
 	controlPoll := DiscordSource{BaseURL: cfg.Discord.BaseURL, Token: token, ChannelID: cfg.Discord.ChannelID, Limit: 50}
 	var controlSource MessageSource = controlPoll
 	if cfg.Control.Mode == ModePush && push != nil {
@@ -187,7 +214,11 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 		// bindings ingest out-of-band via a persistent ingester (started once,
 		// kept alive by the PushManager) and only drain here.
 		var ingester Ingester
-		if b.ModeOf() == ModePush {
+		if cfg.Discord.GatewayDemux && b.PlatformOf() == PlatformDiscord {
+			// Fed by the single shared Discord Gateway demux (started below); just
+			// drain the inbox here. No per-binding poll or Gateway connection.
+			ingester = noopIngester{}
+		} else if b.ModeOf() == ModePush {
 			if push == nil {
 				fmt.Fprintf(stdout, "binding %s: push mode but no push manager\n", b.Name)
 				continue
