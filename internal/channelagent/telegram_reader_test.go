@@ -173,3 +173,35 @@ func TestTelegramDemuxHandlerRoutes(t *testing.T) {
 		t.Fatalf("worker inbox pending = %d, want 1", len(entries))
 	}
 }
+
+func TestInboundRoutesIsPlatformScoped(t *testing.T) {
+	root := t.TempDir()
+	reg := Registry{Bindings: []Binding{
+		{Name: "d", ChannelID: "dc1", Platform: PlatformDiscord, Plane: PlatformDiscord, Root: filepath.Join(root, "b", "d")},
+		{Name: "t", ChannelID: "tg1", Platform: PlatformTelegram, Plane: PlatformTelegram, Root: filepath.Join(root, "b", "t")},
+	}}
+	var cfg Config
+	dc := inboundRoutes(root, cfg, reg, PlatformDiscord)
+	if _, ok := dc["dc1"]; !ok {
+		t.Fatal("discord route missing dc1")
+	}
+	if _, ok := dc["tg1"]; ok {
+		t.Fatal("discord routes leaked telegram binding")
+	}
+	tg := inboundRoutes(root, cfg, reg, PlatformTelegram)
+	if _, ok := tg["tg1"]; !ok {
+		t.Fatal("telegram route missing tg1")
+	}
+	if _, ok := tg["dc1"]; ok {
+		t.Fatal("telegram routes leaked discord binding")
+	}
+}
+
+func TestControlBufferPathPreservesTelegramName(t *testing.T) {
+	if got := controlBufferPath("/r", PlatformTelegram); got != "/r/control-tg/state/tg_buffer.json" {
+		t.Fatalf("telegram buffer path = %q", got)
+	}
+	if got := controlBufferPath("/r", PlatformDiscord); got != "/r/control-dc/state/inbound_buffer.json" {
+		t.Fatalf("discord buffer path = %q", got)
+	}
+}
