@@ -109,16 +109,30 @@ func (h AdminHandler) sendChat(w http.ResponseWriter, r *http.Request, name stri
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	msg := SourceMessage{
-		Platform:  PlatformWeb,
+		Platform:  b.PlatformOf(),
 		ChannelID: b.ChannelID,
 		MessageID: newWebMessageID(),
 		AuthorID:  "web",
 		CreatedAt: now,
 		Content:   req.Text,
 	}
-	if _, err := IngestMessages(r.Context(), b.Root, []SourceMessage{msg}); err != nil {
-		http.Error(w, "ingest error", http.StatusInternalServerError)
-		return
+	if b.Control {
+		// Control bindings are driven by the control pipeline (RunControlOnce),
+		// which reads its inbound buffer; the worker inbox isn't its input.
+		bufName := "inbound_buffer.json"
+		if b.PlatformOf() == PlatformTelegram {
+			bufName = "tg_buffer.json"
+		}
+		if err := appendTelegramBuffer(pathIn(b.Root, "state", bufName), msg); err != nil {
+			http.Error(w, "buffer error", http.StatusInternalServerError)
+			return
+		}
+	} else {
+		msg.Platform = PlatformWeb
+		if _, err := IngestMessages(r.Context(), b.Root, []SourceMessage{msg}); err != nil {
+			http.Error(w, "ingest error", http.StatusInternalServerError)
+			return
+		}
 	}
 	// Echo the user message to every connected tab so the conversation stays in
 	// sync without each client tracking its own optimistic state.

@@ -293,7 +293,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 0
 	case "notify":
 		return runNotifyCommand(args[1:], stdout, stderr)
-	case "bind", "unbind", "pause", "resume", "list":
+	case "bind", "unbind", "pause", "resume", "list", "set-default":
 		return runManageCommand(args[0], args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown command %q\n", args[0])
@@ -306,6 +306,7 @@ func runManageCommand(name string, rest []string, stdout, stderr io.Writer) int 
 	deleteChannel := false
 	var pos []string
 	opts := map[string]string{}
+	flags := map[string]bool{}
 	for i := 0; i < len(rest); i++ {
 		switch {
 		case rest[i] == "--root":
@@ -318,10 +319,12 @@ func runManageCommand(name string, rest []string, stdout, stderr io.Writer) int 
 		case rest[i] == "--delete-channel":
 			deleteChannel = true
 		case strings.HasPrefix(rest[i], "--"):
-			// --key=value options (e.g. --platform=tg). Bare flags fall through.
+			// --key=value options (e.g. --platform=tg); bare --flag (e.g. --control).
 			kv := strings.TrimPrefix(rest[i], "--")
 			if k, v, ok := strings.Cut(kv, "="); ok {
 				opts[k] = v
+			} else {
+				flags[kv] = true
 			}
 		default:
 			pos = append(pos, rest[i])
@@ -345,7 +348,7 @@ func runManageCommand(name string, rest []string, stdout, stderr io.Writer) int 
 	}
 	deps := agent.BuildControlDeps(root, cfg)
 
-	cmd := agent.Command{Name: name, Args: pos, Flags: map[string]bool{}, Opts: opts}
+	cmd := agent.Command{Name: name, Args: pos, Flags: flags, Opts: opts}
 	if deleteChannel {
 		cmd.Flags["delete-channel"] = true
 	}

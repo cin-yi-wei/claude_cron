@@ -199,6 +199,11 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 	}
 
 	for _, b := range reg.Bindings {
+		// Control bindings are driven by the control-binding loop below, not the
+		// worker pipeline (they have no project worktree).
+		if b.Control {
+			continue
+		}
 		// Paused (hot-stopped) bindings: don't recreate the session or ingest.
 		// The session was killed on /pause; any stray copy is reaped below
 		// (excluded from the valid set). Messages stay in the channel until
@@ -295,6 +300,52 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 		}
 		fmt.Fprintf(stdout, "binding=%s created=%d processed=%t sent=%d\n", b.Name, res.Created, res.Processed, res.Sent)
 	}
+	// Registry-defined control bindings (unified control model). Each runs the
+	// control pipeline against its own root/session, fed by its platform's source
+	// and replying via the hub (web) or the platform sender teed to the hub
+	// (dc/tg). Additive: a no-op when there are none, so it cannot disturb the
+	// hardcoded dc/tg control planes above.
+	for _, b := range reg.Bindings {
+		if !b.Control || b.Paused {
+			continue
+		}
+		var tokenEnv, tokenVal string
+		var src MessageSource
+		var snd Sender
+		switch b.PlatformOf() {
+		case PlatformWeb:
+			// Browser is the transport: sendChat appends to this buffer; replies
+			// stream back via the hub.
+			src = TelegramBufferSource{Path: pathIn(b.Root, "state", "inbound_buffer.json")}
+			snd = WebSender{Hub: DefaultChatHub, Key: b.Name}
+		case PlatformTelegram:
+			tokenEnv, tokenVal = cfg.Telegram.TokenEnv, tgToken
+			src = TelegramBufferSource{Path: pathIn(b.Root, "state", "tg_buffer.json")}
+			snd = TeeSender{Inner: TelegramSender{BaseURL: cfg.Telegram.BaseURL, Token: tgToken, ChatID: b.ChannelID}, Hub: DefaultChatHub, Key: b.Name}
+		case PlatformDiscord:
+			tokenEnv, tokenVal = cfg.Discord.TokenEnv, token
+			src = BufferPollSource{BufferPath: pathIn(b.Root, "state", "inbound_buffer.json"), Poll: DiscordSource{BaseURL: cfg.Discord.BaseURL, Token: token, ChannelID: b.ChannelID, Limit: 50}}
+			snd = TeeSender{Inner: DiscordSender{BaseURL: cfg.Discord.BaseURL, Token: token, ChannelID: b.ChannelID}, Hub: DefaultChatHub, Key: b.Name}
+		default:
+			continue
+		}
+		cplane := ControlPlane{Name: b.Name, Platform: b.PlatformOf(), ChannelID: b.ChannelID}
+		if err := RunControlOnce(ctx, root, b.Root, deps, &reg, src, snd, cplane); err != nil {
+			fmt.Fprintf(stdout, "control-binding[%s] error: %v\n", b.Name, err)
+		}
+		if reg, err = LoadRegistry(root); err != nil {
+			return err
+		}
+		if err := StartControlSession(ctx, b.TmuxSession, b.Worktree, tokenEnv, tokenVal, controlSystemPrompt(root, b.Worktree, b.Name)); err != nil {
+			fmt.Fprintf(stdout, "control-binding[%s] session error: %v\n", b.Name, err)
+			continue
+		}
+		inj := TmuxInjector{Session: b.TmuxSession, Root: b.Root, AutoStart: false}
+		if err := runControlAssistant(ctx, b, inj, snd, timeout); err != nil {
+			fmt.Fprintf(stdout, "control-binding[%s] assistant error: %v\n", b.Name, err)
+		}
+	}
+
 	// Stop push ingesters whose binding was removed or flipped to poll.
 	if push != nil {
 		push.Reconcile(activePush)

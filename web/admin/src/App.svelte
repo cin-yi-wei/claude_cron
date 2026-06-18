@@ -65,7 +65,10 @@
         <tbody>
           {#each bindings as b}
             <tr>
-              <td><strong>{b.name}</strong></td>
+              <td>
+                <strong>{b.name}</strong>
+                {#if b.control}<span class="badge ctrl">control{b.default ? ' 🛡' : ''}</span>{/if}
+              </td>
               <td><span class="badge">{b.platform} · {b.transport}</span></td>
               <td>{b.plane}</td>
               <td>{#if b.paused}<span class="muted">⏸ paused</span>{:else}{b.tmux_session} {b._alive ? '🟢' : '🔴'}{/if}</td>
@@ -105,4 +108,5 @@
   .muted { color: var(--pico-muted-color); }
   table { font-size: .85rem; }
   .chat-btn { width: auto; padding: .15rem .55rem; font-size: .75rem; margin: 0; }
+  .badge.ctrl { background: var(--pico-primary); color: var(--pico-primary-inverse); margin-left: .35rem; }
 </style>

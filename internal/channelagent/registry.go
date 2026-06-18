@@ -32,6 +32,42 @@ type Binding struct {
 	// means the legacy default plane ("discord"), so existing registries keep
 	// working. Names remain globally unique across planes.
 	Plane string `json:"plane,omitempty"`
+	// Control marks this binding as a control plane (the management assistant)
+	// rather than a worker. Control bindings have no project worktree/branch; the
+	// supervisor drives them through the control pipeline (RunControlOnce + the
+	// assistant session) instead of the worker pipeline.
+	Control bool `json:"control,omitempty"`
+	// Default marks the protected bootstrap control plane: the first control
+	// created becomes the default, and it cannot be paused/unbound (that would
+	// lock the user out of all management). The flag is transferable to another
+	// control via set-default.
+	Default bool `json:"default,omitempty"`
+}
+
+// ControlBindingDefaults derives a control binding's session/root/workspace.
+// Control bindings have no project worktree (no dir/branch); the workspace is a
+// plain sandbox dir under controls/<name>.
+func ControlBindingDefaults(root, name, platform string) Binding {
+	base := filepath.Join(root, "controls", name)
+	return Binding{
+		Name:        name,
+		Platform:    platform,
+		Control:     true,
+		TmuxSession: "cc-" + name,
+		Root:        base,
+		Worktree:    filepath.Join(base, "workspace"),
+	}
+}
+
+// HasControl reports whether any control binding exists (used to decide if a
+// newly-created control becomes the protected default).
+func (r Registry) HasControl() bool {
+	for _, b := range r.Bindings {
+		if b.Control {
+			return true
+		}
+	}
+	return false
 }
 
 // PlaneOf returns the owning control plane, defaulting to "discord" when unset.
@@ -152,6 +188,25 @@ func (r *Registry) SetPaused(name string, paused bool) bool {
 		}
 	}
 	return false
+}
+
+// SetDefaultControl makes the named control binding the sole default, clearing
+// the flag on every other control. Returns false if name is not a control
+// binding. The caller persists the registry.
+func (r *Registry) SetDefaultControl(name string) bool {
+	idx := -1
+	for i := range r.Bindings {
+		if r.Bindings[i].Name == name && r.Bindings[i].Control {
+			idx = i
+		}
+	}
+	if idx < 0 {
+		return false
+	}
+	for i := range r.Bindings {
+		r.Bindings[i].Default = r.Bindings[i].Control && i == idx
+	}
+	return true
 }
 
 func (r *Registry) Remove(name string) bool {

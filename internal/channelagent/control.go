@@ -69,7 +69,7 @@ type ControlDeps struct {
 	InitRoot       func(root string) error
 }
 
-const controlUsage = "指令: /bind <name> <project-dir> <branch> [--platform=dc|tg] [--mode=poll|push] [--chat-id=<id> (tg)] | /unbind <name> [--delete-channel] | /pause <name> | /resume <name> | /list | /status <name> | /help"
+const controlUsage = "指令: /bind <name> <project-dir> <branch> [--platform=dc|tg] [--mode=poll|push] [--chat-id=<id> (tg)] | /bind <name> --control [--platform=web|dc|tg] [--chat-id=<id>] | /unbind <name> [--delete-channel] | /pause <name> | /resume <name> | /set-default <name> | /list | /status <name> | /help"
 
 // HandleCommand executes a parsed control command against the registry, using
 // deps for side effects. Returns a reply to post to the control channel and
@@ -84,6 +84,8 @@ func HandleCommand(ctx context.Context, deps ControlDeps, reg *Registry, cmd Com
 		return handlePause(ctx, deps, reg, cmd, plane)
 	case "resume":
 		return handleResume(reg, cmd, plane)
+	case "set-default":
+		return handleSetDefault(reg, cmd, plane)
 	case "list":
 		return handleList(reg, plane), false, nil
 	case "status":
@@ -110,6 +112,9 @@ func (p ControlPlane) ownsBinding(b Binding) bool {
 }
 
 func handleBind(ctx context.Context, deps ControlDeps, reg *Registry, cmd Command, plane ControlPlane) (string, bool, error) {
+	if cmd.Flags["control"] {
+		return handleBindControl(ctx, deps, reg, cmd, plane)
+	}
 	if len(cmd.Args) != 3 {
 		return "用法: /bind <name> <project-dir> <branch>", false, nil
 	}
@@ -244,6 +249,78 @@ func normalizeMode(s string) (string, error) {
 	}
 }
 
+// handleBindControl creates a control binding (a management plane) via bind.
+// Control bindings have no project dir/branch/worktree; only the per-platform
+// prerequisites are checked. The first control created becomes the protected
+// default (transferable via set-default; the default can't be paused/unbound).
+func handleBindControl(ctx context.Context, deps ControlDeps, reg *Registry, cmd Command, plane ControlPlane) (string, bool, error) {
+	if len(cmd.Args) != 1 {
+		return "用法: /bind <name> --control [--platform=web|dc|tg] [--chat-id=<id> (tg)]", false, nil
+	}
+	name := cmd.Args[0]
+	if !ValidName(name) {
+		return fmt.Sprintf("name %q 不合法 (只能用 a-z 0-9 -)", name), false, nil
+	}
+	if name == "control" {
+		return `name "control" 為保留字，請換別的名稱`, false, nil
+	}
+	if _, ok := reg.Get(name); ok {
+		return fmt.Sprintf("binding %q 已存在", name), false, nil
+	}
+	// Control defaults to the web platform — a user may have no Discord/Telegram.
+	platform := PlatformWeb
+	if cmd.opt("platform") != "" {
+		p, perr := normalizePlatform(cmd.opt("platform"))
+		if perr != nil {
+			return perr.Error(), false, nil
+		}
+		platform = p
+	}
+
+	b := ControlBindingDefaults(deps.Root, name, platform)
+	b.Plane = plane.planeName()
+
+	switch platform {
+	case PlatformWeb:
+		b.ChannelID = name // no upstream channel; browser is the transport
+	case PlatformTelegram:
+		chat := cmd.opt("chat-id")
+		if chat == "" {
+			return "tg control 需要 --chat-id=<chat id>", false, nil
+		}
+		b.ChannelID = chat
+	case PlatformDiscord:
+		if deps.GuildID == "" || deps.CreateChannel == nil {
+			return "dc control 需要設定 Discord guild + token", false, nil
+		}
+		ch, err := deps.CreateChannel(ctx, deps.GuildID, name)
+		if err != nil {
+			return "", false, fmt.Errorf("建頻道失敗: %w", err)
+		}
+		b.ChannelID = ch
+	}
+
+	// First control becomes the protected default (lifeline).
+	if !reg.HasControl() {
+		b.Default = true
+	}
+
+	if err := deps.InitRoot(b.Root); err != nil {
+		return "", false, fmt.Errorf("init root 失敗: %w", err)
+	}
+	if err := os.MkdirAll(b.Worktree, 0o755); err != nil {
+		return "", false, fmt.Errorf("建 workspace 失敗: %w", err)
+	}
+	if err := reg.Add(b); err != nil {
+		return "", false, err
+	}
+	def := ""
+	if b.Default {
+		def = "（預設 control，受保護不可刪）"
+	}
+	return fmt.Sprintf("✅ 建立 control %s [%s]%s — 下個 cycle 起 session %s", name, platform, def, b.TmuxSession), true, nil
+}
+
 func handleUnbind(ctx context.Context, deps ControlDeps, reg *Registry, cmd Command, plane ControlPlane) (string, bool, error) {
 	if len(cmd.Args) != 1 {
 		return "用法: /unbind <name> [--delete-channel]", false, nil
@@ -252,6 +329,17 @@ func handleUnbind(ctx context.Context, deps ControlDeps, reg *Registry, cmd Comm
 	b, ok := reg.Get(name)
 	if !ok || !plane.ownsBinding(b) {
 		return fmt.Sprintf("找不到 binding %q", name), false, nil
+	}
+	// Control bindings: the protected default can't be removed (lock-out guard);
+	// others tear down without worktree handling (they have none).
+	if b.Control {
+		if b.Default {
+			return fmt.Sprintf("control %q 是預設（lifeline），不能刪。先用 /set-default <別的 control> 轉移預設再刪。", name), false, nil
+		}
+		_ = deps.StopSession(ctx, b.TmuxSession)
+		_ = os.RemoveAll(b.Root)
+		reg.Remove(name)
+		return fmt.Sprintf("🗑️ 移除 control %s 完成", name), true, nil
 	}
 	_ = deps.StopSession(ctx, b.TmuxSession)
 	// Preserve in-flight work: commit any uncommitted changes onto the branch
@@ -283,6 +371,9 @@ func handlePause(ctx context.Context, deps ControlDeps, reg *Registry, cmd Comma
 	if !ok || !plane.ownsBinding(b) {
 		return fmt.Sprintf("找不到 binding %q", name), false, nil
 	}
+	if b.Control && b.Default {
+		return fmt.Sprintf("control %q 是預設（lifeline），不能暫停。先轉移預設。", name), false, nil
+	}
 	if b.Paused {
 		return fmt.Sprintf("binding %q 已是暫停狀態", name), false, nil
 	}
@@ -307,6 +398,29 @@ func handleResume(reg *Registry, cmd Command, plane ControlPlane) (string, bool,
 	}
 	reg.SetPaused(name, false)
 	return fmt.Sprintf("▶️ 已恢復 %s（下個 cycle 重開 session %s 並 resume 對話）", name, b.TmuxSession), true, nil
+}
+
+// handleSetDefault transfers the protected-default flag to another control
+// binding, so the previous default becomes pausable/removable.
+func handleSetDefault(reg *Registry, cmd Command, plane ControlPlane) (string, bool, error) {
+	if len(cmd.Args) != 1 {
+		return "用法: /set-default <control-name>", false, nil
+	}
+	name := cmd.Args[0]
+	b, ok := reg.Get(name)
+	if !ok || !plane.ownsBinding(b) {
+		return fmt.Sprintf("找不到 binding %q", name), false, nil
+	}
+	if !b.Control {
+		return fmt.Sprintf("%q 不是 control binding", name), false, nil
+	}
+	if b.Default {
+		return fmt.Sprintf("%q 已是預設 control", name), false, nil
+	}
+	if !reg.SetDefaultControl(name) {
+		return fmt.Sprintf("無法設定 %q 為預設", name), false, nil
+	}
+	return fmt.Sprintf("✅ 預設 control 已轉移到 %s（舊預設現在可暫停/刪除）", name), true, nil
 }
 
 func handleList(reg *Registry, plane ControlPlane) string {

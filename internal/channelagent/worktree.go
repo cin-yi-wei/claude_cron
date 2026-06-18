@@ -252,8 +252,12 @@ func StartControlSession(ctx context.Context, session, cwd, tokenEnv, tokenValue
 	if runExternalCommand(ctx, "tmux", "has-session", "-t", session) == nil {
 		return nil
 	}
-	args := append([]string{"new-session", "-d", "-s", session, "-c", cwd, "-e", tokenEnv + "=" + tokenValue},
-		claudeArgs(cwd, "--append-system-prompt", systemPrompt)...)
+	base := []string{"new-session", "-d", "-s", session, "-c", cwd}
+	if tokenEnv != "" {
+		// A web control plane has no bot token; only inject -e when there is one.
+		base = append(base, "-e", tokenEnv+"="+tokenValue)
+	}
+	args := append(base, claudeArgs(cwd, "--append-system-prompt", systemPrompt)...)
 	if err := runExternalCommand(ctx, "tmux", args...); err != nil {
 		return err
 	}

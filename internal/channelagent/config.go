@@ -50,6 +50,8 @@ func (c Config) Transport(b Binding) string {
 		return c.DiscordTransport()
 	case PlatformTelegram:
 		return c.TelegramTransport()
+	case PlatformWeb:
+		return "browser"
 	}
 	return b.ModeOf()
 }
