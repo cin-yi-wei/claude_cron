@@ -39,7 +39,7 @@ const adminIndexHTML = `<!doctype html>
   discord transport:
   <select id="s_dc"><option value="gateway">gateway</option><option value="poll">poll</option></select>
   &nbsp; telegram transport:
-  <select id="s_tg"><option value="webhook">webhook</option><option value="poll">poll</option></select><br>
+  <select id="s_tg"><option value="webhook">webhook</option></select><br>
   push listen: <input id="s_listen" size="18">
   public_url: <input id="s_url" size="28">
   secret: <input id="s_secret" type="password" size="18" placeholder="(unchanged)">
