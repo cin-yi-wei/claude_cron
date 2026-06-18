@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -134,7 +135,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 			token = *tokenFlag
 		}
 		fmt.Fprintf(stdout, "admin API listening on %s (writes=%t)\n", addr, !*readonly)
-		if err := agent.RunAdminServer(context.Background(), absRoot, addr, token, deps, cfg.Discord.GuildID); err != nil && err != context.Canceled {
+		if err := agent.RunAdminServer(context.Background(), absRoot, addr, token, deps, cfg.Discord.GuildID, nil); err != nil && err != context.Canceled {
 			fmt.Fprintln(stderr, err)
 			return 1
 		}
@@ -183,9 +184,16 @@ func run(args []string, stdout, stderr io.Writer) int {
 				absRoot = a
 			}
 			adminDeps := agent.BuildControlDeps(absRoot, cfg)
+			// On a config change the admin asks serve to restart so the new config
+			// is read; systemd (Restart=always) brings it straight back. Delay so the
+			// HTTP response flushes before this process is killed.
+			restartServe := func() {
+				time.Sleep(600 * time.Millisecond)
+				_ = exec.Command("systemctl", "--user", "restart", "claude-cron-serve.service").Start()
+			}
 			go func() {
 				fmt.Fprintf(stdout, "admin API in-process on %s\n", cfg.Admin.Listen)
-				if err := agent.RunAdminServer(supCtx, absRoot, cfg.Admin.Listen, cfg.Admin.Token, &adminDeps, cfg.Discord.GuildID); err != nil && err != context.Canceled {
+				if err := agent.RunAdminServer(supCtx, absRoot, cfg.Admin.Listen, cfg.Admin.Token, &adminDeps, cfg.Discord.GuildID, restartServe); err != nil && err != context.Canceled {
 					fmt.Fprintf(stderr, "admin server error: %v\n", err)
 				}
 			}()
