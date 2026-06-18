@@ -95,6 +95,31 @@ func (h AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSONResponse(w, map[string]string{"status": "ok"})
 		return
 	}
+	// Web-chat endpoints have their own auth (SSE can't send a header → ?token=).
+	if rest, ok := strings.CutPrefix(path, "/api/chat/"); ok {
+		if !h.chatAuthorized(r) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if name, ok := strings.CutSuffix(rest, "/stream"); ok {
+			if r.Method != http.MethodGet {
+				methodNotAllowed(w)
+				return
+			}
+			h.streamChat(w, r, name)
+			return
+		}
+		if name, ok := strings.CutSuffix(rest, "/send"); ok {
+			if r.Method != http.MethodPost {
+				methodNotAllowed(w)
+				return
+			}
+			h.sendChat(w, r, name)
+			return
+		}
+		http.NotFound(w, r)
+		return
+	}
 	if !h.authorized(r) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return

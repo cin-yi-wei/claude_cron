@@ -167,7 +167,10 @@ func handleBind(ctx context.Context, deps ControlDeps, reg *Registry, cmd Comman
 	// Provision the channel/chat. Discord auto-creates a channel; Telegram reuses
 	// an existing chat, so the chat id must be supplied via --chat-id.
 	var channelID string
-	if platform == PlatformTelegram {
+	if platform == PlatformWeb {
+		// No upstream channel to provision; the binding name is its identity.
+		channelID = name
+	} else if platform == PlatformTelegram {
 		channelID = cmd.opt("chat-id")
 		if channelID == "" {
 			return "telegram 綁定需要 --chat-id=<chat id>", false, nil
@@ -222,8 +225,10 @@ func normalizePlatform(s string) (string, error) {
 		return PlatformDiscord, nil
 	case "tg", "telegram":
 		return PlatformTelegram, nil
+	case "web", "browser":
+		return PlatformWeb, nil
 	default:
-		return "", fmt.Errorf("platform %q 不合法 (用 discord|dc 或 telegram|tg)", s)
+		return "", fmt.Errorf("platform %q 不合法 (用 discord|dc、telegram|tg 或 web)", s)
 	}
 }
 

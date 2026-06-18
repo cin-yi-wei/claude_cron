@@ -87,6 +87,8 @@ func SelectSender(b Binding, cfg Config, tokens bindingTokens) (Sender, error) {
 		return DiscordSender{BaseURL: cfg.Discord.BaseURL, Token: tokens.discord, ChannelID: b.ChannelID}, nil
 	case PlatformTelegram:
 		return TelegramSender{BaseURL: cfg.Telegram.BaseURL, Token: tokens.telegram, ChatID: b.ChannelID}, nil
+	case PlatformWeb:
+		return WebSender{Hub: DefaultChatHub, Key: b.Name}, nil
 	default:
 		return nil, fmt.Errorf("binding %q: unknown platform %q", b.Name, b.Platform)
 	}

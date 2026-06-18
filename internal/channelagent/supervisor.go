@@ -225,7 +225,11 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 		// bindings ingest out-of-band via a persistent ingester (started once,
 		// kept alive by the PushManager) and only drain here.
 		var ingester Ingester
-		if cfg.DiscordTransport() == TransportGateway && b.PlatformOf() == PlatformDiscord {
+		if b.PlatformOf() == PlatformWeb {
+			// Web bindings are fed out-of-band: the admin POST /api/chat/<name>/send
+			// endpoint writes browser messages straight into the inbox. Just drain.
+			ingester = noopIngester{}
+		} else if cfg.DiscordTransport() == TransportGateway && b.PlatformOf() == PlatformDiscord {
 			// Fed by the single shared Discord Gateway demux (started below); just
 			// drain the inbox here. No per-binding poll or Gateway connection.
 			ingester = noopIngester{}

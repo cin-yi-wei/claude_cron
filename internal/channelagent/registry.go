@@ -47,8 +47,13 @@ func (b Binding) PlaneOf() string {
 const (
 	PlatformDiscord  = "discord"
 	PlatformTelegram = "telegram"
-	ModePoll         = "poll"
-	ModePush         = "push"
+	// PlatformWeb is the in-browser chat platform: no external channel/chat —
+	// messages arrive via the admin SSE/POST endpoints and replies are delivered
+	// to connected browsers through the in-process ChatHub. Its ChannelID is the
+	// binding name (there is no upstream channel to provision).
+	PlatformWeb = "web"
+	ModePoll    = "poll"
+	ModePush    = "push"
 )
 
 // PlatformOf returns the binding's platform, defaulting to discord when unset.

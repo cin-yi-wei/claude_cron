@@ -1,8 +1,10 @@
 <script>
+  import Chat from './Chat.svelte';
   let token = $state(localStorage.getItem('cc_admin_token') || '');
   let bindings = $state([]);
   let err = $state('');
   let loading = $state(false);
+  let webBindings = $derived(bindings.filter((b) => b.platform === 'web'));
 
   function hdr() {
     return token ? { Authorization: 'Bearer ' + token } : {};
@@ -33,7 +35,7 @@
 <main class="container">
   <hgroup>
     <h1>claude_cron admin <small>· svelte</small></h1>
-    <p>新版介面 (v2) — bindings；之後加聊天窗</p>
+    <p>新版介面 (v2) — bindings + 瀏覽器聊天窗</p>
   </hgroup>
 
   <article>
@@ -67,7 +69,17 @@
     </div>
   </article>
 
-  <p><small>完整功能 (settings / create / chat) 會逐步從舊版 / (Pico) 搬過來</small></p>
+  <section class="chats">
+    <h2>Chat <small>(platform=web bindings)</small></h2>
+    {#each webBindings as b (b.name)}
+      <Chat name={b.name} {token} />
+    {/each}
+    {#if webBindings.length === 0}
+      <p class="muted"><em>沒有 web binding。建一個：<code>/bind &lt;name&gt; &lt;dir&gt; &lt;branch&gt; --platform web</code>，重整後這裡會出現聊天窗。</em></p>
+    {/if}
+  </section>
+
+  <p><small>settings / create 仍在舊版 / (Pico)，之後搬過來</small></p>
 </main>
 
 <style>
