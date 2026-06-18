@@ -105,3 +105,36 @@ func countJSONFilesSafe(dir string) int {
 }
 
 var _ PushIngester = DiscordGatewayIngester{}
+
+func TestGatewayDemuxRoutesByChannel(t *testing.T) {
+	hello := `{"op":10,"d":{"heartbeat_interval":45000}}`
+	m1 := `{"op":0,"t":"MESSAGE_CREATE","s":1,"d":{"id":"a","channel_id":"c1","content":"one","author":{"id":"u","bot":false},"timestamp":"2026-06-16T01:30:12Z"}}`
+	m2 := `{"op":0,"t":"MESSAGE_CREATE","s":2,"d":{"id":"b","channel_id":"c2","content":"two","author":{"id":"u","bot":false},"timestamp":"2026-06-16T01:30:13Z"}}`
+	bot := `{"op":0,"t":"MESSAGE_CREATE","s":3,"d":{"id":"c","channel_id":"c1","content":"botmsg","author":{"id":"x","bot":true},"timestamp":"2026-06-16T01:30:14Z"}}`
+	conn := &fakeGwConn{frames: [][]byte{[]byte(hello), []byte(m1), []byte(m2), []byte(bot)}}
+
+	var mu sync.Mutex
+	got := map[string]string{} // channel_id -> content
+	g := DiscordGatewayIngester{Token: "tok", Route: func(_ context.Context, msg SourceMessage) error {
+		mu.Lock()
+		got[msg.ChannelID] = msg.Content
+		mu.Unlock()
+		return nil
+	}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- g.runLoop(ctx, conn) }()
+	waitFor(t, func() bool { mu.Lock(); defer mu.Unlock(); return len(got) == 2 })
+	cancel()
+	<-done
+
+	mu.Lock()
+	defer mu.Unlock()
+	if got["c1"] != "one" || got["c2"] != "two" {
+		t.Fatalf("demux routing = %#v", got)
+	}
+	if _, ok := got["c1"]; ok && len(got) > 2 {
+		t.Fatalf("bot message should have been dropped: %#v", got)
+	}
+}
