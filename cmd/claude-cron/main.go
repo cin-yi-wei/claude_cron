@@ -174,6 +174,22 @@ func run(args []string, stdout, stderr io.Writer) int {
 		supCtx := context.Background()
 		pushMgr := agent.NewPushManager(supCtx)
 		defer pushMgr.StopAll()
+		// Host the admin API in-process when configured, so serve + admin are ONE
+		// service/process (one thing to supervise). The admin UI/API stays up with
+		// serve and can restart bindings/sessions if a tmux session is missing.
+		if cfg.Admin.Listen != "" {
+			absRoot := *root
+			if a, err := filepath.Abs(*root); err == nil {
+				absRoot = a
+			}
+			adminDeps := agent.BuildControlDeps(absRoot, cfg)
+			go func() {
+				fmt.Fprintf(stdout, "admin API in-process on %s\n", cfg.Admin.Listen)
+				if err := agent.RunAdminServer(supCtx, absRoot, cfg.Admin.Listen, cfg.Admin.Token, &adminDeps, cfg.Discord.GuildID); err != nil && err != context.Canceled {
+					fmt.Fprintf(stderr, "admin server error: %v\n", err)
+				}
+			}()
+		}
 		for {
 			if err := agent.RunSupervisorOnce(supCtx, *root, cfg, timeout, stdout, pushMgr); err != nil {
 				fmt.Fprintln(stderr, err)
