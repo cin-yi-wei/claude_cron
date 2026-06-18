@@ -117,6 +117,14 @@ func (h AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			h.sendChat(w, r, name)
 			return
 		}
+		if name, ok := strings.CutSuffix(rest, "/history"); ok {
+			if r.Method != http.MethodGet {
+				methodNotAllowed(w)
+				return
+			}
+			h.historyChat(w, name)
+			return
+		}
 		http.NotFound(w, r)
 		return
 	}

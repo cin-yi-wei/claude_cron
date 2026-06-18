@@ -5,6 +5,17 @@
   let status = $state('connecting…');
   let es;
 
+  async function loadHistory() {
+    try {
+      const headers = token ? { Authorization: 'Bearer ' + token } : {};
+      const r = await fetch('/api/chat/' + encodeURIComponent(name) + '/history', { headers });
+      if (r.ok) {
+        const past = await r.json();
+        if (Array.isArray(past)) messages = past;
+      }
+    } catch {}
+  }
+
   function connect() {
     if (es) es.close();
     status = 'connecting…';
@@ -37,7 +48,8 @@
   }
 
   $effect(() => {
-    connect();
+    // Load the existing thread first so the window isn't blank, then stream live.
+    loadHistory().then(connect);
     return () => { if (es) es.close(); };
   });
 </script>

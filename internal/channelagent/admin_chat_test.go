@@ -2,6 +2,7 @@ package channelagent
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -98,6 +99,53 @@ func TestChatSendRejectsNonWebBinding(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("non-web send status = %d, want 404", rec.Code)
+	}
+}
+
+func TestChatHistoryReplaysThread(t *testing.T) {
+	root := t.TempDir()
+	if err := Init(root); err != nil {
+		t.Fatal(err)
+	}
+	bRoot := pathIn(root, "bindings", "webx")
+	if err := Init(bRoot); err != nil {
+		t.Fatal(err)
+	}
+	seedBinding(t, root, Binding{Name: "webx", ChannelID: "webx", TmuxSession: "cc-webx", Root: bRoot, Platform: PlatformWeb})
+
+	// A processed user message (inbox/done) and its sent reply (outbox/sent).
+	in := InputJob{Schema: 1, JobID: "j1", Source: SourceMessage{Platform: PlatformWeb, Content: "hi there", CreatedAt: "2026-06-18T00:00:00Z"}}
+	if err := AtomicWriteJSON(pathIn(bRoot, "inbox", "done", "j1.json"), in); err != nil {
+		t.Fatal(err)
+	}
+	out := OutputJob{Schema: 1, JobID: "j1", Send: true, Text: "hello back"}
+	if err := AtomicWriteJSON(pathIn(bRoot, "outbox", "sent", "j1.json"), out); err != nil {
+		t.Fatal(err)
+	}
+	// A non-send reply must be excluded.
+	if err := AtomicWriteJSON(pathIn(bRoot, "outbox", "sent", "j2.json"), OutputJob{Schema: 1, JobID: "j2", Send: false, Text: "skipped"}); err != nil {
+		t.Fatal(err)
+	}
+
+	h := AdminHandler{Root: root}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/chat/webx/history", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("history status = %d", rec.Code)
+	}
+	var got []ChatEvent
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("history len = %d, want 2 (non-send excluded): %#v", len(got), got)
+	}
+	roles := got[0].Role + "," + got[1].Role
+	if roles != "user,assistant" {
+		t.Fatalf("order/roles = %q, want user,assistant", roles)
+	}
+	if got[0].Text != "hi there" || got[1].Text != "hello back" {
+		t.Fatalf("texts = %#v", got)
 	}
 }
 

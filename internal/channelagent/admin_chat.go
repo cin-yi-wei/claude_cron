@@ -6,12 +6,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
 	"time"
 )
 
 // Web-chat endpoints (platform "web"):
 //   GET  /api/chat/<name>/stream  → SSE of ChatEvents for that binding
 //   POST /api/chat/<name>/send    → inject a browser message into the inbox
+//   GET  /api/chat/<name>/history → past conversation (replayed from the queues)
 //
 // These bridge the browser to a cc-<name> Claude session via the ChatHub
 // (replies) and the inbox (messages), reusing the existing worker/sender
@@ -129,4 +134,93 @@ func newWebMessageID() string {
 	var b [6]byte
 	_, _ = rand.Read(b[:])
 	return fmt.Sprintf("web-%d-%s", time.Now().UnixNano(), hex.EncodeToString(b[:]))
+}
+
+// historyChat replays the binding's past conversation so a freshly-opened chat
+// window shows the existing thread instead of starting blank. Sources: processed
+// user messages (inbox/done, plus in-flight pending/processing) and sent replies
+// (outbox/sent, plus outbox/pending). Ordered by file mtime — a user message is
+// moved to done right before its reply is written, so the order comes out right.
+func (h AdminHandler) historyChat(w http.ResponseWriter, name string) {
+	b, ok := h.webBinding(name)
+	if !ok {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	writeJSONResponse(w, readChatHistory(b.Root))
+}
+
+type stampedEvent struct {
+	ev ChatEvent
+	ts int64 // unix nanos for stable ordering
+}
+
+func readChatHistory(bRoot string) []ChatEvent {
+	var items []stampedEvent
+	// User messages from the inbox (done = processed; pending/processing = in flight).
+	for _, sub := range []string{"done", "processing", "pending"} {
+		dir := pathIn(bRoot, "inbox", sub)
+		for _, fp := range jsonFilesByMtime(dir) {
+			var job InputJob
+			if err := ReadJSON(fp.path, &job); err != nil {
+				continue
+			}
+			if strings.TrimSpace(job.Source.Content) == "" {
+				continue
+			}
+			items = append(items, stampedEvent{
+				ev: ChatEvent{Role: "user", Text: job.Source.Content, Time: job.Source.CreatedAt},
+				ts: fp.mtime,
+			})
+		}
+	}
+	// Assistant replies from the outbox (sent; pending = not yet delivered).
+	for _, sub := range []string{"sent", "pending"} {
+		dir := pathIn(bRoot, "outbox", sub)
+		for _, fp := range jsonFilesByMtime(dir) {
+			var out OutputJob
+			if err := ReadJSON(fp.path, &out); err != nil {
+				continue
+			}
+			if !out.Send || strings.TrimSpace(out.Text) == "" {
+				continue
+			}
+			items = append(items, stampedEvent{
+				ev: ChatEvent{Role: "assistant", Text: out.Text},
+				ts: fp.mtime,
+			})
+		}
+	}
+	sort.SliceStable(items, func(i, j int) bool { return items[i].ts < items[j].ts })
+	out := make([]ChatEvent, 0, len(items))
+	for _, it := range items {
+		out = append(out, it.ev)
+	}
+	return out
+}
+
+type fileMtime struct {
+	path  string
+	mtime int64
+}
+
+// jsonFilesByMtime lists *.json files in dir with their modtime (nanos). Missing
+// dir → empty.
+func jsonFilesByMtime(dir string) []fileMtime {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	var out []fileMtime
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		out = append(out, fileMtime{path: filepath.Join(dir, e.Name()), mtime: info.ModTime().UnixNano()})
+	}
+	return out
 }
