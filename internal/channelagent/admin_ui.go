@@ -1,65 +1,101 @@
 package channelagent
 
-// adminIndexHTML is a minimal single-page UI served at /. It calls the same
-// JSON API (sending the bearer token typed into the field), lists bindings,
-// and offers create / delete / restart. Intentionally dependency-free.
+// adminIndexHTML is the single-page admin UI served at /. It styles semantic
+// HTML with Pico.css (classless, ~10KB via CDN — mainstream, no build step, no
+// JS framework, so it stays lightweight) and drives the same JSON API with the
+// bearer token typed into the field. Pico loads from a CDN; if offline the page
+// degrades to unstyled-but-functional HTML.
 const adminIndexHTML = `<!doctype html>
-<html lang="en">
+<html lang="en" data-theme="light">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>claude_cron admin</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
 <style>
-  body { font: 14px system-ui, sans-serif; margin: 2rem; color: #1c1c1c; }
-  h1 { font-size: 1.2rem; }
-  table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
-  th, td { border: 1px solid #ddd; padding: 6px 8px; text-align: left; }
-  th { background: #f5f5f5; }
-  .badge { font-size: 11px; padding: 1px 6px; border-radius: 8px; background: #eee; }
-  button { cursor: pointer; }
-  input { padding: 4px; margin: 2px; }
-  #err { color: #b00; white-space: pre-wrap; }
-  .ok { color: #070; }
+  :root { --pico-font-size: 92%; --pico-spacing: .8rem; }
+  main.container { max-width: 1100px; }
+  article { padding: 1rem 1.2rem; margin: 1rem 0; }
+  article > header { margin: -1rem -1.2rem 1rem; padding: .6rem 1.2rem; }
+  table { font-size: .85rem; margin: 0; }
+  th, td { padding: .4rem .5rem; }
+  .badge { font-size: .72rem; padding: .1rem .5rem; border-radius: 1rem; background: var(--pico-secondary-background); color: var(--pico-secondary-inverse); margin-right: .25rem; white-space: nowrap; }
+  .alive { color: var(--pico-ins-color); font-weight: 600; }
+  .dead { color: var(--pico-del-color); font-weight: 600; }
+  .paused { color: var(--pico-muted-color); }
+  td button, td a[role=button] { width: auto; padding: .15rem .55rem; font-size: .75rem; margin: 0 .15rem 0 0; }
+  button { width: auto; }
+  #err { color: var(--pico-del-color); white-space: pre-wrap; font-size: .85rem; }
+  .ok { color: var(--pico-ins-color); }
+  label { font-size: .8rem; color: var(--pico-muted-color); }
+  label input, label select { margin-top: .2rem; }
+  .row-actions { display: flex; }
 </style>
 </head>
 <body>
-<h1>claude_cron admin</h1>
-<div>
-  Token: <input id="token" type="password" placeholder="bearer token (blank if loopback)" size="30">
-  <button onclick="refresh()">Refresh</button>
-  <span id="msg"></span>
-</div>
-<div id="err"></div>
-<table id="tbl"><thead><tr>
-  <th>name</th><th>platform/mode</th><th>channel</th><th>branch</th><th>session</th><th>queue</th><th></th>
-</tr></thead><tbody></tbody></table>
+<main class="container">
+  <hgroup>
+    <h1>claude_cron admin</h1>
+    <p>bindings · transport · settings</p>
+  </hgroup>
 
-<h2 style="font-size:1rem">Settings</h2>
-<div id="settings">
-  discord transport:
-  <select id="s_dc"><option value="gateway">gateway</option><option value="poll">poll</option></select>
-  &nbsp; telegram transport:
-  <select id="s_tg"><option value="webhook">webhook</option></select><br>
-  push listen: <input id="s_listen" size="18">
-  public_url: <input id="s_url" size="28">
-  secret: <input id="s_secret" type="password" size="18" placeholder="(unchanged)">
-  tg control chat-id: <input id="s_chat" size="14"><br>
-  discord token: <input id="s_dctok" type="password" size="22" placeholder="(unchanged)">
-  telegram token: <input id="s_tgtok" type="password" size="22" placeholder="(unchanged)"><br>
-  <button onclick="saveSettings()">Save &amp; Restart serve</button>
-  <span id="s_msg"></span>
-</div>
+  <article>
+    <div class="grid">
+      <input id="token" type="password" placeholder="bearer token (blank if loopback)" autocomplete="off">
+      <div><button onclick="refresh();loadSettings();">Refresh</button> &nbsp;<span id="msg"></span></div>
+    </div>
+    <div id="err"></div>
+  </article>
 
-<h2 style="font-size:1rem">Create binding</h2>
-<div>
-  <input id="c_name" placeholder="name">
-  <input id="c_dir" placeholder="project dir" size="24">
-  <input id="c_branch" placeholder="branch">
-  <input id="c_platform" placeholder="platform dc|tg" size="10">
-  <input id="c_mode" placeholder="mode poll|push" size="10">
-  <input id="c_chat" placeholder="chat-id (tg)" size="10">
-  <button onclick="create()">Create</button>
-</div>
+  <article>
+    <header><strong>Bindings</strong></header>
+    <div style="overflow-x:auto">
+    <table id="tbl"><thead><tr>
+      <th>name</th><th>transport</th><th>channel</th><th>branch</th><th>session</th><th>queue</th><th>actions</th>
+    </tr></thead><tbody></tbody></table>
+    </div>
+  </article>
+
+  <article>
+    <header><strong>Settings</strong> <small>(saving restarts serve to apply)</small></header>
+    <div class="grid">
+      <label>discord transport
+        <select id="s_dc"><option value="gateway">gateway</option><option value="poll">poll</option></select>
+      </label>
+      <label>telegram transport
+        <select id="s_tg"><option value="webhook">webhook</option></select>
+      </label>
+    </div>
+    <div class="grid">
+      <label>push listen <input id="s_listen" placeholder="127.0.0.1:8788"></label>
+      <label>push public_url <input id="s_url" placeholder="https://…/tg"></label>
+    </div>
+    <div class="grid">
+      <label>push secret <input id="s_secret" type="password" placeholder="(unchanged)" autocomplete="off"></label>
+      <label>tg control chat-id <input id="s_chat"></label>
+    </div>
+    <div class="grid">
+      <label>discord bot token <input id="s_dctok" type="password" placeholder="(unchanged)" autocomplete="off"></label>
+      <label>telegram bot token <input id="s_tgtok" type="password" placeholder="(unchanged)" autocomplete="off"></label>
+    </div>
+    <button onclick="saveSettings()">Save &amp; Restart serve</button> &nbsp;<span id="s_msg"></span>
+  </article>
+
+  <article>
+    <header><strong>Create binding</strong></header>
+    <div class="grid">
+      <input id="c_name" placeholder="name">
+      <input id="c_dir" placeholder="project dir">
+      <input id="c_branch" placeholder="branch">
+    </div>
+    <div class="grid">
+      <input id="c_platform" placeholder="platform dc|tg">
+      <input id="c_mode" placeholder="mode poll|push">
+      <input id="c_chat" placeholder="chat-id (tg)">
+    </div>
+    <button onclick="create()">Create</button>
+  </article>
+</main>
 
 <script>
 function tok() { return document.getElementById('token').value.trim(); }
@@ -79,18 +115,20 @@ async function refresh() {
       var st = await (await fetch('/api/bindings/' + encodeURIComponent(b.name), { headers: hdr() })).json();
       var tr = document.createElement('tr');
       var toggle = b.paused
-        ? '<button onclick="act(\'' + b.name + '\',\'resume\')">resume</button>'
-        : '<button onclick="act(\'' + b.name + '\',\'pause\')">pause</button>';
-      var sessCell = b.paused ? '⏸️ paused' : (b.tmux_session + (st.session_alive ? ' ✅' : ' ⛔'));
+        ? '<button class="secondary" onclick="act(\'' + b.name + '\',\'resume\')">resume</button>'
+        : '<button class="secondary" onclick="act(\'' + b.name + '\',\'pause\')">pause</button>';
+      var sessCell = b.paused
+        ? '<span class="paused">⏸ paused</span>'
+        : (b.tmux_session + (st.session_alive ? ' <span class="alive">●</span>' : ' <span class="dead">●</span>'));
       tr.innerHTML =
-        '<td>' + b.name + '</td>' +
-        '<td><span class="badge">' + b.platform + ' · ' + b.transport + '</span> <span class="badge">' + b.plane + '</span></td>' +
+        '<td><strong>' + b.name + '</strong></td>' +
+        '<td><span class="badge">' + b.platform + ' · ' + b.transport + '</span><span class="badge">' + b.plane + '</span></td>' +
         '<td>' + b.channel_id + '</td>' +
         '<td>' + b.branch + '</td>' +
         '<td>' + sessCell + '</td>' +
         '<td>p' + st.pending + ' / r' + st.processing + ' / f' + st.failed + '</td>' +
-        '<td>' + toggle + ' ' +
-        '<button onclick="del(\'' + b.name + '\')">delete</button></td>';
+        '<td><div class="row-actions">' + toggle +
+        '<button class="contrast outline" onclick="del(\'' + b.name + '\')">delete</button></div></td>';
       body.appendChild(tr);
     }
   } catch (e) { setErr(String(e)); }
