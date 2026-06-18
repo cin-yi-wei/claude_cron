@@ -68,7 +68,7 @@ async function refresh() {
       var sessCell = b.paused ? '⏸️ paused' : (b.tmux_session + (st.session_alive ? ' ✅' : ' ⛔'));
       tr.innerHTML =
         '<td>' + b.name + '</td>' +
-        '<td><span class="badge">' + b.platform + '/' + b.mode + '</span> <span class="badge">' + b.plane + '</span></td>' +
+        '<td><span class="badge">' + b.platform + ' · ' + b.transport + '</span> <span class="badge">' + b.plane + '</span></td>' +
         '<td>' + b.channel_id + '</td>' +
         '<td>' + b.branch + '</td>' +
         '<td>' + sessCell + '</td>' +
