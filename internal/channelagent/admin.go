@@ -28,6 +28,8 @@ type adminBindingDTO struct {
 	ChannelID   string `json:"channel_id"`
 	Branch      string `json:"branch"`
 	TmuxSession string `json:"tmux_session"`
+	Plane       string `json:"plane"`
+	Paused      bool   `json:"paused"`
 }
 
 type adminStatusDTO struct {
@@ -92,6 +94,14 @@ func (h AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			h.restartBinding(w, r, name)
 			return
 		}
+		if name, ok := strings.CutSuffix(rest, "/pause"); ok {
+			h.pauseResume(w, r, name, "pause")
+			return
+		}
+		if name, ok := strings.CutSuffix(rest, "/resume"); ok {
+			h.pauseResume(w, r, name, "resume")
+			return
+		}
 		switch r.Method {
 		case http.MethodGet:
 			h.bindingStatus(w, rest)
@@ -124,6 +134,7 @@ func (h AdminHandler) listBindings(w http.ResponseWriter) {
 		out = append(out, adminBindingDTO{
 			Name: b.Name, Platform: b.PlatformOf(), Mode: b.ModeOf(),
 			ChannelID: b.ChannelID, Branch: b.Branch, TmuxSession: b.TmuxSession,
+			Plane: b.PlaneOf(), Paused: b.Paused,
 		})
 	}
 	writeJSONResponse(w, out)
@@ -221,10 +232,10 @@ func (h AdminHandler) runWrite(w http.ResponseWriter, cmd Command, okStatus int)
 		http.Error(w, "registry error", http.StatusInternalServerError)
 		return
 	}
-	// Admin acts as the discord (default) plane for now; cross-plane god-mode
-	// writes are a later step. Reads (the bindings list) already show all planes.
-	adminPlane := ControlPlane{Name: PlatformDiscord, Platform: PlatformDiscord}
-	reply, changed, herr := HandleCommand(context.Background(), *h.Deps, &reg, cmd, adminPlane)
+	// Admin is god-view: act as whichever plane owns the target binding so manage
+	// ops (unbind/pause/resume) work across planes (e.g. a telegram-plane binding).
+	// For a new bind, use the requested platform's plane (default discord).
+	reply, changed, herr := HandleCommand(context.Background(), *h.Deps, &reg, cmd, h.planeForCommand(cmd, reg))
 	if herr != nil {
 		writeJSONStatus(w, http.StatusBadGateway, map[string]string{"error": herr.Error()})
 		return
@@ -236,6 +247,36 @@ func (h AdminHandler) runWrite(w http.ResponseWriter, cmd Command, okStatus int)
 		}
 	}
 	writeJSONStatus(w, okStatus, map[string]string{"result": reply})
+}
+
+// planeForCommand picks the control plane to run cmd as: an existing target
+// binding's own plane (so cross-plane manage works), else the platform requested
+// for a new bind (default discord).
+func (h AdminHandler) planeForCommand(cmd Command, reg Registry) ControlPlane {
+	if len(cmd.Args) >= 1 {
+		if b, ok := reg.Get(cmd.Args[0]); ok {
+			return ControlPlane{Name: b.PlaneOf(), Platform: b.PlatformOf()}
+		}
+	}
+	name := PlatformDiscord
+	if p, err := normalizePlatform(cmd.opt("platform")); err == nil {
+		name = p
+	}
+	return ControlPlane{Name: name, Platform: name}
+}
+
+// pauseResume handles POST /api/bindings/<name>/{pause,resume} via the shared
+// command path (plane-aware), so it works for any plane's binding.
+func (h AdminHandler) pauseResume(w http.ResponseWriter, r *http.Request, name, action string) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if h.Deps == nil {
+		http.Error(w, "writes disabled", http.StatusServiceUnavailable)
+		return
+	}
+	h.runWrite(w, Command{Name: action, Args: []string{name}, Flags: map[string]bool{}}, http.StatusOK)
 }
 
 func (h AdminHandler) restartBinding(w http.ResponseWriter, r *http.Request, name string) {

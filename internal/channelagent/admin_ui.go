@@ -62,14 +62,18 @@ async function refresh() {
     for (const b of rows) {
       var st = await (await fetch('/api/bindings/' + encodeURIComponent(b.name), { headers: hdr() })).json();
       var tr = document.createElement('tr');
+      var toggle = b.paused
+        ? '<button onclick="act(\'' + b.name + '\',\'resume\')">resume</button>'
+        : '<button onclick="act(\'' + b.name + '\',\'pause\')">pause</button>';
+      var sessCell = b.paused ? '⏸️ paused' : (b.tmux_session + (st.session_alive ? ' ✅' : ' ⛔'));
       tr.innerHTML =
         '<td>' + b.name + '</td>' +
-        '<td><span class="badge">' + b.platform + '/' + b.mode + '</span></td>' +
+        '<td><span class="badge">' + b.platform + '/' + b.mode + '</span> <span class="badge">' + b.plane + '</span></td>' +
         '<td>' + b.channel_id + '</td>' +
         '<td>' + b.branch + '</td>' +
-        '<td>' + b.tmux_session + (st.session_alive ? ' ✅' : ' ⛔') + '</td>' +
+        '<td>' + sessCell + '</td>' +
         '<td>p' + st.pending + ' / r' + st.processing + ' / f' + st.failed + '</td>' +
-        '<td><button onclick="restart(\'' + b.name + '\')">restart</button> ' +
+        '<td>' + toggle + ' ' +
         '<button onclick="del(\'' + b.name + '\')">delete</button></td>';
       body.appendChild(tr);
     }
@@ -98,13 +102,13 @@ async function del(name) {
     setMsg(j.result || 'deleted', true); refresh();
   } catch (e) { setErr(String(e)); }
 }
-async function restart(name) {
+async function act(name, action) {
   setErr('');
   try {
-    var r = await fetch('/api/bindings/' + encodeURIComponent(name) + '/restart', { method: 'POST', headers: hdr() });
+    var r = await fetch('/api/bindings/' + encodeURIComponent(name) + '/' + action, { method: 'POST', headers: hdr() });
     var j = await r.json();
     if (!r.ok) throw new Error(j.error || ('status ' + r.status));
-    setMsg(j.result || 'restarted', true); refresh();
+    setMsg(j.result || (action + ' ok'), true); refresh();
   } catch (e) { setErr(String(e)); }
 }
 refresh();
