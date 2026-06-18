@@ -30,6 +30,9 @@ type adminBindingDTO struct {
 	TmuxSession string `json:"tmux_session"`
 	Plane       string `json:"plane"`
 	Paused      bool   `json:"paused"`
+	// Transport is the ACTUAL ingestion path (gateway/webhook under demux, else the
+	// legacy poll/push mode). Mode is kept for reference but is fallback-only.
+	Transport string `json:"transport"`
 }
 
 type adminStatusDTO struct {
@@ -129,12 +132,13 @@ func (h AdminHandler) listBindings(w http.ResponseWriter) {
 		http.Error(w, "registry error", http.StatusInternalServerError)
 		return
 	}
+	cfg, _ := LoadConfig(h.Root) // for the actual transport (demux-aware); zero cfg is fine
 	out := make([]adminBindingDTO, 0, len(reg.Bindings))
 	for _, b := range reg.Bindings {
 		out = append(out, adminBindingDTO{
 			Name: b.Name, Platform: b.PlatformOf(), Mode: b.ModeOf(),
 			ChannelID: b.ChannelID, Branch: b.Branch, TmuxSession: b.TmuxSession,
-			Plane: b.PlaneOf(), Paused: b.Paused,
+			Plane: b.PlaneOf(), Paused: b.Paused, Transport: cfg.Transport(b),
 		})
 	}
 	writeJSONResponse(w, out)

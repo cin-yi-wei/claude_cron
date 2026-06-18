@@ -39,6 +39,25 @@ type ControlPlane struct {
 	ChannelID string
 }
 
+// Transport returns a binding's ACTUAL message transport, derived from the
+// global demux flags rather than the per-binding mode. Under demux (the current
+// model) every binding of a platform shares one connection, so the legacy
+// per-binding mode (poll/push) no longer drives ingestion — it's only the
+// fallback when demux is off. This keeps display/behaviour aligned with reality.
+func (c Config) Transport(b Binding) string {
+	switch b.PlatformOf() {
+	case PlatformDiscord:
+		if c.Discord.GatewayDemux {
+			return "gateway"
+		}
+	case PlatformTelegram:
+		if c.Telegram.Webhook {
+			return "webhook"
+		}
+	}
+	return b.ModeOf() // poll/push — only meaningful when demux is off
+}
+
 // ControlPlanes returns the configured control entrances: always the Discord
 // plane (back-compat), plus a Telegram plane when ControlConfig.TelegramChatID is
 // set. Token resolution and source/sender selection happen in the supervisor.

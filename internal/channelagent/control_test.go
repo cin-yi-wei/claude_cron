@@ -492,3 +492,23 @@ func TestConfigControlPlanes(t *testing.T) {
 		t.Fatalf("with tg planes = %#v", p)
 	}
 }
+
+func TestConfigTransport(t *testing.T) {
+	var c Config
+	// demux off → falls back to the legacy per-binding mode.
+	if got := c.Transport(Binding{Platform: PlatformDiscord, Mode: ModePush}); got != "push" {
+		t.Fatalf("discord demux-off = %q, want push", got)
+	}
+	if got := c.Transport(Binding{Platform: PlatformDiscord}); got != "poll" {
+		t.Fatalf("discord default = %q, want poll", got)
+	}
+	// demux on → real transport regardless of stored mode.
+	c.Discord.GatewayDemux = true
+	if got := c.Transport(Binding{Platform: PlatformDiscord, Mode: ModePoll}); got != "gateway" {
+		t.Fatalf("discord demux-on = %q, want gateway", got)
+	}
+	c.Telegram.Webhook = true
+	if got := c.Transport(Binding{Platform: PlatformTelegram, Mode: ModePoll}); got != "webhook" {
+		t.Fatalf("telegram webhook = %q, want webhook", got)
+	}
+}
