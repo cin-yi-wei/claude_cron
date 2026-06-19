@@ -126,7 +126,7 @@
         <span class="txt">
           {#each segments(m.text) as seg}
             {#if seg.t === 'diff'}
-              <pre class="code diff">{#each seg.c.split('\n') as ln}<span class="dl {dcls(ln)}">{ln}{'\n'}</span>{/each}</pre>
+              <pre class="code diff">{#each seg.c.split('\n') as ln}<span style={dcls(ln) === 'add' ? 'color:#3fb950' : dcls(ln) === 'del' ? 'color:#f85149' : ''}>{ln}{'\n'}</span>{/each}</pre>
             {:else if seg.t === 'code'}
               <pre class="code">{seg.c}</pre>
             {:else}<span>{seg.c}</span>{/if}
@@ -150,8 +150,7 @@
   .msg .who { flex: 0 0 1.4rem; }
   .msg .txt { white-space: pre-wrap; word-break: break-word; }
   .msg .txt .code { white-space: pre; overflow-x: auto; margin: .2rem 0; padding: .3rem .5rem; border-radius: 4px; background: var(--pico-code-background-color, #1e2030); font-size: .78rem; line-height: 1.3; }
-  .msg .txt .diff .dl.add { color: #3fb950; }
-  .msg .txt .diff .dl.del { color: #f85149; }
+  /* diff line colours are applied inline (Svelte can't keep CSS for runtime-only classes). */
   .msg.assistant .txt { color: var(--pico-color); }
   .msg.user .txt { color: var(--pico-primary); }
   .msg.error .txt { color: var(--pico-del-color); }
