@@ -6,3 +6,31 @@
 main.container {
   max-width: 1100px;
 }
+
+/* Mobile (RWD): tighten spacing, keep wide content scrollable, enlarge tap
+   targets. Pico already collapses .grid to one column on small screens. */
+@media (max-width: 640px) {
+  :root {
+    --pico-font-size: 100%;
+    --pico-spacing: 0.7rem;
+  }
+  article {
+    padding: 0.8rem 0.9rem;
+    margin: 0.7rem 0;
+  }
+  article > header {
+    margin: -0.8rem -0.9rem 0.8rem;
+    padding: 0.5rem 0.9rem;
+  }
+  /* Any wide block (tables, code) scrolls inside its own box instead of
+     widening the page. */
+  table {
+    min-width: 460px;
+  }
+  /* Row action buttons stay comfortably tappable on touch screens. */
+  td button,
+  td a[role='button'] {
+    min-height: 2rem;
+    min-width: 2rem;
+  }
+}

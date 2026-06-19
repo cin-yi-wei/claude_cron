@@ -29,10 +29,10 @@
 </script>
 
 <nav class="container-fluid topnav">
-  <ul>
+  <ul class="brand">
     <li><strong>claude_cron</strong> <small class="muted">admin</small></li>
   </ul>
-  <ul>
+  <ul class="links">
     {#each nav as n}
       <li><a href={n.href} class={route.view === n.id ? 'active' : ''}>{t(n.key)}</a></li>
     {/each}
@@ -41,7 +41,7 @@
         {#each LOCALES as l}<option value={l.id}>{l.label}</option>{/each}
       </select>
     </li>
-    <li><input class="tok" type="password" bind:value={token} placeholder={t('common.token')} autocomplete="off" /></li>
+    <li class="tok-li"><input class="tok" type="password" bind:value={token} placeholder={t('common.token')} autocomplete="off" /></li>
   </ul>
 </nav>
 
@@ -66,12 +66,24 @@
 </main>
 
 <style>
-  .topnav { padding: 0 1rem; border-bottom: 1px solid var(--pico-muted-border-color); position: sticky; top: 0; background: var(--pico-background-color); z-index: 10; }
-  .topnav ul { margin: 0; }
+  .topnav { padding: 0 1rem; border-bottom: 1px solid var(--pico-muted-border-color); position: sticky; top: 0; background: var(--pico-background-color); z-index: 10; flex-wrap: wrap; gap: .25rem; }
+  .topnav ul { margin: 0; flex-wrap: wrap; }
   .topnav a { padding: .4rem .6rem; border-radius: var(--pico-border-radius); text-decoration: none; }
   .topnav a.active { background: var(--pico-primary-background); color: var(--pico-primary-inverse); }
   .muted { color: var(--pico-muted-color); }
   .lang { width: auto; font-size: .75rem; padding: .15rem 1.4rem .15rem .4rem; margin: 0; }
   .tok { width: 120px; font-size: .75rem; padding: .2rem .4rem; margin: 0; }
   main.container { max-width: 1000px; padding-top: 1rem; }
+
+  /* Mobile: stack the brand above a wrapping link row; token input goes
+     full-width on its own line so the nav never overflows. */
+  @media (max-width: 640px) {
+    .topnav { padding: .25rem .6rem; }
+    .topnav .brand { width: 100%; }
+    .topnav .links { width: 100%; justify-content: flex-start; gap: .15rem; }
+    .topnav a { padding: .45rem .55rem; font-size: .9rem; }
+    .tok-li { flex: 1 1 100%; }
+    .tok { width: 100%; }
+    main.container { padding-top: .6rem; }
+  }
 </style>
