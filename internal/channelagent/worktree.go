@@ -48,9 +48,12 @@ func waitSessionReady(ctx context.Context, session string) {
 // binding's worktree so the driven agent can read the job, write its reply, and
 // rename the output file without interactive permission prompts (which a
 // tmux-driven session cannot answer). Scoped to the tools the agent prompt uses.
+// WebFetch/WebSearch are allowed outright (read-only, low-risk) so a tmux-driven
+// session never hangs on Claude Code's native domain-approval prompt — which it
+// cannot answer interactively. Risky Bash + MCP still route through the gate.
 const agentSettings = `{
   "permissions": {
-    "allow": ["Read", "Write", "Edit"]
+    "allow": ["Read", "Write", "Edit", "WebFetch", "WebSearch"]
   },
   "hooks": {
     "PreToolUse": [
