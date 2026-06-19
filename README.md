@@ -2,9 +2,13 @@
 
 Claude Cron watches Discord or Telegram messages, injects each message into a long-running Claude Code tmux session, waits for Claude to write a reply file, then sends the verified reply back.
 
-It also runs a **multi-project control plane**: a single `serve` supervisor can manage many `Discord channel ↔ tmux Claude session` bindings, dispatched from a control channel with `/bind`, `/unbind`, `/list`, and `/status` commands. Each binding is isolated on its own git worktree branch. The control channel is also an AI assistant — free-text messages are answered by a dedicated Claude session that can manage bindings and run shell tasks. See [Multi-Project Control Plane](#multi-project-control-plane).
+It also runs a **multi-project control plane**: a single `serve` supervisor can manage many `channel ↔ tmux Claude session` bindings, dispatched from a control channel with `/bind`, `/unbind`, `/list`, and `/status` commands. Each binding is isolated on its own git worktree branch. The control channel is also an AI assistant — free-text messages are answered by a dedicated Claude session that can manage bindings and run shell tasks. See [Multi-Project Control Plane](#multi-project-control-plane).
+
+Control planes are themselves registry bindings, so Discord, Telegram, and a built-in **web admin UI** are all managed the same way. The web UI (served at `/app/`) lists bindings, streams each session's live activity, and lets you chat with any session from the browser. See [Web Admin UI](#web-admin-ui).
 
 It is built as a single CLI binary. Users do not need Go unless they want to build from source.
+
+> **Billing:** workers run Claude in an interactive `tmux` PTY on purpose — interactive Claude authenticates with the Claude **subscription** quota, while `claude -p` / headless / SDK go through the pay-per-token API credit pool. Sessions are launched with `env -u ANTHROPIC_API_KEY claude` so a stray API key never silently switches billing to the API.
 
 ## Install From GitHub Release
 
@@ -145,6 +149,29 @@ claude-cron notify <channel-id> "build finished ✅" --root .channel-agent
 ```
 
 Agents are instructed (in their job prompt) to end long detached background tasks with `&& claude-cron notify <their-channel-id> "..." --root <root>` so you get pinged when the work is done.
+
+## Web Admin UI
+
+`serve` also exposes an in-process admin server (default `0.0.0.0:8787`). Open `/` (redirects to `/app/`) for the Svelte admin UI:
+
+- **Bindings** — list every binding (worker + control planes) with live status; sleeping sessions show 💤 and can still be chatted with (they wake on demand).
+- **Chat** — open any session in the browser. Messages stream live over SSE; the transcript is paginated and catches up on reconnect, so you can talk to a session from the web exactly as from Discord/Telegram.
+- **Activity** — each session's tool use is streamed as it happens (💭 thinking / ▶ text / 🔧 tool), with code edits rendered as colored diffs.
+- **Create / Settings** — create new bindings (worker or control) and edit runtime settings.
+
+The same activity stream is mirrored to the chat channels: Discord renders diffs as colored ```ansi blocks, Telegram uses HTML, and the web UI renders inline-colored diffs with syntax highlighting.
+
+> Security: the admin server has full control over bindings and shell-capable sessions. Front it with an authenticating proxy (e.g. Cloudflare Access) and keep the admin token secret.
+
+## Resilience
+
+`serve` keeps long-running sessions healthy without manual babysitting:
+
+- **Auto-sleep / wake** — a worker session idle past `idle_sleep_minutes` (default 30) is stopped to free RAM; the next message for that binding wakes it (recreating the tmux session and resuming the transcript) before delivery. Control sessions never auto-sleep.
+- **Stall watchdog** — a session whose transcript stops advancing past `stall_minutes` (default 10) while a job is in flight is restarted; after repeated failures the stuck job is failed out so the queue keeps moving.
+- **Inject retry** — a message that fails to land (e.g. a session still cold from `--resume`) is requeued and retried up to a few times before being moved to `failed`, instead of being lost.
+- **Permission gate** — a `PreToolUse` hook routes tool approvals (Bash / WebFetch / WebSearch / MCP on workers) to the channel as a `y/n` prompt, so a session never hangs on an unanswerable permission dialog.
+- **SessionStart hook** — records the exact transcript path per session so activity streaming and the stall watchdog read the right file across resumes.
 
 ## Useful Commands
 
