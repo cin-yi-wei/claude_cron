@@ -7,8 +7,38 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
+	"strings"
 )
+
+var discordDiffFenceRE = regexp.MustCompile("(?s)```diff\\n(.*?)```")
+
+// discordColorDiff rewrites ```diff blocks to ```ansi blocks with real ANSI
+// colour codes — Discord renders ```ansi reliably (− red, + green), unlike its
+// dim/inconsistent ```diff highlighting. Other platforms keep ```diff.
+func discordColorDiff(text string) string {
+	if !strings.Contains(text, "```diff") {
+		return text
+	}
+	return discordDiffFenceRE.ReplaceAllStringFunc(text, func(m string) string {
+		inner := strings.TrimSuffix(strings.TrimPrefix(m, "```diff\n"), "```")
+		var b strings.Builder
+		b.WriteString("```ansi\n")
+		for _, ln := range strings.Split(strings.TrimRight(inner, "\n"), "\n") {
+			switch {
+			case strings.HasPrefix(ln, "- "):
+				b.WriteString("\x1b[31m" + ln + "\x1b[0m\n")
+			case strings.HasPrefix(ln, "+ "):
+				b.WriteString("\x1b[32m" + ln + "\x1b[0m\n")
+			default:
+				b.WriteString(ln + "\n")
+			}
+		}
+		b.WriteString("```")
+		return b.String()
+	})
+}
 
 const defaultDiscordBaseURL = "https://discord.com/api/v10"
 
@@ -117,7 +147,7 @@ func (s DiscordSender) Send(ctx context.Context, output OutputJob) error {
 	if client == nil {
 		client = http.DefaultClient
 	}
-	body, err := json.Marshal(map[string]string{"content": output.Text})
+	body, err := json.Marshal(map[string]string{"content": discordColorDiff(output.Text)})
 	if err != nil {
 		return err
 	}
