@@ -185,6 +185,33 @@ func TestUnbindLeavesTombstoneAndRebindReusesChannel(t *testing.T) {
 	}
 }
 
+func TestUnbindDeleteChannelFlagDeletesAndLeavesNoTombstone(t *testing.T) {
+	root := filepath.Join(t.TempDir(), ".channel-agent")
+	if err := Init(root); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	var actions []string
+	deps := newTestDeps(root, &actions)
+	reg := Registry{}
+	projectDir := t.TempDir()
+
+	cmd, _ := ParseCommand("/bind proj-a " + projectDir + " ticket-1")
+	if _, _, err := HandleCommand(context.Background(), deps, &reg, cmd, ControlPlane{}); err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+
+	cmd2, _ := ParseCommand("/unbind proj-a --delete-channel")
+	if _, _, err := HandleCommand(context.Background(), deps, &reg, cmd2, ControlPlane{}); err != nil {
+		t.Fatalf("unbind: %v", err)
+	}
+	if !containsStr(actions, "delete:chan-proj-a") {
+		t.Fatalf("--delete-channel should delete the channel, actions=%#v", actions)
+	}
+	if _, ok := reg.UnboundByName("proj-a"); ok {
+		t.Fatal("deleted channel must NOT leave a rebind tombstone")
+	}
+}
+
 func TestHandleBindRejectsReservedControlName(t *testing.T) {
 	root := filepath.Join(t.TempDir(), ".channel-agent")
 	_ = Init(root)

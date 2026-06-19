@@ -69,7 +69,7 @@ type ControlDeps struct {
 	InitRoot       func(root string) error
 }
 
-const controlUsage = "指令: /bind <name> <project-dir> <branch> [--platform=dc|tg] [--mode=poll|push] [--chat-id=<id> (tg)] | /bind <name> --control [--platform=web|dc|tg] [--chat-id=<id>] | /unbind <name> | /pause <name> | /resume <name> | /set-default <name> | /list | /status <name> | /help"
+const controlUsage = "指令: /bind <name> <project-dir> <branch> [--platform=dc|tg] [--mode=poll|push] [--chat-id=<id> (tg)] | /bind <name> --control [--platform=web|dc|tg] [--chat-id=<id>] | /unbind <name> [--delete-channel] | /pause <name> | /resume <name> | /set-default <name> | /list | /status <name> | /help"
 
 // HandleCommand executes a parsed control command against the registry, using
 // deps for side effects. Returns a reply to post to the control channel and
@@ -339,7 +339,7 @@ func handleBindControl(ctx context.Context, deps ControlDeps, reg *Registry, cmd
 
 func handleUnbind(ctx context.Context, deps ControlDeps, reg *Registry, cmd Command, plane ControlPlane) (string, bool, error) {
 	if len(cmd.Args) != 1 {
-		return "用法: /unbind <name>", false, nil
+		return "用法: /unbind <name> [--delete-channel]", false, nil
 	}
 	name := cmd.Args[0]
 	b, ok := reg.Get(name)
@@ -368,13 +368,19 @@ func handleUnbind(ctx context.Context, deps ControlDeps, reg *Registry, cmd Comm
 		warn = "（⚠️ worktree 清理可能不完全: " + err.Error() + "）"
 	}
 	_ = os.RemoveAll(b.Root)
-	// Leave a tombstone so that if someone later messages the kept Discord
-	// channel, the supervisor can offer to rebind it (see dcRoute).
-	if b.PlatformOf() == PlatformDiscord && b.ChannelID != "" {
+	// delete-channel (web UI only, behind a confirm + opt-in checkbox): also
+	// delete the Discord channel. Telegram chats are the user's, never deleted.
+	// When the channel is deleted there is nothing to rebind, so no tombstone.
+	channelMsg := "（git 分支與 Discord 頻道都保留；之後在該頻道發言我會問你要不要 rebind）"
+	if cmd.Flags["delete-channel"] && b.PlatformOf() == PlatformDiscord && b.ChannelID != "" {
+		_ = deps.DeleteChannel(ctx, b.ChannelID)
+		channelMsg = "（git 分支保留；Discord 頻道已刪除）"
+	} else if b.PlatformOf() == PlatformDiscord && b.ChannelID != "" {
+		// Leave a tombstone so a later message in the kept channel offers a rebind.
 		reg.AddUnbound(UnboundChannel{Name: name, ChannelID: b.ChannelID, ProjectDir: b.ProjectDir, Branch: b.Branch, Plane: b.PlaneOf()})
 	}
 	reg.Remove(name)
-	return fmt.Sprintf("🗑️ 解綁 %s 完成%s（git 分支與 Discord 頻道都保留；之後在該頻道發言我會問你要不要 rebind）", name, warn), true, nil
+	return fmt.Sprintf("🗑️ 解綁 %s 完成%s%s", name, warn, channelMsg), true, nil
 }
 
 // handlePause hot-stops a binding: kills its tmux session to free memory but
@@ -555,7 +561,7 @@ func controlSystemPrompt(root, workspace, planeName string) string {
 
 要管理「頻道 ↔ Claude session」綁定時，用以下 CLI（root 用絕對路徑 %s）：
   claude-cron bind <name> <project-dir> <branch> --root %s%s
-  claude-cron unbind <name> --root %s%s
+  claude-cron unbind <name> [--delete-channel] --root %s%s
   claude-cron list --root %s%s
 
 name 只能用小寫字母、數字、減號。回覆使用者時直接用一般文字即可。%s`,

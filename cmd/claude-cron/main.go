@@ -345,6 +345,8 @@ func runManageCommand(name string, rest []string, stdout, stderr io.Writer) int 
 			}
 			root = rest[i+1]
 			i++
+		case rest[i] == "--delete-channel":
+			flags["delete-channel"] = true
 		case strings.HasPrefix(rest[i], "--"):
 			// --key=value options (e.g. --platform=tg); bare --flag (e.g. --control).
 			kv := strings.TrimPrefix(rest[i], "--")

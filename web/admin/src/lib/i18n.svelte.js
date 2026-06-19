@@ -46,7 +46,12 @@ const dict = {
     'create.chatid': 'chat-id（tg）',
     'create.controlHint': 'Control 不用綁目錄/分支。第一個建立的 control 會成為受保護的預設🛡。',
     'create.submit': '建立',
-    'unbind.confirm': '確定解綁 {name}？',
+    'unbind.title': '解綁 {name}',
+    'unbind.confirm': '確定解綁 {name}？（git 分支保留）',
+    'unbind.deletechannel': '連同 Discord 頻道一起刪除（含所有訊息，無法復原；預設不刪）',
+    'unbind.confirm.keep': '解綁（保留頻道）',
+    'unbind.confirm.both': '解綁並刪除頻道',
+    'common.cancel': '取消',
   },
   en: {
     'app.subtitle': 'bindings + in-browser chat',
@@ -91,7 +96,12 @@ const dict = {
     'create.chatid': 'chat-id (tg)',
     'create.controlHint': 'Control needs no dir/branch. The first control created becomes the protected default 🛡.',
     'create.submit': 'Create',
-    'unbind.confirm': 'unbind {name}?',
+    'unbind.title': 'Unbind {name}',
+    'unbind.confirm': 'Unbind {name}? (git branch is kept)',
+    'unbind.deletechannel': 'Also delete the Discord channel (and all its messages — irreversible; off by default)',
+    'unbind.confirm.keep': 'Unbind (keep channel)',
+    'unbind.confirm.both': 'Unbind & delete channel',
+    'common.cancel': 'Cancel',
   },
 };
 

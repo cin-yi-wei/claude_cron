@@ -285,10 +285,13 @@ func (h AdminHandler) deleteBinding(w http.ResponseWriter, r *http.Request, name
 		http.Error(w, "writes disabled", http.StatusServiceUnavailable)
 		return
 	}
-	// Channel deletion is intentionally unsupported: unbind never removes the
-	// Discord channel (too dangerous — it would destroy chat history). To delete
-	// a channel, do it manually in Discord.
+	// delete_channel=true also deletes the Discord channel. The web UI gates this
+	// behind a confirm dialog + an opt-in checkbox (default off), so it can't
+	// happen by a stray click.
 	cmd := Command{Name: "unbind", Args: []string{name}, Flags: map[string]bool{}}
+	if r.URL.Query().Get("delete_channel") == "true" {
+		cmd.Flags["delete-channel"] = true
+	}
 	h.runWrite(w, cmd, http.StatusOK)
 }
 

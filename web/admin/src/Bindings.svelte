@@ -35,9 +35,18 @@
     } catch (e) { err = String(e); }
   }
 
-  function del(name) {
-    if (!confirm(t('unbind.confirm', { name }))) return;
-    act(name, 'delete', 'DELETE', '/api/bindings/' + encodeURIComponent(name));
+  let delTarget = $state(null);   // binding being deleted (opens the modal)
+  let delChannel = $state(false); // opt-in: also delete the dc/tg channel
+
+  function del(b) { delTarget = b; delChannel = false; }
+  function cancelDel() { delTarget = null; }
+  function confirmDel() {
+    const name = delTarget.name;
+    const wantChannel = delChannel && delTarget.platform === 'discord';
+    let url = '/api/bindings/' + encodeURIComponent(name);
+    if (wantChannel) url += '?delete_channel=true';
+    delTarget = null;
+    act(name, 'delete', 'DELETE', url);
   }
 
   $effect(() => { refresh(); });
@@ -76,7 +85,7 @@
                 <button class="mini secondary" onclick={() => act(b.name, 'restart')}>⟳</button>
               {/if}
               {#if !(b.control && b.default)}
-                <button class="mini contrast outline" onclick={() => del(b.name)}>🗑</button>
+                <button class="mini contrast outline" onclick={() => del(b)}>🗑</button>
               {/if}
             </td>
           </tr>
@@ -88,6 +97,25 @@
     </table>
   </div>
 </article>
+
+{#if delTarget}
+  <dialog open>
+    <article>
+      <header><strong>{t('unbind.title', { name: delTarget.name })}</strong></header>
+      <p>{t('unbind.confirm', { name: delTarget.name })}</p>
+      {#if delTarget.platform === 'discord'}
+        <label>
+          <input type="checkbox" bind:checked={delChannel} />
+          {t('unbind.deletechannel')}
+        </label>
+      {/if}
+      <footer>
+        <button class="secondary" onclick={cancelDel}>{t('common.cancel')}</button>
+        <button class="contrast" onclick={confirmDel}>{delChannel ? t('unbind.confirm.both') : t('unbind.confirm.keep')}</button>
+      </footer>
+    </article>
+  </dialog>
+{/if}
 
 <style>
   .badge { font-size: .72rem; padding: .1rem .5rem; border-radius: 1rem; background: var(--pico-secondary-background); color: var(--pico-secondary-inverse); }
