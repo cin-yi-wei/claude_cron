@@ -126,6 +126,65 @@ func TestHandleBindThenUnbind(t *testing.T) {
 	}
 }
 
+func TestUnbindLeavesTombstoneAndRebindReusesChannel(t *testing.T) {
+	root := filepath.Join(t.TempDir(), ".channel-agent")
+	if err := Init(root); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	var actions []string
+	deps := newTestDeps(root, &actions)
+	reg := Registry{}
+	projectDir := t.TempDir()
+
+	cmd, _ := ParseCommand("/bind proj-a " + projectDir + " ticket-1")
+	if _, _, err := HandleCommand(context.Background(), deps, &reg, cmd, ControlPlane{}); err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+	orig, _ := reg.Get("proj-a")
+
+	cmd2, _ := ParseCommand("/unbind proj-a")
+	if _, _, err := HandleCommand(context.Background(), deps, &reg, cmd2, ControlPlane{}); err != nil {
+		t.Fatalf("unbind: %v", err)
+	}
+	u, ok := reg.UnboundByName("proj-a")
+	if !ok || u.ChannelID != orig.ChannelID || u.Branch != "ticket-1" {
+		t.Fatalf("tombstone wrong: %#v ok=%v", u, ok)
+	}
+
+	// Count channel creations so far (one).
+	creates := 0
+	for _, a := range actions {
+		if a == "create:proj-a" {
+			creates++
+		}
+	}
+
+	cmd3, _ := ParseCommand("/bind proj-a " + projectDir + " ticket-1")
+	reply, _, err := HandleCommand(context.Background(), deps, &reg, cmd3, ControlPlane{})
+	if err != nil {
+		t.Fatalf("rebind: %v", err)
+	}
+	if !strings.Contains(reply, "重新綁定") {
+		t.Fatalf("rebind reply should say 重新綁定, got %q", reply)
+	}
+	b, _ := reg.Get("proj-a")
+	if b.ChannelID != orig.ChannelID {
+		t.Fatalf("rebind channel = %q, want reused %q", b.ChannelID, orig.ChannelID)
+	}
+	if _, ok := reg.UnboundByName("proj-a"); ok {
+		t.Fatal("tombstone should be cleared after rebind")
+	}
+	creates2 := 0
+	for _, a := range actions {
+		if a == "create:proj-a" {
+			creates2++
+		}
+	}
+	if creates2 != creates {
+		t.Fatalf("rebind must NOT create a new channel: creates %d -> %d", creates, creates2)
+	}
+}
+
 func TestHandleBindRejectsReservedControlName(t *testing.T) {
 	root := filepath.Join(t.TempDir(), ".channel-agent")
 	_ = Init(root)

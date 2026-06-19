@@ -112,8 +112,63 @@ func (b Binding) ModeOf() string {
 	return b.Mode
 }
 
+// UnboundChannel is a tombstone left when a Discord worker binding is unbound:
+// the channel is kept (we never delete channels) but no longer has a session.
+// If a message later lands in such a channel (seen via the Gateway demux), the
+// supervisor pings the control channel offering to rebind. Cleared on rebind.
+type UnboundChannel struct {
+	Name       string `json:"name"`
+	ChannelID  string `json:"channel_id"`
+	ProjectDir string `json:"project_dir"`
+	Branch     string `json:"branch"`
+	Plane      string `json:"plane,omitempty"`
+}
+
 type Registry struct {
-	Bindings []Binding `json:"bindings"`
+	Bindings []Binding        `json:"bindings"`
+	Unbound  []UnboundChannel `json:"unbound,omitempty"`
+}
+
+// AddUnbound records (or refreshes) a tombstone, keyed by channel id.
+func (r *Registry) AddUnbound(u UnboundChannel) {
+	for i := range r.Unbound {
+		if r.Unbound[i].ChannelID == u.ChannelID {
+			r.Unbound[i] = u
+			return
+		}
+	}
+	r.Unbound = append(r.Unbound, u)
+}
+
+// UnboundByChannel returns the tombstone for a channel id, if any.
+func (r *Registry) UnboundByChannel(channelID string) (UnboundChannel, bool) {
+	for _, u := range r.Unbound {
+		if u.ChannelID == channelID {
+			return u, true
+		}
+	}
+	return UnboundChannel{}, false
+}
+
+// UnboundByName returns the tombstone for a binding name, if any.
+func (r *Registry) UnboundByName(name string) (UnboundChannel, bool) {
+	for _, u := range r.Unbound {
+		if u.Name == name {
+			return u, true
+		}
+	}
+	return UnboundChannel{}, false
+}
+
+// RemoveUnboundByName drops a tombstone by binding name (called on rebind).
+func (r *Registry) RemoveUnboundByName(name string) bool {
+	for i := range r.Unbound {
+		if r.Unbound[i].Name == name {
+			r.Unbound = append(r.Unbound[:i], r.Unbound[i+1:]...)
+			return true
+		}
+	}
+	return false
 }
 
 var validNameRE = regexp.MustCompile(`^[a-z0-9-]+$`)

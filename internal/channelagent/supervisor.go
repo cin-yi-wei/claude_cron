@@ -7,8 +7,43 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
+
+var (
+	unboundAnnounceMu  sync.Mutex
+	unboundAnnouncedAt = map[string]time.Time{}
+)
+
+const unboundAnnounceCooldown = 10 * time.Minute
+
+// announceUnboundMessage pings the Discord control channel that a kept-but-
+// unbound channel just received a message, offering a one-line rebind that
+// reconnects the SAME channel + its old conversation. Debounced per channel so a
+// chatty orphan channel can't spam the control channel.
+func announceUnboundMessage(ctx context.Context, cfg Config, token string, u UnboundChannel, msg SourceMessage) {
+	controlCh := cfg.Discord.ChannelID
+	if controlCh == "" || controlCh == u.ChannelID {
+		return
+	}
+	unboundAnnounceMu.Lock()
+	if last, seen := unboundAnnouncedAt[u.ChannelID]; seen && time.Since(last) < unboundAnnounceCooldown {
+		unboundAnnounceMu.Unlock()
+		return
+	}
+	unboundAnnouncedAt[u.ChannelID] = time.Now()
+	unboundAnnounceMu.Unlock()
+
+	snippet := strings.TrimSpace(msg.Content)
+	if r := []rune(snippet); len(r) > 80 {
+		snippet = string(r[:80]) + "…"
+	}
+	text := fmt.Sprintf("🔌 <#%s> 收到訊息但目前未綁定（之前是 `%s`）。\n> %s\n要重新綁定就回我，或直接下：`/bind %s %s %s`（會接回這個頻道＋原本的對話）。",
+		u.ChannelID, u.Name, snippet, u.Name, u.ProjectDir, u.Branch)
+	sender := DiscordSender{BaseURL: cfg.Discord.BaseURL, Token: token, ChannelID: controlCh}
+	_ = sender.Send(ctx, OutputJob{Schema: 1, Send: true, Text: text})
+}
 
 // runControlAssistant ensures the control assistant workspace exists and drives
 // one worker+sender cycle for any queued free-text control jobs. injector and
@@ -127,6 +162,11 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 				if b.Control && b.PlatformOf() == PlatformDiscord && !b.Paused && b.ChannelID == msg.ChannelID {
 					return appendTelegramBuffer(pathIn(b.Root, "state", controlBufferName(PlatformDiscord)), msg)
 				}
+			}
+			// Unbound (tombstoned) channel: a message landed in a channel we kept
+			// after /unbind. Ping the control channel offering to rebind, debounced.
+			if u, ok := reg2.UnboundByChannel(msg.ChannelID); ok {
+				announceUnboundMessage(ctx, cfg, token, u, msg)
 			}
 			return nil // unknown channel → dropped
 		}

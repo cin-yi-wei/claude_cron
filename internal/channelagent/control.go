@@ -180,19 +180,30 @@ func handleBind(ctx context.Context, deps ControlDeps, reg *Registry, cmd Comman
 		if channelID == "" {
 			return "telegram 綁定需要 --chat-id=<chat id>", false, nil
 		}
-	} else {
-		var err error
-		channelID, err = deps.CreateChannel(ctx, deps.GuildID, name)
-		if err != nil {
-			return "", false, fmt.Errorf("建頻道失敗: %w", err)
+	}
+	// Discord: rebind reuses the original channel if a tombstone exists for this
+	// name (so /bind <name> ... after an /unbind reconnects the SAME channel and
+	// its history); otherwise create a fresh one.
+	reusedChannel := false
+	if platform == PlatformDiscord {
+		if u, ok := reg.UnboundByName(name); ok && u.ChannelID != "" {
+			channelID = u.ChannelID
+			reusedChannel = true
+		} else {
+			var err error
+			channelID, err = deps.CreateChannel(ctx, deps.GuildID, name)
+			if err != nil {
+				return "", false, fmt.Errorf("建頻道失敗: %w", err)
+			}
 		}
 	}
 	b.ChannelID = channelID
 
-	// On failure, only tear down a channel we created. A Telegram chat is the
-	// user's, never ours to delete.
+	// On failure, only tear down a channel we just CREATED. Never a reused
+	// (rebind) channel — it predates this bind and may hold history. A Telegram
+	// chat is the user's, never ours to delete.
 	cleanupChannel := func() {
-		if platform == PlatformDiscord {
+		if platform == PlatformDiscord && !reusedChannel {
 			_ = deps.DeleteChannel(ctx, channelID)
 		}
 	}
@@ -219,7 +230,12 @@ func handleBind(ctx context.Context, deps ControlDeps, reg *Registry, cmd Comman
 		cleanupChannel()
 		return "", false, err
 	}
-	return fmt.Sprintf("✅ 綁定 %s [%s/%s] → channel %s (branch %s, session %s)", name, b.PlatformOf(), b.ModeOf(), channelID, branch, b.TmuxSession), true, nil
+	reg.RemoveUnboundByName(name) // rebound → clear any tombstone
+	verb := "綁定"
+	if reusedChannel {
+		verb = "重新綁定"
+	}
+	return fmt.Sprintf("✅ %s %s [%s/%s] → channel %s (branch %s, session %s)", verb, name, b.PlatformOf(), b.ModeOf(), channelID, branch, b.TmuxSession), true, nil
 }
 
 // normalizePlatform maps user input (incl. dc/tg aliases) to a canonical
@@ -352,8 +368,13 @@ func handleUnbind(ctx context.Context, deps ControlDeps, reg *Registry, cmd Comm
 		warn = "（⚠️ worktree 清理可能不完全: " + err.Error() + "）"
 	}
 	_ = os.RemoveAll(b.Root)
+	// Leave a tombstone so that if someone later messages the kept Discord
+	// channel, the supervisor can offer to rebind it (see dcRoute).
+	if b.PlatformOf() == PlatformDiscord && b.ChannelID != "" {
+		reg.AddUnbound(UnboundChannel{Name: name, ChannelID: b.ChannelID, ProjectDir: b.ProjectDir, Branch: b.Branch, Plane: b.PlaneOf()})
+	}
 	reg.Remove(name)
-	return fmt.Sprintf("🗑️ 解綁 %s 完成%s（git 分支與 Discord 頻道都保留）", name, warn), true, nil
+	return fmt.Sprintf("🗑️ 解綁 %s 完成%s（git 分支與 Discord 頻道都保留；之後在該頻道發言我會問你要不要 rebind）", name, warn), true, nil
 }
 
 // handlePause hot-stops a binding: kills its tmux session to free memory but
