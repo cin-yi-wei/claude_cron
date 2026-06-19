@@ -118,7 +118,20 @@
 
   $effect(() => {
     loadInitial().then(connect);
-    return () => { if (es) es.close(); };
+    // SSE only pushes to currently-connected clients — messages that arrive while
+    // the page is backgrounded (e.g. phone screen off, browser freezes the
+    // connection) are missed. On resume, re-fetch the latest history (persisted,
+    // so it includes anything missed) and reconnect the stream.
+    const onVis = () => {
+      if (document.visibilityState !== 'visible') return;
+      loadInitial();
+      connect();
+    };
+    document.addEventListener('visibilitychange', onVis);
+    return () => {
+      document.removeEventListener('visibilitychange', onVis);
+      if (es) es.close();
+    };
   });
 
   // Split a message into plain-text and fenced-code segments so ```diff blocks
