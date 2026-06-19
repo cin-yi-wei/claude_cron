@@ -80,6 +80,33 @@ func TestDefaultControlProtected(t *testing.T) {
 	}
 }
 
+func TestSeedControlPlanes(t *testing.T) {
+	root := t.TempDir()
+	cfg := Config{}
+	cfg.Discord.ChannelID = "dc-chan"
+	cfg.Control.TelegramChatID = "tg-chat"
+
+	reg := Registry{}
+	if !seedControlPlanes(root, cfg, &reg) {
+		t.Fatal("first seed should change registry")
+	}
+	dc, ok := reg.Get(PlatformDiscord)
+	if !ok || !dc.Control || !dc.Default || dc.TmuxSession != "cc-dc-control" || dc.ChannelID != "dc-chan" {
+		t.Fatalf("seeded discord = %#v", dc)
+	}
+	tg, ok := reg.Get(PlatformTelegram)
+	if !ok || !tg.Control || tg.Default || tg.TmuxSession != "cc-tg-control" {
+		t.Fatalf("seeded telegram = %#v", tg)
+	}
+	// Idempotent: a second seed makes no change.
+	if seedControlPlanes(root, cfg, &reg) {
+		t.Fatal("second seed should be a no-op")
+	}
+	if len(reg.Bindings) != 2 {
+		t.Fatalf("bindings = %d, want 2", len(reg.Bindings))
+	}
+}
+
 func TestSetDefaultTransferThenDelete(t *testing.T) {
 	root := t.TempDir()
 	if err := Init(root); err != nil {

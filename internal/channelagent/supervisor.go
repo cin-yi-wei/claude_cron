@@ -47,6 +47,18 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 		return err
 	}
 
+	// Unified control model: seed the configured (hardcoded) control planes as
+	// registry control bindings so they appear in the list and are manageable.
+	// Each reuses the EXISTING control-<x> root/session/workspace + plane name, so
+	// the registry control loop (below) runs it IDENTICALLY to the legacy
+	// hardcoded path (which is guarded off once seeded). Discord is the bootstrap
+	// lifeline → forced as the protected default.
+	if seedControlPlanes(root, cfg, &reg) {
+		if err := SaveRegistry(root, reg); err != nil {
+			return err
+		}
+	}
+
 	deps := BuildControlDeps(root, cfg)
 
 	// activePush tracks every push ingester/webhook that should stay alive this
@@ -123,52 +135,46 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 		activePush["__dc_demux__"] = true
 	}
 
-	controlPoll := DiscordSource{BaseURL: cfg.Discord.BaseURL, Token: token, ChannelID: cfg.Discord.ChannelID, Limit: 50}
-	var controlSource MessageSource = controlPoll
-	if cfg.DiscordTransport() == TransportGateway {
-		// Phase C: control is fed by the shared demux buffer + poll backstop; no
-		// separate __control_gw__ connection. The always-run poll keeps the lifeline
-		// safe if the demux drops.
-		controlSource = BufferPollSource{BufferPath: controlBufferPath(root, PlatformDiscord), Poll: controlPoll}
-	} else if cfg.Control.Mode == ModePush && push != nil {
-		// Gateway-fed control with poll always-on as backstop (lifeline channel).
-		cs := push.ControlSource(controlPoll)
-		push.Ensure("__control_gw__", cs.gatewayIngester(token, cfg.Discord.ChannelID, cfg.Discord.BaseURL), func(e error) {
-			if e != nil {
-				fmt.Fprintf(stdout, "control gateway exited (poll backstop continues): %v\n", e)
+	// Legacy hardcoded Discord control execution. Guarded off once the registry
+	// has a "discord" control binding (seeded above) — the registry control loop
+	// then runs it identically. Kept as a fallback if the seed is ever absent.
+	if !hasControlNamed(&reg, PlatformDiscord) {
+		controlPoll := DiscordSource{BaseURL: cfg.Discord.BaseURL, Token: token, ChannelID: cfg.Discord.ChannelID, Limit: 50}
+		var controlSource MessageSource = controlPoll
+		if cfg.DiscordTransport() == TransportGateway {
+			controlSource = BufferPollSource{BufferPath: controlBufferPath(root, PlatformDiscord), Poll: controlPoll}
+		} else if cfg.Control.Mode == ModePush && push != nil {
+			cs := push.ControlSource(controlPoll)
+			push.Ensure("__control_gw__", cs.gatewayIngester(token, cfg.Discord.ChannelID, cfg.Discord.BaseURL), func(e error) {
+				if e != nil {
+					fmt.Fprintf(stdout, "control gateway exited (poll backstop continues): %v\n", e)
+				}
+			})
+			activePush["__control_gw__"] = true
+			controlSource = cs
+		}
+		discordPlane := ControlPlane{Name: PlatformDiscord, Platform: PlatformDiscord, ChannelID: cfg.Discord.ChannelID}
+		controlSender := DiscordSender{BaseURL: cfg.Discord.BaseURL, Token: token, ChannelID: cfg.Discord.ChannelID}
+		if err := RunControlOnce(ctx, root, ControlBinding(root).Root, deps, &reg, controlSource, controlSender, discordPlane); err != nil {
+			fmt.Fprintf(stdout, "control error: %v\n", err)
+		}
+		if reg, err = LoadRegistry(root); err != nil {
+			return err
+		}
+		cb := ControlBinding(root)
+		if err := StartControlSession(ctx, cb.TmuxSession, cb.Worktree, cfg.Discord.TokenEnv, token, controlSystemPrompt(root, cb.Worktree, PlatformDiscord)); err != nil {
+			fmt.Fprintf(stdout, "control session error: %v\n", err)
+		} else {
+			controlInjector := TmuxInjector{Session: cb.TmuxSession, Root: cb.Root, AutoStart: false}
+			controlChatSender := DiscordSender{BaseURL: cfg.Discord.BaseURL, Token: token, ChannelID: cfg.Discord.ChannelID}
+			if err := runControlAssistant(ctx, cb, controlInjector, controlChatSender, timeout); err != nil {
+				fmt.Fprintf(stdout, "control assistant error: %v\n", err)
 			}
-		})
-		activePush["__control_gw__"] = true
-		controlSource = cs
-	}
-	discordPlane := ControlPlane{Name: PlatformDiscord, Platform: PlatformDiscord, ChannelID: cfg.Discord.ChannelID}
-	controlSender := DiscordSender{BaseURL: cfg.Discord.BaseURL, Token: token, ChannelID: cfg.Discord.ChannelID}
-	if err := RunControlOnce(ctx, root, ControlBinding(root).Root, deps, &reg, controlSource, controlSender, discordPlane); err != nil {
-		fmt.Fprintf(stdout, "control error: %v\n", err)
-	}
-
-	// reg may have changed; reload the persisted set.
-	reg, err = LoadRegistry(root)
-	if err != nil {
-		return err
-	}
-
-	// Control assistant: start its session and drive any queued free-text jobs.
-	cb := ControlBinding(root)
-	if err := StartControlSession(ctx, cb.TmuxSession, cb.Worktree, cfg.Discord.TokenEnv, token, controlSystemPrompt(root, cb.Worktree, PlatformDiscord)); err != nil {
-		fmt.Fprintf(stdout, "control session error: %v\n", err)
-	} else {
-		controlInjector := TmuxInjector{Session: cb.TmuxSession, Root: cb.Root, AutoStart: false}
-		controlChatSender := DiscordSender{BaseURL: cfg.Discord.BaseURL, Token: token, ChannelID: cfg.Discord.ChannelID}
-		if err := runControlAssistant(ctx, cb, controlInjector, controlChatSender, timeout); err != nil {
-			fmt.Fprintf(stdout, "control assistant error: %v\n", err)
 		}
 	}
 
-	// Extra (isolated) control planes — currently a Telegram plane when
-	// configured. Each runs the same control pipeline against its own chat,
-	// reserved session (cc-control-<plane>), root, and seen-state; it only
-	// sees/manages bindings tagged with its own plane.
+	// Legacy hardcoded Telegram control plane(s). Guarded per-plane: skipped once
+	// a registry control binding for that plane exists (seeded above).
 	tgControlPlanes := cfg.ControlPlanes()
 	for _, plane := range tgControlPlanes {
 		if plane.Name == PlatformDiscord {
@@ -176,6 +182,9 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 		}
 		if plane.Platform != PlatformTelegram || tgToken == "" {
 			continue
+		}
+		if hasControlNamed(&reg, plane.Name) {
+			continue // migrated to the registry control loop
 		}
 		pcb := ControlBindingFor(root, plane.Name)
 		// Source = the buffer the shared reader routed this plane's messages into
@@ -369,4 +378,43 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 		fmt.Fprintf(stdout, "reaped orphan sessions: %v\n", orphans)
 	}
 	return nil
+}
+
+// hasControlNamed reports whether the registry has a control binding by name.
+func hasControlNamed(reg *Registry, name string) bool {
+	b, ok := reg.Get(name)
+	return ok && b.Control
+}
+
+// seedControlPlanes migrates the configured (hardcoded) control planes into the
+// registry as control bindings, reusing their EXISTING control-<x> identities
+// (session/root/workspace) and plane name so the registry control loop runs them
+// identically to the legacy path. Idempotent: only adds missing planes. Discord
+// is the bootstrap lifeline → forced as the protected default. Returns whether
+// the registry changed.
+func seedControlPlanes(root string, cfg Config, reg *Registry) bool {
+	changed := false
+	add := func(planeName, channel string) {
+		if channel == "" {
+			return
+		}
+		if hasControlNamed(reg, planeName) {
+			return
+		}
+		cb := ControlBindingFor(root, planeName)
+		reg.Bindings = append(reg.Bindings, Binding{
+			Name: planeName, Platform: planeName, Control: true, Plane: planeName,
+			ChannelID: channel, TmuxSession: cb.TmuxSession, Root: cb.Root, Worktree: cb.Worktree,
+		})
+		changed = true
+	}
+	add(PlatformDiscord, cfg.Discord.ChannelID)
+	add(PlatformTelegram, cfg.Control.TelegramChatID)
+	// Discord is the lifeline → the protected default (only flip when needed so
+	// this doesn't mark the registry dirty every cycle).
+	if b, ok := reg.Get(PlatformDiscord); ok && b.Control && !b.Default {
+		reg.SetDefaultControl(PlatformDiscord)
+		changed = true
+	}
+	return changed
 }
