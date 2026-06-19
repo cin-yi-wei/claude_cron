@@ -42,3 +42,35 @@ func TestShouldSleep(t *testing.T) {
 		t.Fatal("timeout<=0 must disable sleep")
 	}
 }
+
+func TestFailStuckJobs(t *testing.T) {
+	root := t.TempDir()
+	if err := Init(root); err != nil {
+		t.Fatal(err)
+	}
+	if err := AtomicWriteJSON(pathIn(root, "inbox", "processing", "stuck.json"), InputJob{Schema: 1, JobID: "stuck"}); err != nil {
+		t.Fatal(err)
+	}
+	failStuckJobs(root)
+	if countJSON(pathIn(root, "inbox", "processing")) != 0 {
+		t.Fatal("stuck job still in processing")
+	}
+	if countJSON(pathIn(root, "inbox", "failed")) != 1 {
+		t.Fatal("stuck job not moved to failed")
+	}
+}
+
+func TestStallAndSleepTimeouts(t *testing.T) {
+	if (Config{}).IdleSleepTimeout() != 30*time.Minute {
+		t.Fatal("default idle sleep should be 30m")
+	}
+	if (Config{IdleSleepMinutes: -1}).IdleSleepTimeout() != 0 {
+		t.Fatal("negative idle sleep should disable")
+	}
+	if (Config{}).StallTimeout() != 10*time.Minute {
+		t.Fatal("default stall should be 10m")
+	}
+	if (Config{StallMinutes: -1}).StallTimeout() != 0 {
+		t.Fatal("negative stall should disable")
+	}
+}

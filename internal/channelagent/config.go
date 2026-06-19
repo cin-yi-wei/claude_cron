@@ -19,6 +19,9 @@ type Config struct {
 	// IdleSleepMinutes: a binding idle this long auto-sleeps (session killed to
 	// free RAM; auto-wakes on next message). 0 = default (30 min); <0 = disabled.
 	IdleSleepMinutes int `json:"idle_sleep_minutes,omitempty"`
+	// StallMinutes: a session with queued work but no transcript progress for this
+	// long is treated as stuck and restarted. 0 = default (10 min); <0 = disabled.
+	StallMinutes int `json:"stall_minutes,omitempty"`
 }
 
 // IdleSleepTimeout resolves the auto-sleep idle threshold. Zero return = feature
@@ -30,6 +33,18 @@ func (c Config) IdleSleepTimeout() time.Duration {
 	}
 	if m < 0 {
 		return 0 // explicitly disabled
+	}
+	return time.Duration(m) * time.Minute
+}
+
+// StallTimeout resolves the stall-watchdog threshold. Zero return = disabled.
+func (c Config) StallTimeout() time.Duration {
+	m := c.StallMinutes
+	if m == 0 {
+		m = 10 // default: restart after 10 min of no transcript progress
+	}
+	if m < 0 {
+		return 0
 	}
 	return time.Duration(m) * time.Minute
 }
