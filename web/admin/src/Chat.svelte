@@ -94,6 +94,26 @@
     loadInitial().then(connect);
     return () => { if (es) es.close(); };
   });
+
+  // Split a message into plain-text and fenced-code segments so ```diff blocks
+  // render with red/green line colouring (matching Discord).
+  function segments(text) {
+    const parts = [];
+    const re = /```(\w*)\n?([\s\S]*?)```/g;
+    let last = 0, mm;
+    while ((mm = re.exec(text))) {
+      if (mm.index > last) parts.push({ t: 'text', c: text.slice(last, mm.index) });
+      parts.push({ t: mm[1] === 'diff' ? 'diff' : 'code', c: mm[2].replace(/\n$/, '') });
+      last = re.lastIndex;
+    }
+    if (last < text.length) parts.push({ t: 'text', c: text.slice(last) });
+    return parts;
+  }
+  function dcls(line) {
+    if (line[0] === '+') return 'add';
+    if (line[0] === '-') return 'del';
+    return '';
+  }
 </script>
 
 <article class="chat">
@@ -103,7 +123,15 @@
     {#each messages as m}
       <div class="msg {m.role}">
         <span class="who">{m.role === 'assistant' ? '🤖' : m.role === 'user' ? '🧑' : '⚠️'}</span>
-        <span class="txt">{m.text}</span>
+        <span class="txt">
+          {#each segments(m.text) as seg}
+            {#if seg.t === 'diff'}
+              <pre class="code diff">{#each seg.c.split('\n') as ln}<span class="dl {dcls(ln)}">{ln}{'\n'}</span>{/each}</pre>
+            {:else if seg.t === 'code'}
+              <pre class="code">{seg.c}</pre>
+            {:else}<span>{seg.c}</span>{/if}
+          {/each}
+        </span>
       </div>
     {/each}
     {#if messages.length === 0}<p class="muted"><em>{t('chat.empty', { name })}</em></p>{/if}
@@ -121,6 +149,9 @@
   .msg { display: flex; gap: .5rem; font-size: .85rem; }
   .msg .who { flex: 0 0 1.4rem; }
   .msg .txt { white-space: pre-wrap; word-break: break-word; }
+  .msg .txt .code { white-space: pre; overflow-x: auto; margin: .2rem 0; padding: .3rem .5rem; border-radius: 4px; background: var(--pico-code-background-color, #1e2030); font-size: .78rem; line-height: 1.3; }
+  .msg .txt .diff .dl.add { color: #3fb950; }
+  .msg .txt .diff .dl.del { color: #f85149; }
   .msg.assistant .txt { color: var(--pico-color); }
   .msg.user .txt { color: var(--pico-primary); }
   .msg.error .txt { color: var(--pico-del-color); }

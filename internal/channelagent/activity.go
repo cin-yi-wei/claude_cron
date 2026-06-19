@@ -158,25 +158,31 @@ func formatToolUse(name string, input json.RawMessage) string {
 		return "▶ " + condense(str("command"), 160)
 	case "Edit":
 		f := base(str("file_path"))
-		o, n := condense(str("old_string"), 100), condense(str("new_string"), 100)
+		o, n := str("old_string"), str("new_string")
 		if o == "" && n == "" {
 			return "🔧 Edit " + f
 		}
-		return "🔧 Edit " + f + "\n  − " + o + "\n  + " + n
+		return "🔧 Edit " + f + "\n" + diffBlock(o, n)
 	case "MultiEdit":
 		f := base(str("file_path"))
-		cnt := 0
+		var blocks []string
 		if arr, ok := m["edits"].([]any); ok {
-			cnt = len(arr)
+			for _, e := range arr {
+				if em, ok := e.(map[string]any); ok {
+					eo, _ := em["old_string"].(string)
+					en, _ := em["new_string"].(string)
+					blocks = append(blocks, diffBlock(eo, en))
+				}
+			}
 		}
-		return fmt.Sprintf("🔧 Edit %s (%d 處)", f, cnt)
+		return fmt.Sprintf("🔧 Edit %s (%d 處)\n%s", f, len(blocks), strings.Join(blocks, "\n"))
 	case "Write":
 		f := base(str("file_path"))
-		c := condense(str("content"), 140)
+		c := str("content")
 		if c == "" {
 			return "📝 Write " + f
 		}
-		return "📝 Write " + f + "\n  " + c
+		return "📝 Write " + f + "\n```\n" + clampBlock(c, 20, 200) + "\n```"
 	case "Read":
 		return "👀 Read " + base(str("file_path"))
 	case "Grep":
@@ -194,6 +200,49 @@ func formatToolUse(name string, input json.RawMessage) string {
 	}
 }
 
+// diffBlock renders an old→new change as a ```diff fenced block: lines starting
+// with - / + so Discord colours them red/green (the web chat colours them too).
+// Capped per side to keep messages bounded.
+func diffBlock(old, new string) string {
+	var b strings.Builder
+	b.WriteString("```diff\n")
+	for _, ln := range clampLines(old, 12, 200) {
+		b.WriteString("- " + ln + "\n")
+	}
+	for _, ln := range clampLines(new, 12, 200) {
+		b.WriteString("+ " + ln + "\n")
+	}
+	b.WriteString("```")
+	return b.String()
+}
+
+// clampLines splits s into at most maxLines lines (each ≤ maxCol runes),
+// appending an ellipsis line when truncated.
+func clampLines(s string, maxLines, maxCol int) []string {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	lines := strings.Split(strings.ReplaceAll(s, "\r\n", "\n"), "\n")
+	var out []string
+	for i, ln := range lines {
+		if i >= maxLines {
+			out = append(out, "… (+"+fmt.Sprint(len(lines)-maxLines)+" 行)")
+			break
+		}
+		r := []rune(ln)
+		if len(r) > maxCol {
+			ln = string(r[:maxCol]) + "…"
+		}
+		out = append(out, ln)
+	}
+	return out
+}
+
+// clampBlock is clampLines re-joined for a plain (non-diff) code block.
+func clampBlock(s string, maxLines, maxCol int) string {
+	return strings.Join(clampLines(s, maxLines, maxCol), "\n")
+}
+
 // condense collapses whitespace/newlines and truncates to max runes.
 func condense(s string, max int) string {
 	s = strings.Join(strings.Fields(s), " ")
@@ -204,12 +253,22 @@ func condense(s string, max int) string {
 	return s
 }
 
-// activityMessage joins lines into one throttle-friendly message per tick.
+// activityMessage joins lines into one throttle-friendly message per tick,
+// capped under the Discord 2000-char limit (diff blocks can be large).
 func activityMessage(lines []string) string {
 	if len(lines) == 0 {
 		return ""
 	}
-	return fmt.Sprintf("⏳ %s", strings.Join(lines, "\n"))
+	msg := "⏳ " + strings.Join(lines, "\n")
+	const max = 1800
+	if r := []rune(msg); len(r) > max {
+		msg = string(r[:max]) + "\n… (截斷)"
+		// Close any code fence left open by truncation so rendering stays sane.
+		if strings.Count(msg, "```")%2 == 1 {
+			msg += "\n```"
+		}
+	}
+	return msg
 }
 
 // activitySender builds the Sender that delivers a binding's activity to its
