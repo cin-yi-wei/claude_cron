@@ -110,11 +110,12 @@ func TestAdminRestart(t *testing.T) {
 }
 
 func TestAdminServesUI(t *testing.T) {
+	// Root now redirects to the Svelte SPA at /app/.
 	h := AdminHandler{Root: t.TempDir()}
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
-	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "claude_cron admin") {
-		t.Fatalf("UI status=%d", rec.Code)
+	if rec.Code != http.StatusFound || rec.Header().Get("Location") != "/app/" {
+		t.Fatalf("root redirect: status=%d location=%q", rec.Code, rec.Header().Get("Location"))
 	}
 }
 

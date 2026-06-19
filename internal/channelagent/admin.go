@@ -70,16 +70,15 @@ type AdminHandler struct {
 
 func (h AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
-	// The UI page is static (no data) and must load without a bearer token —
-	// a browser navigating to the URL cannot send one. It then prompts for the
-	// token and sends it on the API calls, which ARE gated below.
+	// The Svelte SPA at /app/ is now the primary UI — redirect the root there so
+	// there's a single URL. (The legacy inline Pico page in adminIndexHTML is kept
+	// for reference but no longer served.)
 	if path == "/" || path == "/index.html" {
 		if r.Method != http.MethodGet {
 			methodNotAllowed(w)
 			return
 		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_, _ = w.Write([]byte(adminIndexHTML))
+		http.Redirect(w, r, "/app/", http.StatusFound)
 		return
 	}
 	// The v2 Svelte SPA at /app/ is static (no data); served unauth like / so a
