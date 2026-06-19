@@ -156,10 +156,27 @@ func formatToolUse(name string, input json.RawMessage) string {
 	switch name {
 	case "Bash":
 		return "▶ " + condense(str("command"), 160)
-	case "Edit", "MultiEdit":
-		return "🔧 Edit " + base(str("file_path"))
+	case "Edit":
+		f := base(str("file_path"))
+		o, n := condense(str("old_string"), 100), condense(str("new_string"), 100)
+		if o == "" && n == "" {
+			return "🔧 Edit " + f
+		}
+		return "🔧 Edit " + f + "\n  − " + o + "\n  + " + n
+	case "MultiEdit":
+		f := base(str("file_path"))
+		cnt := 0
+		if arr, ok := m["edits"].([]any); ok {
+			cnt = len(arr)
+		}
+		return fmt.Sprintf("🔧 Edit %s (%d 處)", f, cnt)
 	case "Write":
-		return "📝 Write " + base(str("file_path"))
+		f := base(str("file_path"))
+		c := condense(str("content"), 140)
+		if c == "" {
+			return "📝 Write " + f
+		}
+		return "📝 Write " + f + "\n  " + c
 	case "Read":
 		return "👀 Read " + base(str("file_path"))
 	case "Grep":

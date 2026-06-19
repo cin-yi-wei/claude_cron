@@ -14,6 +14,9 @@ func TestFormatToolUse(t *testing.T) {
 		{"Grep", `{"pattern":"func main"}`, "🔍 Grep func main"},
 		{"WebFetch", `{"url":"https://x.dev"}`, "🌐 Fetch https://x.dev"},
 		{"Frobnicate", `{}`, "🔧 Frobnicate"},
+		{"Edit", `{"file_path":"/x/a.go","old_string":"a := 1","new_string":"a := 2"}`, "🔧 Edit a.go\n  − a := 1\n  + a := 2"},
+		{"Write", `{"file_path":"/x/n.go","content":"package main"}`, "📝 Write n.go\n  package main"},
+		{"MultiEdit", `{"file_path":"/x/m.go","edits":[{},{}]}`, "🔧 Edit m.go (2 處)"},
 	}
 	for _, c := range cases {
 		got := formatToolUse(c.name, json.RawMessage(c.input))
