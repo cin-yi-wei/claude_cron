@@ -7,11 +7,46 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
+	"strings"
 	"time"
 )
 
 const defaultTelegramBaseURL = "https://api.telegram.org"
+
+var tgFenceRE = regexp.MustCompile("(?s)```(\\w*)\\n?(.*?)```")
+
+// telegramHTML converts ```lang fenced blocks to Telegram HTML
+// <pre><code class="language-lang">…</code></pre> (Telegram highlights the
+// language, incl. diff red/green) and HTML-escapes everything else. Used with
+// parse_mode=HTML.
+func telegramHTML(text string) string {
+	esc := func(s string) string {
+		s = strings.ReplaceAll(s, "&", "&amp;")
+		s = strings.ReplaceAll(s, "<", "&lt;")
+		s = strings.ReplaceAll(s, ">", "&gt;")
+		return s
+	}
+	var out strings.Builder
+	last := 0
+	for _, loc := range tgFenceRE.FindAllStringSubmatchIndex(text, -1) {
+		out.WriteString(esc(text[last:loc[0]]))
+		lang := text[loc[2]:loc[3]]
+		code := text[loc[4]:loc[5]]
+		out.WriteString("<pre>")
+		if lang != "" {
+			out.WriteString(`<code class="language-` + lang + `">`)
+		} else {
+			out.WriteString("<code>")
+		}
+		out.WriteString(esc(code))
+		out.WriteString("</code></pre>")
+		last = loc[1]
+	}
+	out.WriteString(esc(text[last:]))
+	return out.String()
+}
 
 type TelegramSource struct {
 	BaseURL string
@@ -129,7 +164,15 @@ func (s TelegramSender) Send(ctx context.Context, output OutputJob) error {
 	if client == nil {
 		client = http.DefaultClient
 	}
-	body, err := json.Marshal(map[string]string{"chat_id": s.ChatID, "text": output.Text})
+	// Messages with ```fenced``` blocks (e.g. activity diffs) are sent as HTML so
+	// Telegram renders code blocks + diff colouring; plain messages stay plain
+	// (zero change for normal replies).
+	payloadMap := map[string]string{"chat_id": s.ChatID, "text": output.Text}
+	if strings.Contains(output.Text, "```") {
+		payloadMap["text"] = telegramHTML(output.Text)
+		payloadMap["parse_mode"] = "HTML"
+	}
+	body, err := json.Marshal(payloadMap)
 	if err != nil {
 		return err
 	}
