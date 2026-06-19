@@ -54,6 +54,9 @@ const agentSettings = `{
     "allow": ["Read", "Write", "Edit"]
   },
   "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "claude-cron session-hook" } ] }
+    ],
     "PreToolUse": [
       { "matcher": "Bash", "hooks": [ { "type": "command", "command": "claude-cron permission-gate" } ] },
       { "matcher": "WebFetch", "hooks": [ { "type": "command", "command": "claude-cron permission-gate" } ] },
@@ -73,6 +76,9 @@ const controlAgentSettings = `{
     "allow": ["Read", "Write", "Edit", "Bash"]
   },
   "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "claude-cron session-hook" } ] }
+    ],
     "PreToolUse": [
       { "matcher": "WebFetch", "hooks": [ { "type": "command", "command": "claude-cron permission-gate" } ] },
       { "matcher": "WebSearch", "hooks": [ { "type": "command", "command": "claude-cron permission-gate" } ] },
@@ -271,14 +277,16 @@ func claudeArgs(cwd string, extra ...string) []string {
 // and the Discord bot token injected into the session environment (so the
 // assistant's `claude-cron` management calls can authenticate). No-op if the
 // session already exists. tokenEnv is the env var name, tokenValue its value.
-func StartControlSession(ctx context.Context, session, cwd, tokenEnv, tokenValue, systemPrompt string) error {
+func StartControlSession(ctx context.Context, session, cwd, registryRoot, tokenEnv, tokenValue, systemPrompt string) error {
 	if err := EnsureControlSettings(cwd); err != nil {
 		return err
 	}
 	if runExternalCommand(ctx, "tmux", "has-session", "-t", session) == nil {
 		return nil
 	}
-	base := []string{"new-session", "-d", "-s", session, "-c", cwd}
+	// CC_REGISTRY_ROOT lets the PreToolUse / SessionStart hooks find the registry
+	// (the hooks have no flags) so permission-gate routing + session-hook work.
+	base := []string{"new-session", "-d", "-s", session, "-c", cwd, "-e", "CC_REGISTRY_ROOT=" + registryRoot}
 	if tokenEnv != "" {
 		// A web control plane has no bot token; only inject -e when there is one.
 		base = append(base, "-e", tokenEnv+"="+tokenValue)

@@ -74,7 +74,7 @@ func TestStartControlSessionInjectsTokenAndPrompt(t *testing.T) {
 	}
 
 	cwd := t.TempDir()
-	if err := StartControlSession(context.Background(), "cc-control", cwd, "DISCORD_BOT_TOKEN", "tok123", "SYS PROMPT"); err != nil {
+	if err := StartControlSession(context.Background(), "cc-control", cwd, "/reg/root", "DISCORD_BOT_TOKEN", "tok123", "SYS PROMPT"); err != nil {
 		t.Fatalf("StartControlSession: %v", err)
 	}
 	var start []string
@@ -87,7 +87,7 @@ func TestStartControlSessionInjectsTokenAndPrompt(t *testing.T) {
 		t.Fatalf("no new-session call: %#v", calls)
 	}
 	joined := strings.Join(start, " ")
-	for _, want := range []string{"-e DISCORD_BOT_TOKEN=tok123", "-c " + cwd, "--append-system-prompt", "SYS PROMPT", "claude"} {
+	for _, want := range []string{"-e CC_REGISTRY_ROOT=/reg/root", "-e DISCORD_BOT_TOKEN=tok123", "-c " + cwd, "--append-system-prompt", "SYS PROMPT", "claude"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("new-session missing %q: %v", want, start)
 		}

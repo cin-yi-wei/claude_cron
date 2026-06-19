@@ -21,7 +21,7 @@ func lastActivityUnixNano(bRoot, worktree string) int64 {
 			newest = t
 		}
 	}
-	if tp := transcriptPath(worktree); tp != "" {
+	if tp := sessionTranscriptPath(bRoot, worktree); tp != "" {
 		if fi, err := os.Stat(tp); err == nil {
 			bump(fi.ModTime().UnixNano())
 		}
@@ -62,8 +62,8 @@ type stallState struct {
 	Kills     int   `json:"kills"`
 }
 
-func transcriptMtime(worktree string) int64 {
-	if tp := transcriptPath(worktree); tp != "" {
+func transcriptMtime(bRoot, worktree string) int64 {
+	if tp := sessionTranscriptPath(bRoot, worktree); tp != "" {
 		if fi, err := os.Stat(tp); err == nil {
 			return fi.ModTime().UnixNano()
 		}
@@ -81,7 +81,7 @@ func stallAction(bRoot, worktree string, timeout time.Duration, maxKills int) st
 	sp := pathIn(bRoot, "state", "stall.json")
 	var st stallState
 	_ = ReadJSON(sp, &st)
-	tm := transcriptMtime(worktree)
+	tm := transcriptMtime(bRoot, worktree)
 	// Progress since last check → reset the kill counter.
 	if tm > st.LastMtime {
 		if st.Kills != 0 || st.LastMtime != tm {

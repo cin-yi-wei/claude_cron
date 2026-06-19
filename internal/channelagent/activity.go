@@ -57,7 +57,7 @@ type transcriptEvent struct {
 // offset in <bRoot>/state/activity.json. On first sight of a transcript it seeks
 // to the END (no backlog replay), so only NEW activity streams.
 func CollectActivity(bRoot, worktree string) []string {
-	tp := transcriptPath(worktree)
+	tp := sessionTranscriptPath(bRoot, worktree)
 	if tp == "" {
 		return nil
 	}

@@ -98,6 +98,18 @@ func run(args []string, stdout, stderr io.Writer) int {
 		// Output is the hook decision JSON on stdout; always exit 0 so Claude reads it.
 		_ = agent.RunPermissionGate(context.Background(), absRoot, os.Stdin, stdout, to)
 		return 0
+	case "session-hook":
+		// SessionStart hook: record the session's transcript path. No flags; root
+		// from CC_REGISTRY_ROOT (set by the session launcher), else default.
+		absRoot := ".channel-agent"
+		if env := os.Getenv("CC_REGISTRY_ROOT"); env != "" {
+			absRoot = env
+		}
+		if a, err := filepath.Abs(absRoot); err == nil {
+			absRoot = a
+		}
+		_ = agent.RecordSessionHook(absRoot, os.Stdin)
+		return 0
 	case "admin":
 		fs := flag.NewFlagSet("admin", flag.ContinueOnError)
 		fs.SetOutput(stderr)

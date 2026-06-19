@@ -311,7 +311,7 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 		if reg, err = LoadRegistry(root); err != nil {
 			return err
 		}
-		if err := StartControlSession(ctx, b.TmuxSession, b.Worktree, tokenEnv, tokenVal, controlSystemPrompt(root, b.Worktree, b.Name)); err != nil {
+		if err := StartControlSession(ctx, b.TmuxSession, b.Worktree, root, tokenEnv, tokenVal, controlSystemPrompt(root, b.Worktree, b.Name)); err != nil {
 			fmt.Fprintf(stdout, "control-binding[%s] session error: %v\n", b.Name, err)
 			continue
 		}
