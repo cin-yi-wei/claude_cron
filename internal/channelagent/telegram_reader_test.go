@@ -117,10 +117,18 @@ func TestTelegramBufferSourceFetchClears(t *testing.T) {
 func TestTelegramDemuxHandlerRoutes(t *testing.T) {
 	root := t.TempDir()
 	// One telegram worker binding (chat 111) + a telegram control plane (chat 222).
-	reg := Registry{Bindings: []Binding{{
-		Name: "w", ChannelID: "111", Platform: PlatformTelegram, Plane: PlatformTelegram,
-		Root: filepath.Join(root, "bindings", "w"),
-	}}}
+	reg := Registry{Bindings: []Binding{
+		{
+			Name: "w", ChannelID: "111", Platform: PlatformTelegram, Plane: PlatformTelegram,
+			Root: filepath.Join(root, "bindings", "w"),
+		},
+		{
+			// Control routing is registry-driven (unified model): a telegram control
+			// binding reusing the control-tg identity routes chat 222 to its buffer.
+			Name: PlatformTelegram, ChannelID: "222", Platform: PlatformTelegram, Control: true,
+			Plane: PlatformTelegram, Root: ControlBindingFor(root, PlatformTelegram).Root,
+		},
+	}}
 	if err := SaveRegistry(root, reg); err != nil {
 		t.Fatalf("SaveRegistry: %v", err)
 	}

@@ -119,8 +119,10 @@ func (r TelegramReader) Drain(ctx context.Context, routes map[string]func(contex
 // across platforms; only the connect+decode layer differs per platform.
 func inboundRoutes(root string, cfg Config, reg Registry, platform string) map[string]func(context.Context, SourceMessage) error {
 	routes := map[string]func(context.Context, SourceMessage) error{}
+	// Worker bindings → their inbox. Control bindings are handled below (their
+	// input is the control buffer, not the worker inbox).
 	for _, b := range reg.Bindings {
-		if b.PlatformOf() != platform {
+		if b.PlatformOf() != platform || b.Control {
 			continue
 		}
 		broot := b.Root
@@ -129,16 +131,27 @@ func inboundRoutes(root string, cfg Config, reg Registry, platform string) map[s
 			return err
 		}
 	}
-	for _, plane := range cfg.ControlPlanes() {
-		if plane.Platform != platform || plane.ChannelID == "" {
+	// Control bindings (registry-driven, unified model) → their control buffer,
+	// drained by the control loop. Covers seeded planes + any created via bind.
+	for _, b := range reg.Bindings {
+		if b.PlatformOf() != platform || !b.Control || b.ChannelID == "" {
 			continue
 		}
-		buf := controlBufferPath(root, plane.Name)
-		routes[plane.ChannelID] = func(_ context.Context, msg SourceMessage) error {
+		buf := pathIn(b.Root, "state", controlBufferName(platform))
+		routes[b.ChannelID] = func(_ context.Context, msg SourceMessage) error {
 			return appendTelegramBuffer(buf, msg)
 		}
 	}
 	return routes
+}
+
+// controlBufferName is the per-platform control inbound buffer filename (telegram
+// keeps its legacy tg_buffer.json; others use inbound_buffer.json).
+func controlBufferName(platform string) string {
+	if platform == PlatformTelegram {
+		return "tg_buffer.json"
+	}
+	return "inbound_buffer.json"
 }
 
 // controlBufferPath is where a control plane's inbound messages are buffered by
