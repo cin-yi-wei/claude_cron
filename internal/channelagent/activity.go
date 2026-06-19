@@ -117,12 +117,29 @@ func CollectActivity(bRoot, worktree string) []string {
 					lines = append(lines, "💭 "+s)
 				}
 			case "tool_use":
+				if isPlumbing(b.Input) {
+					continue // skip the reply-publishing plumbing (it trails the reply)
+				}
 				lines = append(lines, formatToolUse(b.Name, b.Input))
 			}
 		}
 	}
 	_ = AtomicWriteJSON(statePath, st)
 	return lines
+}
+
+// isPlumbing reports whether a tool call is the session's own job/reply
+// plumbing (reading current_job.json, writing/moving the outbox reply file).
+// That activity is internal noise and — being the session's LAST action before
+// a turn ends — would stream right after the reply, so it is filtered out.
+func isPlumbing(input json.RawMessage) bool {
+	s := string(input)
+	for _, pat := range []string{"outbox/pending", "outbox/sent", "current_job.json", ".json.tmp", "/inbox/"} {
+		if strings.Contains(s, pat) {
+			return true
+		}
+	}
+	return false
 }
 
 // formatToolUse renders a one-line summary of a tool call.
