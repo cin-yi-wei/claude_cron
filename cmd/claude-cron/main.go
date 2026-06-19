@@ -198,6 +198,24 @@ func run(args []string, stdout, stderr io.Writer) int {
 				}
 			}()
 		}
+		// Live activity streamer: an independent fast ticker that tails each
+		// session's transcript and streams thinking/tool-call progress. Kept OUT of
+		// the supervisor cycle (which blocks on the per-binding worker wait) so
+		// activity arrives in near-real-time, not batched at the end of a turn.
+		if !*once {
+			go func() {
+				t := time.NewTicker(2 * time.Second)
+				defer t.Stop()
+				for {
+					select {
+					case <-supCtx.Done():
+						return
+					case <-t.C:
+						agent.RunActivityStreamOnce(supCtx, *root, cfg)
+					}
+				}
+			}()
+		}
 		for {
 			if err := agent.RunSupervisorOnce(supCtx, *root, cfg, timeout, stdout, pushMgr); err != nil {
 				fmt.Fprintln(stderr, err)

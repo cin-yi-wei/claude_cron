@@ -1,6 +1,7 @@
 package channelagent
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -169,10 +170,45 @@ func condense(s string, max int) string {
 	return s
 }
 
-// activityMessage joins lines into one throttle-friendly message per cycle.
+// activityMessage joins lines into one throttle-friendly message per tick.
 func activityMessage(lines []string) string {
 	if len(lines) == 0 {
 		return ""
 	}
 	return fmt.Sprintf("⏳ %s", strings.Join(lines, "\n"))
+}
+
+// activitySender builds the Sender that delivers a binding's activity to its
+// channel + the web hub (keyed by binding name so the web chat sees it too).
+func activitySender(b Binding, cfg Config, tokens bindingTokens) Sender {
+	switch b.PlatformOf() {
+	case PlatformWeb:
+		return WebSender{Hub: DefaultChatHub, Key: b.Name}
+	case PlatformTelegram:
+		return TeeSender{Inner: TelegramSender{BaseURL: cfg.Telegram.BaseURL, Token: tokens.telegram, ChatID: b.ChannelID}, Hub: DefaultChatHub, Key: b.Name}
+	default:
+		return TeeSender{Inner: DiscordSender{BaseURL: cfg.Discord.BaseURL, Token: tokens.discord, ChannelID: b.ChannelID}, Hub: DefaultChatHub, Key: b.Name}
+	}
+}
+
+// RunActivityStreamOnce sweeps every active binding once, sending any new
+// transcript activity. Run on a fast independent ticker (NOT inside the
+// supervisor cycle, which blocks on the per-binding worker wait — that would
+// batch all activity to the end of a turn instead of streaming it live).
+func RunActivityStreamOnce(ctx context.Context, root string, cfg Config) {
+	reg, err := LoadRegistry(root)
+	if err != nil {
+		return
+	}
+	tokens := bindingTokens{discord: os.Getenv(cfg.Discord.TokenEnv), telegram: os.Getenv(cfg.Telegram.TokenEnv)}
+	for _, b := range reg.Bindings {
+		if b.Paused {
+			continue
+		}
+		lines := CollectActivity(b.Root, b.Worktree)
+		if len(lines) == 0 {
+			continue
+		}
+		_ = activitySender(b, cfg, tokens).Send(ctx, OutputJob{Schema: 1, Send: true, Text: activityMessage(lines)})
+	}
 }

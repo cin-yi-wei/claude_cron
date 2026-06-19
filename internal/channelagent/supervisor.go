@@ -243,11 +243,6 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 			continue
 		}
 		fmt.Fprintf(stdout, "binding=%s created=%d processed=%t sent=%d\n", b.Name, res.Created, res.Processed, res.Sent)
-		// Stream this session's live activity (thinking/tool calls) to its channel
-		// + web chat, so the user sees progress, not just the final reply.
-		if msg := activityMessage(CollectActivity(b.Root, b.Worktree)); msg != "" {
-			_ = sender.Send(ctx, OutputJob{Schema: 1, Send: true, Text: msg})
-		}
 	}
 	// Registry-defined control bindings (unified control model). Each runs the
 	// control pipeline against its own root/session, fed by its platform's source
@@ -292,10 +287,6 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 		inj := TmuxInjector{Session: b.TmuxSession, Root: b.Root, AutoStart: false}
 		if err := runControlAssistant(ctx, b, inj, snd, timeout); err != nil {
 			fmt.Fprintf(stdout, "control-binding[%s] assistant error: %v\n", b.Name, err)
-		}
-		// Stream this control session's live activity (thinking/tool calls).
-		if msg := activityMessage(CollectActivity(b.Root, b.Worktree)); msg != "" {
-			_ = snd.Send(ctx, OutputJob{Schema: 1, Send: true, Text: msg})
 		}
 	}
 
