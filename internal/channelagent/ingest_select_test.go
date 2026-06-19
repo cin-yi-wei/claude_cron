@@ -65,15 +65,15 @@ func TestSelectSenderByPlatform(t *testing.T) {
 }
 
 func TestParseCommandOpts(t *testing.T) {
-	cmd, ok := ParseCommand("/bind foo /dir main --platform=tg --mode=push --chat-id=42 --delete-channel")
+	cmd, ok := ParseCommand("/bind foo /dir main --platform=tg --mode=push --chat-id=42 --control")
 	if !ok {
 		t.Fatal("ParseCommand ok=false")
 	}
 	if cmd.opt("platform") != "tg" || cmd.opt("mode") != "push" || cmd.opt("chat-id") != "42" {
 		t.Fatalf("opts = %#v", cmd.Opts)
 	}
-	if !cmd.Flags["delete-channel"] {
-		t.Fatal("delete-channel flag not set")
+	if !cmd.Flags["control"] {
+		t.Fatal("control flag not set")
 	}
 	if len(cmd.Args) != 3 {
 		t.Fatalf("args = %#v", cmd.Args)

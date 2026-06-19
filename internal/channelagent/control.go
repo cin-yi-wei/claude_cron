@@ -69,7 +69,7 @@ type ControlDeps struct {
 	InitRoot       func(root string) error
 }
 
-const controlUsage = "指令: /bind <name> <project-dir> <branch> [--platform=dc|tg] [--mode=poll|push] [--chat-id=<id> (tg)] | /bind <name> --control [--platform=web|dc|tg] [--chat-id=<id>] | /unbind <name> [--delete-channel] | /pause <name> | /resume <name> | /set-default <name> | /list | /status <name> | /help"
+const controlUsage = "指令: /bind <name> <project-dir> <branch> [--platform=dc|tg] [--mode=poll|push] [--chat-id=<id> (tg)] | /bind <name> --control [--platform=web|dc|tg] [--chat-id=<id>] | /unbind <name> | /pause <name> | /resume <name> | /set-default <name> | /list | /status <name> | /help"
 
 // HandleCommand executes a parsed control command against the registry, using
 // deps for side effects. Returns a reply to post to the control channel and
@@ -323,7 +323,7 @@ func handleBindControl(ctx context.Context, deps ControlDeps, reg *Registry, cmd
 
 func handleUnbind(ctx context.Context, deps ControlDeps, reg *Registry, cmd Command, plane ControlPlane) (string, bool, error) {
 	if len(cmd.Args) != 1 {
-		return "用法: /unbind <name> [--delete-channel]", false, nil
+		return "用法: /unbind <name>", false, nil
 	}
 	name := cmd.Args[0]
 	b, ok := reg.Get(name)
@@ -351,12 +351,9 @@ func handleUnbind(ctx context.Context, deps ControlDeps, reg *Registry, cmd Comm
 	if err := deps.RemoveWorktree(ctx, b.ProjectDir, b.Worktree); err != nil {
 		warn = "（⚠️ worktree 清理可能不完全: " + err.Error() + "）"
 	}
-	if cmd.Flags["delete-channel"] {
-		_ = deps.DeleteChannel(ctx, b.ChannelID)
-	}
 	_ = os.RemoveAll(b.Root)
 	reg.Remove(name)
-	return fmt.Sprintf("🗑️ 解綁 %s 完成%s（git 分支保留）", name, warn), true, nil
+	return fmt.Sprintf("🗑️ 解綁 %s 完成%s（git 分支與 Discord 頻道都保留）", name, warn), true, nil
 }
 
 // handlePause hot-stops a binding: kills its tmux session to free memory but
@@ -537,7 +534,7 @@ func controlSystemPrompt(root, workspace, planeName string) string {
 
 要管理「頻道 ↔ Claude session」綁定時，用以下 CLI（root 用絕對路徑 %s）：
   claude-cron bind <name> <project-dir> <branch> --root %s%s
-  claude-cron unbind <name> [--delete-channel] --root %s%s
+  claude-cron unbind <name> --root %s%s
   claude-cron list --root %s%s
 
 name 只能用小寫字母、數字、減號。回覆使用者時直接用一般文字即可。%s`,

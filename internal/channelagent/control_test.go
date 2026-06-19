@@ -22,8 +22,8 @@ func TestParseCommand(t *testing.T) {
 		t.Fatalf("Args = %#v", cmd.Args)
 	}
 
-	cmd2, ok := ParseCommand("/unbind proj-a --delete-channel")
-	if !ok || cmd2.Name != "unbind" || !cmd2.Flags["delete-channel"] {
+	cmd2, ok := ParseCommand("/unbind proj-a")
+	if !ok || cmd2.Name != "unbind" {
 		t.Fatalf("unbind parse wrong: %#v ok=%v", cmd2, ok)
 	}
 	if !reflect.DeepEqual(cmd2.Args, []string{"proj-a"}) {
@@ -119,7 +119,7 @@ func TestHandleBindThenUnbind(t *testing.T) {
 		t.Fatal("proj-a still registered after unbind")
 	}
 	if containsStr(actions, "delete:chan-proj-a") {
-		t.Fatal("channel should NOT be deleted without --delete-channel")
+		t.Fatal("unbind must never delete the Discord channel")
 	}
 	if !containsStr(actions, "stop:cc-proj-a") {
 		t.Fatal("session should be stopped on unbind")

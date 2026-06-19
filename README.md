@@ -118,7 +118,7 @@ Then, in the control channel, use slash commands:
 
 ```text
 /bind <name> <project-dir> <branch>   # create a channel + worktree + session for a project
-/unbind <name> [--delete-channel]     # tear it down (keeps the Discord channel unless --delete-channel)
+/unbind <name>                         # tear it down (the Discord channel is always kept)
 /list                                  # list bindings
 /status <name>                         # session + queue status for one binding
 /help
@@ -130,7 +130,7 @@ The same actions are available as CLI subcommands (used by the control assistant
 
 ```bash
 claude-cron bind <name> <project-dir> <branch> --root .channel-agent
-claude-cron unbind <name> [--delete-channel] --root .channel-agent
+claude-cron unbind <name> --root .channel-agent
 claude-cron list --root .channel-agent
 ```
 

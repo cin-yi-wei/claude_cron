@@ -333,7 +333,6 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 func runManageCommand(name string, rest []string, stdout, stderr io.Writer) int {
 	root := ".channel-agent"
-	deleteChannel := false
 	var pos []string
 	opts := map[string]string{}
 	flags := map[string]bool{}
@@ -346,8 +345,6 @@ func runManageCommand(name string, rest []string, stdout, stderr io.Writer) int 
 			}
 			root = rest[i+1]
 			i++
-		case rest[i] == "--delete-channel":
-			deleteChannel = true
 		case strings.HasPrefix(rest[i], "--"):
 			// --key=value options (e.g. --platform=tg); bare --flag (e.g. --control).
 			kv := strings.TrimPrefix(rest[i], "--")
@@ -379,9 +376,6 @@ func runManageCommand(name string, rest []string, stdout, stderr io.Writer) int 
 	deps := agent.BuildControlDeps(root, cfg)
 
 	cmd := agent.Command{Name: name, Args: pos, Flags: flags, Opts: opts}
-	if deleteChannel {
-		cmd.Flags["delete-channel"] = true
-	}
 
 	// --plane selects which control plane this CLI invocation acts as (default
 	// discord). A plane's control assistant passes --plane so its bindings are
