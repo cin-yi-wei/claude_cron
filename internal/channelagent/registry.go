@@ -42,6 +42,10 @@ type Binding struct {
 	// lock the user out of all management). The flag is transferable to another
 	// control via set-default.
 	Default bool `json:"default,omitempty"`
+	// Sleeping marks a binding auto-slept after being idle: its session is killed
+	// to free RAM (like Paused) BUT it auto-wakes when a new message arrives.
+	// Distinct from Paused (manual; stays down + ignores messages until /resume).
+	Sleeping bool `json:"sleeping,omitempty"`
 }
 
 // ControlBindingDefaults derives a control binding's session/root/workspace.
@@ -207,6 +211,17 @@ func (r *Registry) SetDefaultControl(name string) bool {
 		r.Bindings[i].Default = r.Bindings[i].Control && i == idx
 	}
 	return true
+}
+
+// SetSleeping flips the auto-sleep flag on a binding by name. Caller persists.
+func (r *Registry) SetSleeping(name string, sleeping bool) bool {
+	for i := range r.Bindings {
+		if r.Bindings[i].Name == name {
+			r.Bindings[i].Sleeping = sleeping
+			return true
+		}
+	}
+	return false
 }
 
 func (r *Registry) Remove(name string) bool {

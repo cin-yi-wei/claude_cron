@@ -155,6 +155,23 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 		if b.Paused {
 			continue
 		}
+		// Auto-sleep/wake: a slept binding stays down until input arrives, then
+		// wakes (clears the flag + falls through to recreate the session). An idle
+		// binding with no queued input is slept (session killed to free RAM).
+		if b.Sleeping {
+			if countJSON(pathIn(b.Root, "inbox", "pending")) == 0 {
+				continue // stay asleep
+			}
+			reg.SetSleeping(b.Name, false)
+			_ = SaveRegistry(root, reg)
+			fmt.Fprintf(stdout, "binding %s waking (input arrived)\n", b.Name)
+		} else if shouldSleep(b.Root, b.Worktree, cfg.IdleSleepTimeout()) {
+			_ = StopTmuxSession(ctx, b.TmuxSession)
+			reg.SetSleeping(b.Name, true)
+			_ = SaveRegistry(root, reg)
+			fmt.Fprintf(stdout, "binding %s sleeping (idle)\n", b.Name)
+			continue
+		}
 		if err := EnsureWorktree(ctx, b.ProjectDir, b.Branch, b.Worktree); err != nil {
 			fmt.Fprintf(stdout, "binding %s worktree error: %v\n", b.Name, err)
 			continue
@@ -302,9 +319,9 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 		valid[ControlBindingFor(root, plane.Name).TmuxSession] = true
 	}
 	for _, b := range reg.Bindings {
-		// Paused bindings intentionally have no session; leaving them out of the
-		// valid set lets the reaper kill any session that lingers after /pause.
-		if b.Paused {
+		// Paused/sleeping bindings intentionally have no session; leaving them out
+		// of the valid set lets the reaper kill any session that lingers.
+		if b.Paused || b.Sleeping {
 			continue
 		}
 		valid[b.TmuxSession] = true

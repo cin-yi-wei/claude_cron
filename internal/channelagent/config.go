@@ -3,6 +3,7 @@ package channelagent
 import (
 	"fmt"
 	"path/filepath"
+	"time"
 )
 
 type Config struct {
@@ -15,6 +16,22 @@ type Config struct {
 	Push         PushConfig     `json:"push,omitempty"`
 	Admin        AdminConfig    `json:"admin,omitempty"`
 	Control      ControlConfig  `json:"control,omitempty"`
+	// IdleSleepMinutes: a binding idle this long auto-sleeps (session killed to
+	// free RAM; auto-wakes on next message). 0 = default (30 min); <0 = disabled.
+	IdleSleepMinutes int `json:"idle_sleep_minutes,omitempty"`
+}
+
+// IdleSleepTimeout resolves the auto-sleep idle threshold. Zero return = feature
+// disabled (the supervisor only sleeps when timeout > 0).
+func (c Config) IdleSleepTimeout() time.Duration {
+	m := c.IdleSleepMinutes
+	if m == 0 {
+		m = 30 // default: sleep after 30 min idle
+	}
+	if m < 0 {
+		return 0 // explicitly disabled
+	}
+	return time.Duration(m) * time.Minute
 }
 
 // ControlConfig configures the control channel's own ingestion. Mode "push"

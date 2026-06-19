@@ -35,8 +35,9 @@ type adminBindingDTO struct {
 	// legacy poll/push mode). Mode is kept for reference but is fallback-only.
 	Transport string `json:"transport"`
 	// Control marks a control-plane binding; Default marks the protected one.
-	Control bool `json:"control"`
-	Default bool `json:"default"`
+	Control  bool `json:"control"`
+	Default  bool `json:"default"`
+	Sleeping bool `json:"sleeping"`
 }
 
 type adminStatusDTO struct {
@@ -201,7 +202,7 @@ func (h AdminHandler) listBindings(w http.ResponseWriter) {
 			Name: b.Name, Platform: b.PlatformOf(), Mode: b.ModeOf(),
 			ChannelID: b.ChannelID, Branch: b.Branch, TmuxSession: b.TmuxSession,
 			Plane: b.PlaneOf(), Paused: b.Paused, Transport: cfg.Transport(b),
-			Control: b.Control, Default: b.Default,
+			Control: b.Control, Default: b.Default, Sleeping: b.Sleeping,
 		})
 	}
 	writeJSONResponse(w, out)

@@ -8,6 +8,7 @@
   let loading = $state(false);
 
   function active(b) { return !b.paused && b._alive; }
+  function chattable(b) { return active(b) || b.sleeping; } // sending wakes a slept binding
 
   export async function refresh() {
     err = ''; loading = true;
@@ -60,10 +61,10 @@
               {#if b.control}<span class="badge ctrl">{t('bindings.control')}{b.default ? ' 🛡' : ''}</span>{/if}
             </td>
             <td><span class="badge">{b.platform} · {b.transport}</span></td>
-            <td>{#if b.paused}<span class="muted">{t('bindings.paused')}</span>{:else}{b._alive ? '🟢' : '🔴'} <small class="muted">{b.tmux_session}</small>{/if}</td>
+            <td>{#if b.paused}<span class="muted">{t('bindings.paused')}</span>{:else if b.sleeping}<span class="muted">💤 sleeping</span>{:else}{b._alive ? '🟢' : '🔴'} <small class="muted">{b.tmux_session}</small>{/if}</td>
             <td><small>{b._q || ''}</small></td>
             <td class="actions">
-              {#if active(b)}
+              {#if chattable(b)}
                 <a role="button" class="mini" href={'#/chat/' + b.name}>💬</a>
               {/if}
               {#if b.paused}
