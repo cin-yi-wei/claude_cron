@@ -1,5 +1,6 @@
 <script>
   import { getJSON, sendJSON } from './lib/api.js';
+  import { t } from './lib/i18n.svelte.js';
   let { token } = $props();
   let c = $state(null);
   let err = $state('');
@@ -31,10 +32,10 @@
     if (f.push_secret) body.push_secret = f.push_secret;
     if (f.discord_token) body.discord_token = f.discord_token;
     if (f.telegram_token) body.telegram_token = f.telegram_token;
-    if (!confirm('儲存設定並重啟 serve？')) return;
+    if (!confirm(t('settings.confirm'))) return;
     try {
       const j = await sendJSON(token, 'PUT', '/api/config', body);
-      msg = j.restarting ? 'saved — 正在重啟 serve…' : 'saved (需手動重啟)';
+      msg = j.restarting ? t('settings.saved.restarting') : t('settings.saved.manual');
     } catch (e) { err = String(e); }
   }
 
@@ -42,7 +43,7 @@
 </script>
 
 <article>
-  <header><strong>Settings</strong> <small class="muted">(儲存會重啟 serve 套用)</small></header>
+  <header><strong>{t('settings.title')}</strong> <small class="muted">{t('settings.note')}</small></header>
   {#if err}<p class="bad">{err}</p>{/if}
   {#if msg}<p class="ok">{msg}</p>{/if}
   {#if c}
@@ -66,9 +67,9 @@
       <label>discord bot token <input type="password" bind:value={f.discord_token} placeholder={c.discord_token_set ? '(set — 留空=不變)' : '(none)'} autocomplete="off" /></label>
       <label>telegram bot token <input type="password" bind:value={f.telegram_token} placeholder={c.telegram_token_set ? '(set — 留空=不變)' : '(none)'} autocomplete="off" /></label>
     </div>
-    <button onclick={save}>Save &amp; Restart serve</button>
+    <button onclick={save}>{t('settings.save')}</button>
   {:else}
-    <p class="muted"><em>載入中…（檢查 token）</em></p>
+    <p class="muted"><em>{t('common.loading')}</em></p>
   {/if}
 </article>
 

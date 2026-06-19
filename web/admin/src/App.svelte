@@ -3,6 +3,7 @@
   import Settings from './Settings.svelte';
   import CreateBinding from './CreateBinding.svelte';
   import Chat from './Chat.svelte';
+  import { t, getLocale, setLocale, LOCALES } from './lib/i18n.svelte.js';
 
   let token = $state(localStorage.getItem('cc_admin_token') || '');
   $effect(() => { localStorage.setItem('cc_admin_token', token); });
@@ -20,13 +21,11 @@
   });
 
   const nav = [
-    { id: 'bindings', label: 'Bindings', href: '#/bindings' },
-    { id: 'chat', label: 'Chat', href: '#/chat' },
-    { id: 'create', label: 'Create', href: '#/create' },
-    { id: 'settings', label: 'Settings', href: '#/settings' },
+    { id: 'bindings', key: 'nav.bindings', href: '#/bindings' },
+    { id: 'chat', key: 'nav.chat', href: '#/chat' },
+    { id: 'create', key: 'nav.create', href: '#/create' },
+    { id: 'settings', key: 'nav.settings', href: '#/settings' },
   ];
-
-  let bindingsRef = $state(null);
 </script>
 
 <nav class="container-fluid topnav">
@@ -35,15 +34,20 @@
   </ul>
   <ul>
     {#each nav as n}
-      <li><a href={n.href} class={route.view === n.id ? 'active' : ''}>{n.label}</a></li>
+      <li><a href={n.href} class={route.view === n.id ? 'active' : ''}>{t(n.key)}</a></li>
     {/each}
-    <li><input class="tok" type="password" bind:value={token} placeholder="token" autocomplete="off" /></li>
+    <li>
+      <select class="lang" value={getLocale()} onchange={(e) => setLocale(e.currentTarget.value)}>
+        {#each LOCALES as l}<option value={l.id}>{l.label}</option>{/each}
+      </select>
+    </li>
+    <li><input class="tok" type="password" bind:value={token} placeholder={t('common.token')} autocomplete="off" /></li>
   </ul>
 </nav>
 
 <main class="container">
   {#if route.view === 'bindings'}
-    <Bindings {token} bind:this={bindingsRef} />
+    <Bindings {token} />
   {:else if route.view === 'create'}
     <CreateBinding {token} onCreated={() => (location.hash = '#/bindings')} />
   {:else if route.view === 'settings'}
@@ -51,11 +55,11 @@
   {:else if route.view === 'chat'}
     {#if route.arg}
       <Chat name={route.arg} {token} />
-      <p><a href="#/bindings">← 回 bindings</a></p>
+      <p><a href="#/bindings">{t('chat.back')}</a></p>
     {:else}
       <article>
-        <header><strong>Chat</strong></header>
-        <p class="muted">從 <a href="#/bindings">Bindings</a> 清單按 💬 開一個 active session 的聊天。</p>
+        <header><strong>{t('nav.chat')}</strong></header>
+        <p class="muted">{t('chat.pick')}</p>
       </article>
     {/if}
   {/if}
@@ -67,6 +71,7 @@
   .topnav a { padding: .4rem .6rem; border-radius: var(--pico-border-radius); text-decoration: none; }
   .topnav a.active { background: var(--pico-primary-background); color: var(--pico-primary-inverse); }
   .muted { color: var(--pico-muted-color); }
-  .tok { width: 130px; font-size: .75rem; padding: .2rem .4rem; margin: 0; }
+  .lang { width: auto; font-size: .75rem; padding: .15rem 1.4rem .15rem .4rem; margin: 0; }
+  .tok { width: 120px; font-size: .75rem; padding: .2rem .4rem; margin: 0; }
   main.container { max-width: 1000px; padding-top: 1rem; }
 </style>

@@ -1,5 +1,6 @@
 <script>
   import { getJSON, sendJSON } from './lib/api.js';
+  import { t } from './lib/i18n.svelte.js';
   let { token } = $props();
   let bindings = $state([]);
   let err = $state('');
@@ -34,7 +35,7 @@
   }
 
   function del(name) {
-    if (!confirm('unbind ' + name + '?')) return;
+    if (!confirm(t('unbind.confirm', { name }))) return;
     act(name, 'delete', 'DELETE', '/api/bindings/' + encodeURIComponent(name));
   }
 
@@ -43,23 +44,23 @@
 
 <article>
   <header>
-    <strong>Bindings</strong> ({bindings.length})
+    <strong>{t('bindings.title')}</strong> ({bindings.length})
     <button class="mini" onclick={refresh} aria-busy={loading} style="float:right">↻</button>
   </header>
   {#if err}<p class="bad">{err}</p>{/if}
   {#if msg}<p class="ok">{msg}</p>{/if}
   <div style="overflow-x:auto">
     <table>
-      <thead><tr><th>name</th><th>kind</th><th>session</th><th>queue</th><th>actions</th></tr></thead>
+      <thead><tr><th>{t('bindings.col.name')}</th><th>{t('bindings.col.kind')}</th><th>{t('bindings.col.session')}</th><th>{t('bindings.col.queue')}</th><th>{t('bindings.col.actions')}</th></tr></thead>
       <tbody>
         {#each bindings as b}
           <tr>
             <td>
               <strong>{b.name}</strong>
-              {#if b.control}<span class="badge ctrl">control{b.default ? ' 🛡' : ''}</span>{/if}
+              {#if b.control}<span class="badge ctrl">{t('bindings.control')}{b.default ? ' 🛡' : ''}</span>{/if}
             </td>
             <td><span class="badge">{b.platform} · {b.transport}</span></td>
-            <td>{#if b.paused}<span class="muted">⏸ paused</span>{:else}{b._alive ? '🟢' : '🔴'} <small class="muted">{b.tmux_session}</small>{/if}</td>
+            <td>{#if b.paused}<span class="muted">{t('bindings.paused')}</span>{:else}{b._alive ? '🟢' : '🔴'} <small class="muted">{b.tmux_session}</small>{/if}</td>
             <td><small>{b._q || ''}</small></td>
             <td class="actions">
               {#if active(b)}
@@ -80,7 +81,7 @@
           </tr>
         {/each}
         {#if bindings.length === 0}
-          <tr><td colspan="5"><em class="muted">none (check token)</em></td></tr>
+          <tr><td colspan="5"><em class="muted">{t('common.none')}</em></td></tr>
         {/if}
       </tbody>
     </table>

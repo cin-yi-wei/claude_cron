@@ -1,8 +1,9 @@
 <script>
+  import { t } from './lib/i18n.svelte.js';
   let { name, token } = $props();
   let messages = $state([]);
   let input = $state('');
-  let status = $state('connecting…');
+  let status = $state('connecting'); // connecting | live | reconnecting
   let es;
 
   async function loadHistory() {
@@ -18,11 +19,11 @@
 
   function connect() {
     if (es) es.close();
-    status = 'connecting…';
+    status = 'connecting';
     const q = token ? '?token=' + encodeURIComponent(token) : '';
     es = new EventSource('/api/chat/' + encodeURIComponent(name) + '/stream' + q);
     es.onopen = () => { status = 'live'; };
-    es.onerror = () => { status = 'reconnecting…'; };
+    es.onerror = () => { status = 'reconnecting'; };
     es.onmessage = (e) => {
       try {
         const ev = JSON.parse(e.data);
@@ -55,7 +56,7 @@
 </script>
 
 <article class="chat">
-  <header><strong>💬 {name}</strong> <small>· {status}</small></header>
+  <header><strong>💬 {name}</strong> <small>· {t('chat.status.' + status)}</small></header>
   <div class="log">
     {#each messages as m}
       <div class="msg {m.role}">
@@ -63,12 +64,12 @@
         <span class="txt">{m.text}</span>
       </div>
     {/each}
-    {#if messages.length === 0}<p class="muted"><em>還沒有訊息。輸入後送出，會注入 cc-{name} session。</em></p>{/if}
+    {#if messages.length === 0}<p class="muted"><em>{t('chat.empty', { name })}</em></p>{/if}
   </div>
   <form onsubmit={(e) => { e.preventDefault(); send(); }}>
     <div role="group">
-      <input bind:value={input} placeholder="輸入訊息給 {name}…" />
-      <button type="submit">送出</button>
+      <input bind:value={input} placeholder={t('chat.placeholder', { name })} />
+      <button type="submit">{t('chat.send')}</button>
     </div>
   </form>
 </article>

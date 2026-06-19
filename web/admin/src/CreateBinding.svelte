@@ -1,5 +1,6 @@
 <script>
   import { sendJSON } from './lib/api.js';
+  import { t } from './lib/i18n.svelte.js';
   let { token, onCreated } = $props();
   let kind = $state('worker'); // 'worker' | 'control'
   let f = $state({ name: '', project_dir: '', branch: '', platform: '', mode: '', chat_id: '' });
@@ -26,19 +27,19 @@
 </script>
 
 <article>
-  <header><strong>Create</strong></header>
+  <header><strong>{t('create.title')}</strong></header>
   <div role="group" class="tabs">
-    <button class={kind === 'worker' ? '' : 'outline'} onclick={() => (kind = 'worker')}>Worker</button>
-    <button class={kind === 'control' ? '' : 'outline'} onclick={() => (kind = 'control')}>Control</button>
+    <button class={kind === 'worker' ? '' : 'outline'} onclick={() => (kind = 'worker')}>{t('create.worker')}</button>
+    <button class={kind === 'control' ? '' : 'outline'} onclick={() => (kind = 'control')}>{t('create.control')}</button>
   </div>
   {#if err}<p class="bad">{err}</p>{/if}
   {#if msg}<p class="ok">{msg}</p>{/if}
 
   <div class="grid">
-    <label>name <input bind:value={f.name} placeholder="a-z0-9-" /></label>
-    <label>platform
+    <label>{t('create.name')} <input bind:value={f.name} placeholder="a-z0-9-" /></label>
+    <label>{t('create.platform')}
       <select bind:value={f.platform}>
-        {#if kind === 'control'}<option value="">web (預設)</option>{:else}<option value="">discord (預設)</option>{/if}
+        {#if kind === 'control'}<option value="">web</option>{:else}<option value="">discord</option>{/if}
         {#if kind === 'control'}<option value="web">web</option>{/if}
         <option value="dc">discord</option>
         <option value="tg">telegram</option>
@@ -48,24 +49,24 @@
 
   {#if kind === 'worker'}
     <div class="grid">
-      <label>project dir <input bind:value={f.project_dir} placeholder="/path/to/repo" /></label>
-      <label>branch <input bind:value={f.branch} placeholder="dev" /></label>
+      <label>{t('create.dir')} <input bind:value={f.project_dir} placeholder="/path/to/repo" /></label>
+      <label>{t('create.branch')} <input bind:value={f.branch} placeholder="dev" /></label>
     </div>
     <div class="grid">
-      <label>mode
-        <select bind:value={f.mode}><option value="">poll (預設)</option><option value="push">push</option></select>
+      <label>{t('create.mode')}
+        <select bind:value={f.mode}><option value="">poll</option><option value="push">push</option></select>
       </label>
-      <label>chat-id (tg) <input bind:value={f.chat_id} /></label>
+      <label>{t('create.chatid')} <input bind:value={f.chat_id} /></label>
     </div>
   {:else}
     <div class="grid">
-      <label>chat-id (tg control 用) <input bind:value={f.chat_id} /></label>
+      <label>{t('create.chatid')} <input bind:value={f.chat_id} /></label>
       <div></div>
     </div>
-    <p class="muted"><small>Control 不用綁目錄/分支。第一個建立的 control 會成為受保護的預設🛡。</small></p>
+    <p class="muted"><small>{t('create.controlHint')}</small></p>
   {/if}
 
-  <button onclick={create}>Create {kind}</button>
+  <button onclick={create}>{t('create.submit')}</button>
 </article>
 
 <style>
