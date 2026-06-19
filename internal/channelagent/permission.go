@@ -147,6 +147,12 @@ func summarizeToolInput(toolName string, raw json.RawMessage) string {
 	if cmd, ok := m["command"].(string); ok && cmd != "" { // Bash
 		return cmd
 	}
+	if u, ok := m["url"].(string); ok && u != "" { // WebFetch
+		return u
+	}
+	if q, ok := m["query"].(string); ok && q != "" { // WebSearch
+		return q
+	}
 	s := string(raw)
 	if len(s) > 200 {
 		s = s[:200] + "…"

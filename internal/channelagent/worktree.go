@@ -44,30 +44,53 @@ func waitSessionReady(ctx context.Context, session string) {
 	}
 }
 
-// agentSettings is the Claude Code permission allowlist written into each
-// binding's worktree so the driven agent can read the job, write its reply, and
-// rename the output file without interactive permission prompts (which a
-// tmux-driven session cannot answer). Scoped to the tools the agent prompt uses.
-// WebFetch/WebSearch are allowed outright (read-only, low-risk) so a tmux-driven
-// session never hangs on Claude Code's native domain-approval prompt — which it
-// cannot answer interactively. Risky Bash + MCP still route through the gate.
+// agentSettings is the Claude Code permission config for a WORKER binding's
+// worktree. Read/Write/Edit are auto-allowed (read job, write reply); Bash,
+// WebFetch, WebSearch and MCP route through the permission-gate so the user
+// approves them in the channel (a tmux-driven session can't answer Claude's own
+// interactive prompt, so everything not auto-allowed must go through the gate).
 const agentSettings = `{
   "permissions": {
-    "allow": ["Read", "Write", "Edit", "WebFetch", "WebSearch"]
+    "allow": ["Read", "Write", "Edit"]
   },
   "hooks": {
     "PreToolUse": [
       { "matcher": "Bash", "hooks": [ { "type": "command", "command": "claude-cron permission-gate" } ] },
+      { "matcher": "WebFetch", "hooks": [ { "type": "command", "command": "claude-cron permission-gate" } ] },
+      { "matcher": "WebSearch", "hooks": [ { "type": "command", "command": "claude-cron permission-gate" } ] },
       { "matcher": "mcp__.*", "hooks": [ { "type": "command", "command": "claude-cron permission-gate" } ] }
     ]
   }
 }
 `
 
-// EnsureAgentSettings writes .claude/settings.local.json into dir if it does not
-// already exist, so a freshly-created worktree grants the agent the permissions
-// it needs to run unattended. An existing file is left untouched.
-func EnsureAgentSettings(dir string) error {
+// controlAgentSettings is the permission config for a CONTROL session. Same as a
+// worker BUT Bash is auto-allowed (the control assistant runs management/deploy
+// shell freely — gating it would prompt on every git/curl/sudo). WebFetch /
+// WebSearch / MCP still route through the gate → the user approves in the channel.
+const controlAgentSettings = `{
+  "permissions": {
+    "allow": ["Read", "Write", "Edit", "Bash"]
+  },
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "WebFetch", "hooks": [ { "type": "command", "command": "claude-cron permission-gate" } ] },
+      { "matcher": "WebSearch", "hooks": [ { "type": "command", "command": "claude-cron permission-gate" } ] },
+      { "matcher": "mcp__.*", "hooks": [ { "type": "command", "command": "claude-cron permission-gate" } ] }
+    ]
+  }
+}
+`
+
+// EnsureAgentSettings writes the WORKER permission config into dir's
+// .claude/settings.local.json if absent (existing file left untouched).
+func EnsureAgentSettings(dir string) error { return writeAgentSettings(dir, agentSettings) }
+
+// EnsureControlSettings writes the CONTROL permission config (Bash auto-allowed,
+// WebFetch/WebSearch/MCP gated) into dir if absent.
+func EnsureControlSettings(dir string) error { return writeAgentSettings(dir, controlAgentSettings) }
+
+func writeAgentSettings(dir, content string) error {
 	settingsPath := filepath.Join(dir, ".claude", "settings.local.json")
 	if _, err := os.Stat(settingsPath); err == nil {
 		return nil
@@ -75,7 +98,7 @@ func EnsureAgentSettings(dir string) error {
 	if err := os.MkdirAll(filepath.Dir(settingsPath), 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(settingsPath, []byte(agentSettings), 0o644)
+	return os.WriteFile(settingsPath, []byte(content), 0o644)
 }
 
 // gitIdentity supplies a fallback committer so commits work even when the host
@@ -249,7 +272,7 @@ func claudeArgs(cwd string, extra ...string) []string {
 // assistant's `claude-cron` management calls can authenticate). No-op if the
 // session already exists. tokenEnv is the env var name, tokenValue its value.
 func StartControlSession(ctx context.Context, session, cwd, tokenEnv, tokenValue, systemPrompt string) error {
-	if err := EnsureAgentSettings(cwd); err != nil {
+	if err := EnsureControlSettings(cwd); err != nil {
 		return err
 	}
 	if runExternalCommand(ctx, "tmux", "has-session", "-t", session) == nil {
