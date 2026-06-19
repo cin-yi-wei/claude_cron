@@ -170,12 +170,19 @@ func TestChatHistoryReplaysThread(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("history status = %d", rec.Code)
 	}
-	var got []ChatEvent
-	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+	var resp struct {
+		Messages []ChatEvent `json:"messages"`
+		HasMore  bool        `json:"has_more"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
+	got := resp.Messages
 	if len(got) != 2 {
 		t.Fatalf("history len = %d, want 2 (non-send excluded): %#v", len(got), got)
+	}
+	if resp.HasMore {
+		t.Fatalf("has_more should be false (only 2 messages)")
 	}
 	roles := got[0].Role + "," + got[1].Role
 	if roles != "user,assistant" {
@@ -183,6 +190,29 @@ func TestChatHistoryReplaysThread(t *testing.T) {
 	}
 	if got[0].Text != "hi there" || got[1].Text != "hello back" {
 		t.Fatalf("texts = %#v", got)
+	}
+
+	// Paging: limit=1 returns only the newest (assistant), with has_more.
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/api/chat/webx/history?limit=1", nil))
+	var p1 struct {
+		Messages []ChatEvent `json:"messages"`
+		HasMore  bool        `json:"has_more"`
+	}
+	_ = json.Unmarshal(rec2.Body.Bytes(), &p1)
+	if len(p1.Messages) != 1 || p1.Messages[0].Text != "hello back" || !p1.HasMore {
+		t.Fatalf("page1 = %#v has_more=%v", p1.Messages, p1.HasMore)
+	}
+	// before=1 skips the newest → returns the older user message, no more.
+	rec3 := httptest.NewRecorder()
+	h.ServeHTTP(rec3, httptest.NewRequest(http.MethodGet, "/api/chat/webx/history?limit=1&before=1", nil))
+	var p2 struct {
+		Messages []ChatEvent `json:"messages"`
+		HasMore  bool        `json:"has_more"`
+	}
+	_ = json.Unmarshal(rec3.Body.Bytes(), &p2)
+	if len(p2.Messages) != 1 || p2.Messages[0].Text != "hi there" || p2.HasMore {
+		t.Fatalf("page2 = %#v has_more=%v", p2.Messages, p2.HasMore)
 	}
 }
 

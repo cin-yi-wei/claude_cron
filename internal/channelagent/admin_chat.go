@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -148,18 +149,49 @@ func newWebMessageID() string {
 	return fmt.Sprintf("web-%d-%s", time.Now().UnixNano(), hex.EncodeToString(b[:]))
 }
 
-// historyChat replays the binding's past conversation so a freshly-opened chat
-// window shows the existing thread instead of starting blank. Sources: processed
-// user messages (inbox/done, plus in-flight pending/processing) and sent replies
-// (outbox/sent, plus outbox/pending). Ordered by file mtime — a user message is
-// moved to done right before its reply is written, so the order comes out right.
-func (h AdminHandler) historyChat(w http.ResponseWriter, name string) {
+// historyChat replays the binding's past conversation, PAGED newest-first so the
+// window opens on the latest messages and loads older ones on scroll-up. Query:
+//   limit  — page size (default 30, max 200)
+//   before — number of newest messages to skip (the count already loaded)
+// Returns {messages: [...oldest→newest for this page], has_more: bool}. Sources:
+// user messages (inbox/done + in-flight) and sent replies (outbox), by mtime.
+func (h AdminHandler) historyChat(w http.ResponseWriter, r *http.Request, name string) {
 	b, ok := h.chatBinding(name)
 	if !ok {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
-	writeJSONResponse(w, readChatHistory(b.Root))
+	all := readChatHistory(b.Root) // oldest → newest
+	limit := atoiClamp(r.URL.Query().Get("limit"), 30, 1, 200)
+	before := atoiClamp(r.URL.Query().Get("before"), 0, 0, 1<<30)
+	n := len(all)
+	end := n - before
+	if end < 0 {
+		end = 0
+	}
+	start := end - limit
+	if start < 0 {
+		start = 0
+	}
+	writeJSONResponse(w, map[string]any{
+		"messages": all[start:end],
+		"has_more": start > 0,
+	})
+}
+
+// atoiClamp parses s to an int, falling back to def, then clamps to [min,max].
+func atoiClamp(s string, def, min, max int) int {
+	v := def
+	if n, err := strconv.Atoi(s); err == nil {
+		v = n
+	}
+	if v < min {
+		v = min
+	}
+	if v > max {
+		v = max
+	}
+	return v
 }
 
 type stampedEvent struct {

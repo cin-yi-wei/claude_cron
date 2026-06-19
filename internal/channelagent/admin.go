@@ -125,7 +125,7 @@ func (h AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				methodNotAllowed(w)
 				return
 			}
-			h.historyChat(w, name)
+			h.historyChat(w, r, name)
 			return
 		}
 		http.NotFound(w, r)
