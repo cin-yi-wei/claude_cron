@@ -2,6 +2,32 @@
   import { tick } from 'svelte';
   import { getJSON } from './lib/api.js';
   import { t } from './lib/i18n.svelte.js';
+  // Syntax highlighting: hljs core + only the languages we care about (keeps the
+  // bundle small vs the full build). diff blocks keep our own red/green render.
+  import hljs from 'highlight.js/lib/core';
+  import go from 'highlight.js/lib/languages/go';
+  import javascript from 'highlight.js/lib/languages/javascript';
+  import typescript from 'highlight.js/lib/languages/typescript';
+  import python from 'highlight.js/lib/languages/python';
+  import bash from 'highlight.js/lib/languages/bash';
+  import json from 'highlight.js/lib/languages/json';
+  import ruby from 'highlight.js/lib/languages/ruby';
+  import 'highlight.js/styles/github-dark.css';
+  hljs.registerLanguage('go', go);
+  hljs.registerLanguage('javascript', javascript);
+  hljs.registerLanguage('typescript', typescript);
+  hljs.registerLanguage('python', python);
+  hljs.registerLanguage('bash', bash);
+  hljs.registerLanguage('json', json);
+  hljs.registerLanguage('ruby', ruby);
+
+  function hl(lang, code) {
+    if (lang && hljs.getLanguage(lang)) {
+      try { return hljs.highlight(code, { language: lang, ignoreIllegals: true }).value; } catch {}
+    }
+    return code.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
   let { name, token } = $props();
 
   let messages = $state([]); // oldest → newest
@@ -103,7 +129,7 @@
     let last = 0, mm;
     while ((mm = re.exec(text))) {
       if (mm.index > last) parts.push({ t: 'text', c: text.slice(last, mm.index) });
-      parts.push({ t: mm[1] === 'diff' ? 'diff' : 'code', c: mm[2].replace(/\n$/, '') });
+      parts.push({ t: mm[1] === 'diff' ? 'diff' : 'code', lang: mm[1], c: mm[2].replace(/\n$/, '') });
       last = re.lastIndex;
     }
     if (last < text.length) parts.push({ t: 'text', c: text.slice(last) });
@@ -128,7 +154,7 @@
             {#if seg.t === 'diff'}
               <pre class="code diff">{#each seg.c.split('\n') as ln}<span style={dcls(ln) === 'add' ? 'color:#3fb950' : dcls(ln) === 'del' ? 'color:#f85149' : ''}>{ln}{'\n'}</span>{/each}</pre>
             {:else if seg.t === 'code'}
-              <pre class="code">{seg.c}</pre>
+              <pre class="code hljs"><code>{@html hl(seg.lang, seg.c)}</code></pre>
             {:else}<span>{seg.c}</span>{/if}
           {/each}
         </span>
