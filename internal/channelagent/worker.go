@@ -74,7 +74,10 @@ func RunWorkerOnce(ctx context.Context, root string, injector Injector, timeout 
 
 	outputPath := pathIn(root, "outbox", "pending", job.JobID+".json")
 	if err := injector.Inject(ctx, job, outputPath); err != nil {
-		_ = moveFile(processingPath, pathIn(root, "inbox", "failed", name))
+		// Inject failure usually means the message never landed (e.g. a session
+		// still cold from --resume). Requeue for a retry rather than losing it;
+		// only give up (→ failed) after a few attempts.
+		requeueOrFail(root, processingPath, name, job)
 		return true, err
 	}
 
@@ -91,6 +94,23 @@ func RunWorkerOnce(ctx context.Context, root string, injector Injector, timeout 
 		return true, err
 	}
 	return true, nil
+}
+
+// maxJobAttempts bounds inject retries before a job is moved to failed.
+const maxJobAttempts = 3
+
+// requeueOrFail puts a job back in pending for another attempt (incrementing
+// Attempt), or moves it to failed once attempts are exhausted. Used for inject
+// failures, which usually mean the message never reached the session.
+func requeueOrFail(root, processingPath, name string, job InputJob) {
+	job.Attempt++
+	if job.Attempt < maxJobAttempts {
+		if AtomicWriteJSON(pathIn(root, "inbox", "pending", name), job) == nil {
+			_ = os.Remove(processingPath)
+			return
+		}
+	}
+	_ = moveFile(processingPath, pathIn(root, "inbox", "failed", name))
 }
 
 func ValidateOutput(job InputJob, output OutputJob) error {

@@ -162,9 +162,20 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 			if countJSON(pathIn(b.Root, "inbox", "pending")) == 0 {
 				continue // stay asleep
 			}
+			// Wake: clear the flag + recreate the session NOW, but DON'T process
+			// this cycle. A freshly --resume'd session needs time to load its
+			// transcript before it reliably accepts input; injecting too early
+			// drops the message (the bug that lost a test message). Leave the
+			// message in pending — next cycle (warm) processes it.
 			reg.SetSleeping(b.Name, false)
 			_ = SaveRegistry(root, reg)
-			fmt.Fprintf(stdout, "binding %s waking (input arrived)\n", b.Name)
+			if err := EnsureWorktree(ctx, b.ProjectDir, b.Branch, b.Worktree); err != nil {
+				fmt.Fprintf(stdout, "binding %s wake worktree error: %v\n", b.Name, err)
+			} else if err := StartTmuxClaude(ctx, b.TmuxSession, b.Worktree, root); err != nil {
+				fmt.Fprintf(stdout, "binding %s wake session error: %v\n", b.Name, err)
+			}
+			fmt.Fprintf(stdout, "binding %s woken (warming; processes next cycle)\n", b.Name)
+			continue
 		} else if shouldSleep(b.Root, b.Worktree, cfg.IdleSleepTimeout()) {
 			_ = StopTmuxSession(ctx, b.TmuxSession)
 			reg.SetSleeping(b.Name, true)
