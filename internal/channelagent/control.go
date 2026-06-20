@@ -67,6 +67,9 @@ type ControlDeps struct {
 	StartSession   func(ctx context.Context, session, cwd string) error
 	StopSession    func(ctx context.Context, session string) error
 	InitRoot       func(root string) error
+	// NotifyChannel posts a plain message into a binding's own channel (used to
+	// announce a (re)bind in the worker channel). Optional; nil = skip.
+	NotifyChannel func(ctx context.Context, platform, channelID, text string) error
 }
 
 const controlUsage = "指令: /bind <name> <project-dir> <branch> [--platform=dc|tg] [--mode=poll|push] [--chat-id=<id> (tg)] | /bind <name> --control [--platform=web|dc|tg] [--chat-id=<id>] | /unbind <name> [--delete-channel] | /pause <name> | /resume <name> | /set-default <name> | /list | /status <name> | /help"
@@ -234,6 +237,15 @@ func handleBind(ctx context.Context, deps ControlDeps, reg *Registry, cmd Comman
 	verb := "綁定"
 	if reusedChannel {
 		verb = "重新綁定"
+	}
+	// Announce in the binding's OWN channel that the session is live again, so a
+	// user watching that channel sees it come back (not just the control channel).
+	if deps.NotifyChannel != nil && b.PlatformOf() != PlatformWeb && b.ChannelID != "" {
+		notice := fmt.Sprintf("🔄 已重新綁定，session `%s` 回來了（branch %s），可以繼續聊。", b.TmuxSession, branch)
+		if !reusedChannel {
+			notice = fmt.Sprintf("✅ 已綁定，session `%s` 上線（branch %s）。", b.TmuxSession, branch)
+		}
+		_ = deps.NotifyChannel(ctx, b.PlatformOf(), b.ChannelID, notice)
 	}
 	return fmt.Sprintf("✅ %s %s [%s/%s] → channel %s (branch %s, session %s)", verb, name, b.PlatformOf(), b.ModeOf(), channelID, branch, b.TmuxSession), true, nil
 }
@@ -573,6 +585,7 @@ name 只能用小寫字母、數字、減號。回覆使用者時直接用一般
 // /bind and `claude-cron bind` behave identically.
 func BuildControlDeps(root string, cfg Config) ControlDeps {
 	token := os.Getenv(cfg.Discord.TokenEnv)
+	tgToken := os.Getenv(cfg.Telegram.TokenEnv)
 	admin := DiscordAdmin{BaseURL: cfg.Discord.BaseURL, Token: token}
 	return ControlDeps{
 		Root:           root,
@@ -586,6 +599,17 @@ func BuildControlDeps(root string, cfg Config) ControlDeps {
 		StartSession:   func(ctx context.Context, session, cwd string) error { return StartTmuxClaude(ctx, session, cwd, root) },
 		StopSession:    StopTmuxSession,
 		InitRoot:       Init,
+		NotifyChannel: func(ctx context.Context, platform, channelID, text string) error {
+			out := OutputJob{Schema: 1, Send: true, Text: text}
+			switch platform {
+			case PlatformTelegram:
+				return TelegramSender{BaseURL: cfg.Telegram.BaseURL, Token: tgToken, ChatID: channelID}.Send(ctx, out)
+			case PlatformWeb:
+				return nil // web has its own in-browser chat; no external channel
+			default:
+				return DiscordSender{BaseURL: cfg.Discord.BaseURL, Token: token, ChannelID: channelID}.Send(ctx, out)
+			}
+		},
 	}
 }
 
