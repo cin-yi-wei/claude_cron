@@ -234,16 +234,22 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 		// Stall watchdog: if the session has queued work but its transcript has
 		// gone silent past the threshold, it's stuck — kill it so the next cycle
 		// recreates it (--resume retries). Repeated stalls drop the poison job.
-		switch stallAction(b.Root, b.Worktree, cfg.StallTimeout(), 3) {
-		case "kill":
-			_ = StopTmuxSession(ctx, b.TmuxSession)
-			fmt.Fprintf(stdout, "binding %s stalled — restarting session\n", b.Name)
-			continue
-		case "giveup":
-			_ = StopTmuxSession(ctx, b.TmuxSession)
-			failStuckJobs(b.Root)
-			fmt.Fprintf(stdout, "binding %s stalled repeatedly — dropped stuck job + restarting\n", b.Name)
-			continue
+		// EXCEPTION: a session blocked on a pending permission request is waiting on
+		// the HUMAN, not stuck — its transcript is legitimately silent. Skip the
+		// kill (it would drop the in-flight tool and orphan the permission) but still
+		// fall through so the worker can process the user's y/n reply this cycle.
+		if oldestPendingPermission(b.Root) == "" {
+			switch stallAction(b.Root, b.Worktree, cfg.StallTimeout(), 3) {
+			case "kill":
+				_ = StopTmuxSession(ctx, b.TmuxSession)
+				fmt.Fprintf(stdout, "binding %s stalled — restarting session\n", b.Name)
+				continue
+			case "giveup":
+				_ = StopTmuxSession(ctx, b.TmuxSession)
+				failStuckJobs(b.Root)
+				fmt.Fprintf(stdout, "binding %s stalled repeatedly — dropped stuck job + restarting\n", b.Name)
+				continue
+			}
 		}
 		tokens := bindingTokens{discord: token, telegram: os.Getenv(cfg.Telegram.TokenEnv)}
 		sender, err := SelectSender(b, cfg, tokens)

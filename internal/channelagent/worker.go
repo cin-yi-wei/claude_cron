@@ -62,6 +62,11 @@ func RunWorkerOnce(ctx context.Context, root string, injector Injector, timeout 
 				_ = moveFile(processingPath, pathIn(root, "inbox", "failed", name))
 				return true, err
 			}
+			// Also clear the pending file ourselves. Normally the blocked gate hook
+			// removes it on return, but if that process died (e.g. Claude's own hook
+			// timeout killed it before the user replied), the pending would linger and
+			// poison every future y/n for this binding. Removing it here self-heals.
+			_ = os.Remove(pathIn(root, "permissions", "pending", id+".json"))
 			_ = moveFile(processingPath, pathIn(root, "inbox", "done", name))
 			return true, nil
 		}

@@ -58,10 +58,10 @@ const agentSettings = `{
       { "hooks": [ { "type": "command", "command": "claude-cron session-hook" } ] }
     ],
     "PreToolUse": [
-      { "matcher": "Bash", "hooks": [ { "type": "command", "command": "claude-cron permission-gate" } ] },
-      { "matcher": "WebFetch", "hooks": [ { "type": "command", "command": "claude-cron permission-gate" } ] },
-      { "matcher": "WebSearch", "hooks": [ { "type": "command", "command": "claude-cron permission-gate" } ] },
-      { "matcher": "mcp__.*", "hooks": [ { "type": "command", "command": "claude-cron permission-gate" } ] }
+      { "matcher": "Bash", "hooks": [ { "type": "command", "command": "claude-cron permission-gate --timeout=600s", "timeout": 660 } ] },
+      { "matcher": "WebFetch", "hooks": [ { "type": "command", "command": "claude-cron permission-gate --timeout=600s", "timeout": 660 } ] },
+      { "matcher": "WebSearch", "hooks": [ { "type": "command", "command": "claude-cron permission-gate --timeout=600s", "timeout": 660 } ] },
+      { "matcher": "mcp__.*", "hooks": [ { "type": "command", "command": "claude-cron permission-gate --timeout=600s", "timeout": 660 } ] }
     ]
   }
 }
@@ -80,9 +80,9 @@ const controlAgentSettings = `{
       { "hooks": [ { "type": "command", "command": "claude-cron session-hook" } ] }
     ],
     "PreToolUse": [
-      { "matcher": "WebFetch", "hooks": [ { "type": "command", "command": "claude-cron permission-gate" } ] },
-      { "matcher": "WebSearch", "hooks": [ { "type": "command", "command": "claude-cron permission-gate" } ] },
-      { "matcher": "mcp__.*", "hooks": [ { "type": "command", "command": "claude-cron permission-gate" } ] }
+      { "matcher": "WebFetch", "hooks": [ { "type": "command", "command": "claude-cron permission-gate --timeout=600s", "timeout": 660 } ] },
+      { "matcher": "WebSearch", "hooks": [ { "type": "command", "command": "claude-cron permission-gate --timeout=600s", "timeout": 660 } ] },
+      { "matcher": "mcp__.*", "hooks": [ { "type": "command", "command": "claude-cron permission-gate --timeout=600s", "timeout": 660 } ] }
     ]
   }
 }
