@@ -103,6 +103,7 @@ func (s TelegramSource) Fetch(ctx context.Context) ([]SourceMessage, error) {
 	var messages []SourceMessage
 	for _, update := range payload.Result {
 		if msg, ok := telegramUpdateToMessage(update, s.ChatID); ok {
+			resolveTelegramAttachments(ctx, client, baseURL, s.Token, &msg)
 			messages = append(messages, msg)
 		}
 	}
@@ -121,14 +122,79 @@ func telegramExtract(update telegramUpdate) (SourceMessage, bool) {
 	if content == "" {
 		content = message.Caption
 	}
-	return SourceMessage{
+	src := SourceMessage{
 		Platform:  "telegram",
 		ChannelID: strconv.FormatInt(message.Chat.ID, 10),
 		MessageID: strconv.FormatInt(update.UpdateID, 10),
 		AuthorID:  strconv.FormatInt(message.From.ID, 10),
 		CreatedAt: time.Unix(message.Date, 0).UTC().Format(time.RFC3339),
 		Content:   content,
-	}, true
+	}
+	// Photo (largest size) → image attachment; the file_id is resolved to a
+	// download URL later by the reader (which holds the token). A Document is
+	// included only when its mime type is an image.
+	if n := len(message.Photo); n > 0 {
+		src.Attachments = append(src.Attachments, Attachment{ID: message.Photo[n-1].FileID, Type: "image/jpeg"})
+	}
+	if d := message.Document; d != nil && strings.HasPrefix(strings.ToLower(d.MimeType), "image/") {
+		src.Attachments = append(src.Attachments, Attachment{ID: d.FileID, Type: d.MimeType})
+	}
+	return src, true
+}
+
+// telegramFileURL resolves a Telegram file_id to a downloadable file URL via the
+// getFile API (needs the bot token).
+func telegramFileURL(ctx context.Context, client *http.Client, baseURL, token, fileID string) (string, error) {
+	if client == nil {
+		client = http.DefaultClient
+	}
+	if baseURL == "" {
+		baseURL = defaultTelegramBaseURL
+	}
+	ep := baseURL + "/bot" + token + "/getFile?file_id=" + url.QueryEscape(fileID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ep, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	var out struct {
+		OK     bool `json:"ok"`
+		Result struct {
+			FilePath string `json:"file_path"`
+		} `json:"result"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", err
+	}
+	if !out.OK || out.Result.FilePath == "" {
+		return "", fmt.Errorf("telegram getFile failed for %s", fileID)
+	}
+	return baseURL + "/file/bot" + token + "/" + out.Result.FilePath, nil
+}
+
+// resolveTelegramAttachments fills download URLs for telegram attachments that
+// only carry a file_id. Best-effort: an attachment that can't be resolved is
+// dropped rather than left with an unusable empty URL.
+func resolveTelegramAttachments(ctx context.Context, client *http.Client, baseURL, token string, msg *SourceMessage) {
+	if token == "" || len(msg.Attachments) == 0 {
+		return
+	}
+	kept := msg.Attachments[:0]
+	for _, a := range msg.Attachments {
+		if a.URL == "" && a.ID != "" {
+			u, err := telegramFileURL(ctx, client, baseURL, token, a.ID)
+			if err != nil {
+				continue // drop unresolved
+			}
+			a.URL = u
+		}
+		kept = append(kept, a)
+	}
+	msg.Attachments = kept
 }
 
 // telegramUpdateToMessage maps a Telegram update to a SourceMessage, keeping
@@ -263,6 +329,20 @@ type telegramMessage struct {
 	Caption   string       `json:"caption"`
 	Chat      telegramChat `json:"chat"`
 	From      telegramUser `json:"from"`
+	// Photo is sent in multiple resolutions (ascending); the last is the largest.
+	Photo    []telegramPhotoSize `json:"photo"`
+	Document *telegramDocument   `json:"document"`
+}
+
+type telegramPhotoSize struct {
+	FileID   string `json:"file_id"`
+	FileSize int    `json:"file_size"`
+}
+
+type telegramDocument struct {
+	FileID   string `json:"file_id"`
+	MimeType string `json:"mime_type"`
+	FileName string `json:"file_name"`
 }
 
 type telegramChat struct {

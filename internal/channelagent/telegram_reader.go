@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 )
 
@@ -89,6 +90,7 @@ func (r TelegramReader) Drain(ctx context.Context, routes map[string]func(contex
 		if !ok {
 			continue
 		}
+		resolveTelegramAttachments(ctx, client, baseURL, r.Token, &msg)
 		route, ok := routes[msg.ChannelID]
 		if !ok {
 			continue // not a chat we serve
@@ -196,6 +198,7 @@ func (h TelegramDemuxHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if msg, ok := telegramExtract(update); ok {
+		resolveTelegramAttachments(r.Context(), nil, h.Cfg.Telegram.BaseURL, os.Getenv(h.Cfg.Telegram.TokenEnv), &msg)
 		reg, _ := LoadRegistry(h.Root)
 		if route, ok := telegramRoutes(h.Root, h.Cfg, reg)[msg.ChannelID]; ok {
 			if err := route(r.Context(), msg); err != nil {

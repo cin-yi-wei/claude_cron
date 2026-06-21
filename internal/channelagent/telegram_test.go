@@ -72,3 +72,32 @@ func TestTelegramSenderPostsMessage(t *testing.T) {
 		t.Fatalf("body = %#v", gotBody)
 	}
 }
+
+func TestTelegramExtractCapturesPhoto(t *testing.T) {
+	up := telegramUpdate{
+		UpdateID: 7,
+		Message: &telegramMessage{
+			MessageID: 1, Date: 1700000000,
+			Caption: "看這個",
+			Chat:    telegramChat{ID: 555},
+			From:    telegramUser{ID: 9},
+			Photo: []telegramPhotoSize{
+				{FileID: "small", FileSize: 100},
+				{FileID: "big", FileSize: 9000},
+			},
+		},
+	}
+	msg, ok := telegramExtract(up)
+	if !ok {
+		t.Fatal("extract ok=false")
+	}
+	if msg.Content != "看這個" {
+		t.Fatalf("content = %q", msg.Content)
+	}
+	if len(msg.Attachments) != 1 || msg.Attachments[0].ID != "big" || msg.Attachments[0].Type != "image/jpeg" {
+		t.Fatalf("attachments = %#v (want largest photo 'big')", msg.Attachments)
+	}
+	if msg.Attachments[0].URL != "" {
+		t.Fatalf("URL should be empty pre-resolve, got %q", msg.Attachments[0].URL)
+	}
+}
