@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -36,10 +37,13 @@ func (i TmuxInjector) Inject(ctx context.Context, job InputJob, outputPath strin
 	if err := i.ensureSession(ctx); err != nil {
 		return err
 	}
+	// Download any image attachments to local files so Claude can actually read
+	// them (vision); the prompt then points at the local paths. Best-effort.
+	images := downloadImageAttachments(i.Root, job)
 	// Collapse the prompt to a single line. Embedded newlines sent to the Claude
 	// TUI via send-keys are interpreted as Enter keypresses, which submit the
 	// input prematurely and fragment the prompt. A single line submits cleanly.
-	prompt := collapseWhitespace(BuildClaudePrompt(i.Root, job, outputPath))
+	prompt := collapseWhitespace(BuildClaudePrompt(i.Root, job, outputPath, images))
 
 	// The Enter occasionally fails to submit (drops), leaving the prompt sitting
 	// in the input box and never processed. So submit, then VERIFY the input box
@@ -150,7 +154,7 @@ func (i TmuxInjector) ensureSession(ctx context.Context) error {
 	return runExternalCommand(ctx, "tmux", "new-session", "-d", "-s", i.Session, "claude")
 }
 
-func BuildClaudePrompt(root string, job InputJob, outputPath string) string {
+func BuildClaudePrompt(root string, job InputJob, outputPath string, imagePaths []string) string {
 	// Use absolute paths so the prompt resolves correctly regardless of the
 	// agent's current working directory (the agent may `cd` while renaming the
 	// output file, which would otherwise break the next job's relative paths).
@@ -160,7 +164,11 @@ func BuildClaudePrompt(root string, job InputJob, outputPath string) string {
 	if abs, err := filepath.Abs(outputPath); err == nil {
 		outputPath = abs
 	}
-	return fmt.Sprintf(`請讀取 %s/current_job.json。
+	images := ""
+	if len(imagePaths) > 0 {
+		images = "\n\n本則訊息附帶圖片，已下載到本地檔，請用 Read 工具讀取這些路徑並一併分析（Read 支援圖片）：\n" + strings.Join(imagePaths, "\n")
+	}
+	return fmt.Sprintf(`請讀取 %s/current_job.json。%s
 
 根據目前 Claude Code session / project context，分析裡面的新對話內容，產生要回覆使用者的訊息。
 
@@ -188,5 +196,84 @@ JSON 必須是這個格式（注意 send 要設成布林 true 才會把回覆送
 
 若你啟動了長時間的背景任務（detached，例如安裝、編譯、長測試），請在 shell 指令鏈的最後加上：
 && claude-cron notify %s "完成訊息" --root %s
-這樣任務跑完會自動通知使用者；不要為了等它而卡住這次回覆。`, root, outputPath, outputPath, 1, job.JobID, job.RequestID, job.InputHash, root, job.Source.ChannelID, root)
+這樣任務跑完會自動通知使用者；不要為了等它而卡住這次回覆。`, root, images, outputPath, outputPath, 1, job.JobID, job.RequestID, job.InputHash, root, job.Source.ChannelID, root)
+}
+
+// downloadImageAttachments saves a job's image attachments under
+// <root>/attachments/<jobid>/ and returns their absolute local paths so the
+// injected prompt can point Claude at real files (Read supports images). Best
+// effort: a non-image attachment or a failed download is skipped.
+func downloadImageAttachments(root string, job InputJob) []string {
+	var out []string
+	dir := pathIn(root, "attachments", sanitize(job.JobID))
+	for idx, a := range job.Source.Attachments {
+		if a.URL == "" || !isImageAttachment(a) {
+			continue
+		}
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return out
+		}
+		dst := filepath.Join(dir, fmt.Sprintf("%d%s", idx, imageExt(a)))
+		if err := httpDownloadFile(a.URL, dst); err != nil {
+			continue
+		}
+		if abs, err := filepath.Abs(dst); err == nil {
+			dst = abs
+		}
+		out = append(out, dst)
+	}
+	return out
+}
+
+func isImageAttachment(a Attachment) bool {
+	if strings.HasPrefix(strings.ToLower(a.Type), "image/") {
+		return true
+	}
+	switch strings.ToLower(filepath.Ext(strings.SplitN(a.URL, "?", 2)[0])) {
+	case ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp":
+		return true
+	}
+	return false
+}
+
+func imageExt(a Attachment) string {
+	if e := filepath.Ext(strings.SplitN(a.URL, "?", 2)[0]); len(e) >= 2 && len(e) <= 5 {
+		return e
+	}
+	switch strings.ToLower(a.Type) {
+	case "image/png":
+		return ".png"
+	case "image/jpeg":
+		return ".jpg"
+	case "image/gif":
+		return ".gif"
+	case "image/webp":
+		return ".webp"
+	}
+	return ".img"
+}
+
+// httpDownloadFile GETs url into dst (capped at 25MB, 30s timeout).
+func httpDownloadFile(url, dst string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("download %s: %s", url, resp.Status)
+	}
+	f, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = io.Copy(f, io.LimitReader(resp.Body, 25<<20))
+	return err
 }

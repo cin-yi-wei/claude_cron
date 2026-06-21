@@ -64,11 +64,42 @@ func TestBuildClaudePromptTeachesNotify(t *testing.T) {
 		InputHash: "h1",
 		Source:    SourceMessage{Platform: "discord", ChannelID: "chan99", Content: "hi"},
 	}
-	p := BuildClaudePrompt(".channel-agent", job, ".channel-agent/outbox/pending/j1.json")
+	p := BuildClaudePrompt(".channel-agent", job, ".channel-agent/outbox/pending/j1.json", nil)
 	if !strings.Contains(p, "claude-cron notify") {
 		t.Fatalf("prompt should teach notify:\n%s", p)
 	}
 	if !strings.Contains(p, "chan99") {
 		t.Fatalf("prompt should include the job's channel id:\n%s", p)
+	}
+	if strings.Contains(p, "附帶圖片") {
+		t.Fatalf("no images → prompt must not mention attachments:\n%s", p)
+	}
+	withImg := BuildClaudePrompt(".channel-agent", job, ".channel-agent/outbox/pending/j1.json", []string{"/tmp/a.png"})
+	if !strings.Contains(withImg, "/tmp/a.png") || !strings.Contains(withImg, "附帶圖片") {
+		t.Fatalf("with images → prompt must point at the local path:\n%s", withImg)
+	}
+}
+
+func TestImageAttachmentDetection(t *testing.T) {
+	cases := []struct {
+		a      Attachment
+		isImg  bool
+		ext    string
+	}{
+		{Attachment{URL: "https://cdn/x.png", Type: "image/png"}, true, ".png"},
+		{Attachment{URL: "https://cdn/x.jpg?ex=1&is=2"}, true, ".jpg"},
+		{Attachment{URL: "https://cdn/x", Type: "image/webp"}, true, ".webp"},
+		{Attachment{URL: "https://cdn/doc.pdf", Type: "application/pdf"}, false, ""},
+		{Attachment{URL: "https://cdn/clip.mp4", Type: "video/mp4"}, false, ""},
+	}
+	for _, c := range cases {
+		if got := isImageAttachment(c.a); got != c.isImg {
+			t.Fatalf("isImageAttachment(%v) = %v, want %v", c.a, got, c.isImg)
+		}
+		if c.isImg {
+			if got := imageExt(c.a); got != c.ext {
+				t.Fatalf("imageExt(%v) = %q, want %q", c.a, got, c.ext)
+			}
+		}
 	}
 }
