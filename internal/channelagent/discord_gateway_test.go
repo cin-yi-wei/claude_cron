@@ -138,3 +138,18 @@ func TestGatewayDemuxRoutesByChannel(t *testing.T) {
 		t.Fatalf("bot message should have been dropped: %#v", got)
 	}
 }
+
+func TestGatewayExtractCapturesAttachments(t *testing.T) {
+	raw := []byte(`{"id":"42","channel_id":"c1","content":"look","timestamp":"2026-06-21T00:00:00Z","author":{"id":"u1","bot":false},"attachments":[{"id":"a1","url":"https://cdn/x.png","content_type":"image/png"}]}`)
+	msg, ok := gatewayExtract(raw)
+	if !ok {
+		t.Fatal("gatewayExtract ok=false")
+	}
+	if len(msg.Attachments) != 1 {
+		t.Fatalf("attachments = %#v, want 1", msg.Attachments)
+	}
+	a := msg.Attachments[0]
+	if a.URL != "https://cdn/x.png" || a.Type != "image/png" || a.ID != "a1" {
+		t.Fatalf("attachment = %#v", a)
+	}
+}

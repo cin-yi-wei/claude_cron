@@ -234,6 +234,11 @@ type gatewayMessage struct {
 		ID  string `json:"id"`
 		Bot bool   `json:"bot"`
 	} `json:"author"`
+	Attachments []struct {
+		ID          string `json:"id"`
+		URL         string `json:"url"`
+		ContentType string `json:"content_type"`
+	} `json:"attachments"`
 }
 
 // gatewayExtract maps a MESSAGE_CREATE payload to a SourceMessage tagged with its
@@ -251,14 +256,18 @@ func gatewayExtract(raw json.RawMessage) (SourceMessage, bool) {
 	if created == "" {
 		created = time.Now().UTC().Format(time.RFC3339)
 	}
-	return SourceMessage{
+	src := SourceMessage{
 		Platform:  "discord",
 		ChannelID: m.ChannelID,
 		MessageID: m.ID,
 		AuthorID:  m.Author.ID,
 		CreatedAt: created,
 		Content:   m.Content,
-	}, true
+	}
+	for _, a := range m.Attachments {
+		src.Attachments = append(src.Attachments, Attachment{ID: a.ID, URL: a.URL, Type: a.ContentType})
+	}
+	return src, true
 }
 
 // gatewayMessageToSource maps a MESSAGE_CREATE payload to a SourceMessage,
