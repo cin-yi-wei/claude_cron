@@ -7,6 +7,7 @@
   let bindings = $state([]);
   let err = $state('');
   let page = $state(0);
+  let query = $state('');
   const pageSize = 6;
 
   async function load() {
@@ -18,10 +19,17 @@
   // Web-control bindings have their own chat; every binding is selectable here.
   $effect(() => { load(); });
 
-  let pageCount = $derived(Math.max(1, Math.ceil(bindings.length / pageSize)));
+  // Filter by name (case-insensitive); searching resets to the first page.
+  let filtered = $derived(
+    query.trim()
+      ? bindings.filter((b) => b.name.toLowerCase().includes(query.trim().toLowerCase()))
+      : bindings
+  );
+  $effect(() => { query; page = 0; });
+  let pageCount = $derived(Math.max(1, Math.ceil(filtered.length / pageSize)));
   // Clamp the page if the list shrank.
   $effect(() => { if (page > pageCount - 1) page = pageCount - 1; });
-  let shown = $derived(bindings.slice(page * pageSize, page * pageSize + pageSize));
+  let shown = $derived(filtered.slice(page * pageSize, page * pageSize + pageSize));
 </script>
 
 <div class="chatwrap">
@@ -44,6 +52,7 @@
       <button class="mini" onclick={load} title="reload">↻</button>
     </header>
     {#if err}<p class="bad">{err}</p>{/if}
+    <input class="search" type="search" bind:value={query} placeholder={t('chat.search')} />
     <ul class="chatlist">
       {#each shown as b}
         <li>
@@ -57,8 +66,8 @@
           </a>
         </li>
       {/each}
-      {#if bindings.length === 0}
-        <li><em class="muted">{t('common.none')}</em></li>
+      {#if filtered.length === 0}
+        <li><em class="muted">{bindings.length === 0 ? t('common.none') : t('chat.nomatch')}</em></li>
       {/if}
     </ul>
     {#if pageCount > 1}
@@ -79,6 +88,7 @@
      overflow:auto scrollbar only appears if 7 rows truly don't fit. */
   .picker { order: -1; flex: 0 0 12rem; position: sticky; top: 4rem; font-size: .9rem; display: flex; flex-direction: column; height: 68vh; min-height: 360px; }
   .picker-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: .4rem; }
+  .search { margin: 0 0 .5rem; padding: .35rem .55rem; font-size: .85rem; height: auto; }
   /* No scrollbar — pagination handles overflow (more items → next page). */
   .chatlist { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: .25rem; overflow: hidden; }
   .chatlist a { display: flex; justify-content: space-between; align-items: center; gap: .4rem; padding: .35rem .5rem; border-radius: var(--pico-border-radius); text-decoration: none; border: 1px solid var(--pico-muted-border-color); }
