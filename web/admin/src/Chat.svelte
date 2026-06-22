@@ -206,7 +206,7 @@
   .msg.error .who { background: var(--pico-del-color); }
   /* Both speakers use the same blue bubble + the SAME uniform rounding
      (distinguished by side + avatar). */
-  .msg .txt { white-space: pre-wrap; word-break: break-word; max-width: 82%; padding: .5rem .75rem; border-radius: 16px; border-color: transparent; background: var(--pico-primary-background); color: var(--pico-primary-inverse); }
+  .msg .txt { white-space: pre-wrap; word-break: break-word; max-width: 82%; padding: .55rem .8rem; border-radius: 18px; border-color: transparent; background: var(--pico-primary-background); color: var(--pico-primary-inverse); }
   .msg .txt .code { white-space: pre; overflow-x: auto; margin: .3rem 0; padding: .5rem .7rem; border-radius: 10px; background: var(--pico-code-background-color, #1e2030); color: var(--pico-color); font-size: .9rem; line-height: 1.45; }
   /* diff line colours are applied inline (Svelte can't keep CSS for runtime-only classes). */
   .msg.error .txt { background: var(--pico-del-color); color: #fff; }
