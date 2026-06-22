@@ -7,7 +7,7 @@
   let bindings = $state([]);
   let err = $state('');
   let page = $state(0);
-  const pageSize = 7;
+  const pageSize = 6;
 
   async function load() {
     err = '';
@@ -79,7 +79,8 @@
      overflow:auto scrollbar only appears if 7 rows truly don't fit. */
   .picker { order: -1; flex: 0 0 12rem; position: sticky; top: 4rem; font-size: .9rem; display: flex; flex-direction: column; height: 68vh; min-height: 360px; }
   .picker-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: .4rem; }
-  .chatlist { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: .25rem; overflow-y: auto; }
+  /* No scrollbar — pagination handles overflow (more items → next page). */
+  .chatlist { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: .25rem; overflow: hidden; }
   .chatlist a { display: flex; justify-content: space-between; align-items: center; gap: .4rem; padding: .35rem .5rem; border-radius: var(--pico-border-radius); text-decoration: none; border: 1px solid var(--pico-muted-border-color); }
   .chatlist a.active { background: var(--pico-primary-background); color: var(--pico-primary-inverse); border-color: var(--pico-primary); }
   .chatlist .nm { font-weight: 600; word-break: break-all; }
