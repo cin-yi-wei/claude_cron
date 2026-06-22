@@ -196,14 +196,17 @@
 <style>
   /* Fill most of the viewport instead of a tiny fixed 320px box. */
   .chat .log { height: 68vh; min-height: 360px; overflow-y: auto; display: flex; flex-direction: column; gap: .55rem; padding: .5rem .3rem; }
-  .msg { display: flex; gap: .6rem; font-size: .98rem; line-height: 1.5; }
-  .msg .who { flex: 0 0 1.6rem; }
-  .msg .txt { white-space: pre-wrap; word-break: break-word; }
+  /* Bubble layout: each message gets its own tinted box. User (我方) goes to the
+     right, Claude (assistant) to the left, like a normal IM. */
+  .msg { display: flex; gap: .5rem; font-size: .98rem; line-height: 1.5; align-items: flex-end; }
+  .msg.user { flex-direction: row-reverse; }
+  .msg .who { flex: 0 0 1.8rem; text-align: center; }
+  .msg .txt { white-space: pre-wrap; word-break: break-word; max-width: 82%; padding: .5rem .75rem; border-radius: 14px; border: 1px solid var(--pico-muted-border-color); background: var(--pico-card-background-color, #21232e); }
   .msg .txt .code { white-space: pre; overflow-x: auto; margin: .3rem 0; padding: .5rem .7rem; border-radius: 6px; background: var(--pico-code-background-color, #1e2030); font-size: .9rem; line-height: 1.45; }
   /* diff line colours are applied inline (Svelte can't keep CSS for runtime-only classes). */
-  .msg.assistant .txt { color: var(--pico-color); }
-  .msg.user .txt { color: var(--pico-primary); }
-  .msg.error .txt { color: var(--pico-del-color); }
+  .msg.assistant .txt { border-bottom-left-radius: 4px; }
+  .msg.user .txt { background: var(--pico-primary-background); color: var(--pico-primary-inverse); border-color: transparent; border-bottom-right-radius: 4px; }
+  .msg.error .txt { background: var(--pico-del-color); color: #fff; border-color: transparent; }
   .muted { color: var(--pico-muted-color); }
   .center { text-align: center; margin: 0; }
   /* Composer: multi-line textarea (Enter sends, Shift+Enter newline), send
