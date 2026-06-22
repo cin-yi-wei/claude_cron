@@ -1,7 +1,7 @@
 <script>
   import { getJSON, sendJSON } from './lib/api.js';
   import { t } from './lib/i18n.svelte.js';
-  let { token } = $props();
+  let { token = $bindable() } = $props();
   let c = $state(null);
   let err = $state('');
   let msg = $state('');
@@ -39,11 +39,16 @@
     } catch (e) { err = String(e); }
   }
 
-  $effect(() => { load(); });
+  // Reload when the token changes (e.g. just entered it above).
+  $effect(() => { token; load(); });
 </script>
 
 <article>
   <header><strong>{t('settings.title')}</strong> <small class="muted">{t('settings.note')}</small></header>
+  <label>{t('common.token')}
+    <input type="password" bind:value={token} placeholder={t('common.token')} autocomplete="off" />
+    <small class="muted">{t('settings.tokenhint')}</small>
+  </label>
   {#if err}<p class="bad">{err}</p>{/if}
   {#if msg}<p class="ok">{msg}</p>{/if}
   {#if c}
