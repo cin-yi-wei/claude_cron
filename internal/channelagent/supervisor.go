@@ -182,6 +182,20 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 	// registry control bindings (seeded above from config on first boot) and run
 	// by the unified control-binding loop further down, exactly like web controls.
 
+	// Worker bindings are processed in two phases: a SEQUENTIAL setup pass (which
+	// owns all shared-state mutation — sleep/wake registry writes, push.Ensure,
+	// activePush) builds the ready list; then RunServeOnce (the slow part — up to
+	// `timeout` waiting for a reply) runs CONCURRENTLY per binding, since each
+	// operates on its own root/lock/inbox. This stops one slow session from
+	// head-of-line-blocking every other binding (the cycle time becomes the
+	// slowest single binding, not the sum).
+	type readyWorker struct {
+		b        Binding
+		ingester Ingester
+		sender   Sender
+		injector Injector
+	}
+	var readyWorkers []readyWorker
 	for _, b := range reg.Bindings {
 		// Control bindings are driven by the control-binding loop below, not the
 		// worker pipeline (they have no project worktree).
@@ -325,18 +339,40 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 		}
 
 		injector := TmuxInjector{Session: b.TmuxSession, Root: b.Root, AutoStart: true}
-		res, err := RunServeOnce(ctx, b.Root, ingester, injector, sender, timeout)
-		if err != nil {
-			fmt.Fprintf(stdout, "binding %s error: %v\n", b.Name, err)
-			continue
-		}
-		fmt.Fprintf(stdout, "binding=%s created=%d processed=%t sent=%d\n", b.Name, res.Created, res.Processed, res.Sent)
+		readyWorkers = append(readyWorkers, readyWorker{b: b, ingester: ingester, sender: sender, injector: injector})
 	}
+	// Concurrent phase: each binding's serve cycle is independent (own root/lock),
+	// so run them in parallel. stdout writes may interleave (cosmetic).
+	var workerWG sync.WaitGroup
+	for _, rw := range readyWorkers {
+		workerWG.Add(1)
+		go func(rw readyWorker) {
+			defer workerWG.Done()
+			res, err := RunServeOnce(ctx, rw.b.Root, rw.ingester, rw.injector, rw.sender, timeout)
+			if err != nil {
+				fmt.Fprintf(stdout, "binding %s error: %v\n", rw.b.Name, err)
+				return
+			}
+			fmt.Fprintf(stdout, "binding=%s created=%d processed=%t sent=%d\n", rw.b.Name, res.Created, res.Processed, res.Sent)
+		}(rw)
+	}
+	workerWG.Wait()
 	// Registry-defined control bindings (unified control model). Each runs the
 	// control pipeline against its own root/session, fed by its platform's source
 	// and replying via the hub (web) or the platform sender teed to the hub
 	// (dc/tg). Additive: a no-op when there are none, so it cannot disturb the
 	// hardcoded dc/tg control planes above.
+	// Control bindings: command processing (RunControlOnce) MUST stay sequential —
+	// it mutates the shared registry (bind/unbind) and reloads it. Only the slow
+	// assistant turn (runControlAssistant, up to `timeout`) is fanned out, so a
+	// long control turn (e.g. this very session) no longer delays other control
+	// planes or the next cycle's workers.
+	type readyControl struct {
+		b   Binding
+		inj Injector
+		snd Sender
+	}
+	var readyControls []readyControl
 	for _, b := range reg.Bindings {
 		if !b.Control || b.Paused {
 			continue
@@ -373,10 +409,19 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 			continue
 		}
 		inj := TmuxInjector{Session: b.TmuxSession, Root: b.Root, AutoStart: false}
-		if err := runControlAssistant(ctx, b, inj, snd, timeout); err != nil {
-			fmt.Fprintf(stdout, "control-binding[%s] assistant error: %v\n", b.Name, err)
-		}
+		readyControls = append(readyControls, readyControl{b: b, inj: inj, snd: snd})
 	}
+	var controlWG sync.WaitGroup
+	for _, rc := range readyControls {
+		controlWG.Add(1)
+		go func(rc readyControl) {
+			defer controlWG.Done()
+			if err := runControlAssistant(ctx, rc.b, rc.inj, rc.snd, timeout); err != nil {
+				fmt.Fprintf(stdout, "control-binding[%s] assistant error: %v\n", rc.b.Name, err)
+			}
+		}(rc)
+	}
+	controlWG.Wait()
 
 	// Stop push ingesters whose binding was removed or flipped to poll.
 	if push != nil {
