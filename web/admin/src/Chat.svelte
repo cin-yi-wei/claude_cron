@@ -200,7 +200,12 @@
      right, Claude (assistant) to the left, like a normal IM. */
   .msg { display: flex; gap: .5rem; font-size: .98rem; line-height: 1.5; align-items: flex-end; }
   .msg.user { flex-direction: row-reverse; }
-  .msg .who { flex: 0 0 1.8rem; text-align: center; }
+  /* Circular avatar: the emoji sits in a round filled badge so its transparent
+     corners get a background → easier to tell speakers apart at a glance. */
+  .msg .who { flex: 0 0 2.1rem; width: 2.1rem; height: 2.1rem; display: flex; align-items: center; justify-content: center; border-radius: 50%; font-size: 1.1rem; line-height: 1; box-shadow: 0 0 0 1px var(--pico-muted-border-color) inset; }
+  .msg.assistant .who { background: #2d4636; }
+  .msg.user .who { background: var(--pico-primary); }
+  .msg.error .who { background: var(--pico-del-color); }
   .msg .txt { white-space: pre-wrap; word-break: break-word; max-width: 82%; padding: .5rem .75rem; border-radius: 14px; border: 1px solid var(--pico-muted-border-color); background: var(--pico-card-background-color, #21232e); }
   .msg .txt .code { white-space: pre; overflow-x: auto; margin: .3rem 0; padding: .5rem .7rem; border-radius: 6px; background: var(--pico-code-background-color, #1e2030); font-size: .9rem; line-height: 1.45; }
   /* diff line colours are applied inline (Svelte can't keep CSS for runtime-only classes). */
