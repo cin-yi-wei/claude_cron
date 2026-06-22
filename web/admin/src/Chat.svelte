@@ -175,21 +175,19 @@
     {/each}
     {#if messages.length === 0}<p class="muted"><em>{t('chat.empty', { name })}</em></p>{/if}
   </div>
-  <form onsubmit={(e) => { e.preventDefault(); send(); }}>
-    <div role="group" class="composer">
-      <textarea
-        bind:value={input}
-        rows="2"
-        placeholder={t('chat.placeholder', { name })}
-        onkeydown={(e) => {
-          if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
-            e.preventDefault();
-            send();
-          }
-        }}
-      ></textarea>
-      <button type="submit">{t('chat.send')}</button>
-    </div>
+  <form class="composer" onsubmit={(e) => { e.preventDefault(); send(); }}>
+    <textarea
+      bind:value={input}
+      rows="1"
+      placeholder={t('chat.placeholder', { name })}
+      onkeydown={(e) => {
+        if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+          e.preventDefault();
+          send();
+        }
+      }}
+    ></textarea>
+    <button type="submit" class="sendbtn" aria-label={t('chat.send')} disabled={!input.trim()}>➤</button>
   </form>
 </article>
 
@@ -217,7 +215,12 @@
   .center { text-align: center; margin: 0; }
   /* Composer: multi-line textarea (Enter sends, Shift+Enter newline), send
      button aligned to the bottom so it doesn't stretch with the textarea. */
-  .composer { align-items: stretch; }
-  .composer textarea { resize: vertical; min-height: 2.6rem; max-height: 40vh; line-height: 1.45; margin: 0; }
-  .composer button { white-space: nowrap; align-self: stretch; }
+  /* Composer: a rounded bar with the textarea sitting flush inside and a round
+     send button. The whole bar lights up on focus. */
+  .composer { display: flex; align-items: flex-end; gap: .5rem; margin-top: .6rem; padding: .35rem .35rem .35rem .75rem; border: 1px solid var(--pico-muted-border-color); border-radius: 1.4rem; background: var(--pico-card-background-color, #21232e); transition: border-color .15s, box-shadow .15s; }
+  .composer:focus-within { border-color: var(--pico-primary); box-shadow: 0 0 0 3px var(--pico-primary-focus, rgba(64,120,255,.25)); }
+  .composer textarea { flex: 1 1 auto; resize: none; field-sizing: content; min-height: 1.6rem; max-height: 40vh; line-height: 1.45; margin: 0; padding: .35rem 0; border: none; background: transparent; box-shadow: none; outline: none; font-size: 1rem; }
+  .composer .sendbtn { flex: 0 0 auto; width: 2.6rem; height: 2.6rem; padding: 0; margin: 0; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 1.05rem; line-height: 1; border: none; transition: transform .1s, opacity .15s; }
+  .composer .sendbtn:not(:disabled):hover { transform: scale(1.08); }
+  .composer .sendbtn:disabled { opacity: .4; cursor: not-allowed; }
 </style>
