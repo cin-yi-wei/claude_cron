@@ -10,6 +10,34 @@ main.container {
   max-width: 1280px;
 }
 
+/* Dark mode = Atom One Dark palette. Override Pico's dark vars so the whole
+   admin matches the editor look. */
+[data-theme="dark"] {
+  --pico-background-color: #282c34;
+  --pico-card-background-color: #21252b;
+  --pico-card-sectioning-background-color: #21252b;
+  --pico-code-background-color: #1b1e24;
+  --pico-color: #abb2bf;
+  --pico-h1-color: #d7dae0;
+  --pico-h2-color: #d7dae0;
+  --pico-h3-color: #d7dae0;
+  --pico-muted-color: #828997;
+  --pico-muted-border-color: #3e4451;
+  --pico-primary: #61afef;
+  --pico-primary-hover: #7cc0f3;
+  --pico-primary-background: #3b6ea5;
+  --pico-primary-hover-background: #4a82c0;
+  --pico-primary-border: #3b6ea5;
+  --pico-primary-inverse: #fff;
+  --pico-primary-focus: rgba(97, 175, 239, 0.3);
+  --pico-del-color: #e06c75;
+  --pico-ins-color: #98c379;
+  --pico-form-element-background-color: #1f232a;
+  --pico-form-element-border-color: #3e4451;
+  --pico-secondary-background: #3e4451;
+  --pico-secondary-inverse: #abb2bf;
+}
+
 /* Mobile (RWD): tighten spacing, keep wide content scrollable, enlarge tap
    targets. Pico already collapses .grid to one column on small screens. */
 @media (max-width: 640px) {

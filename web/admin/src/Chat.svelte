@@ -165,7 +165,7 @@
         <span class="txt">
           {#each segments(m.text) as seg}
             {#if seg.t === 'diff'}
-              <pre class="code diff">{#each seg.c.split('\n') as ln}<span style={dcls(ln) === 'add' ? 'color:#3fb950' : dcls(ln) === 'del' ? 'color:#f85149' : ''}>{ln}{'\n'}</span>{/each}</pre>
+              <pre class="code diff">{#each seg.c.split('\n') as ln}<span style={dcls(ln) === 'add' ? 'color:#98c379' : dcls(ln) === 'del' ? 'color:#e06c75' : ''}>{ln}{'\n'}</span>{/each}</pre>
             {:else if seg.t === 'code'}
               <pre class="code hljs"><code>{@html hl(seg.lang, seg.c)}</code></pre>
             {:else}<span>{seg.c}</span>{/if}
