@@ -182,7 +182,7 @@ func formatToolUse(name string, input json.RawMessage) string {
 		if c == "" {
 			return "📝 Write " + f
 		}
-		return "📝 Write " + f + "\n```\n" + clampBlock(c, 20, 200) + "\n```"
+		return "📝 Write " + f + "\n```\n" + clampBlock(c, diffMaxLines, diffMaxCol) + "\n```"
 	case "Read":
 		return "👀 Read " + base(str("file_path"))
 	case "Grep":
@@ -206,15 +206,23 @@ func formatToolUse(name string, input json.RawMessage) string {
 func diffBlock(old, new string) string {
 	var b strings.Builder
 	b.WriteString("```diff\n")
-	for _, ln := range clampLines(old, 12, 200) {
+	for _, ln := range clampLines(old, diffMaxLines, diffMaxCol) {
 		b.WriteString("- " + ln + "\n")
 	}
-	for _, ln := range clampLines(new, 12, 200) {
+	for _, ln := range clampLines(new, diffMaxLines, diffMaxCol) {
 		b.WriteString("+ " + ln + "\n")
 	}
 	b.WriteString("```")
 	return b.String()
 }
+
+// diff/code blocks are shown nearly in full now (split across messages if
+// needed); only absurdly long edits are clamped so one tool use can't flood the
+// channel. A hidden remainder still shows "… (+N 行)".
+const (
+	diffMaxLines = 80
+	diffMaxCol   = 400
+)
 
 // clampLines splits s into at most maxLines lines (each ≤ maxCol runes),
 // appending an ellipsis line when truncated.
@@ -253,22 +261,86 @@ func condense(s string, max int) string {
 	return s
 }
 
-// activityMessage joins lines into one throttle-friendly message per tick,
-// capped under the Discord 2000-char limit (diff blocks can be large).
-func activityMessage(lines []string) string {
+// activityMsgMax bounds one message under Discord's 2000-char hard limit (TG is
+// 4096, web has none, so Discord is the binding constraint).
+const activityMsgMax = 1900
+
+// activityMessages packs activity entries into as FEW messages as possible while
+// keeping each under activityMsgMax — instead of truncating, it spills to more
+// messages so a full diff is shown in order. Each entry (which may itself span
+// many lines, e.g. a whole ```diff block) is kept whole; a single oversized
+// entry is split on line boundaries with its code fence reopened so rendering
+// stays valid.
+func activityMessages(lines []string) []string {
 	if len(lines) == 0 {
-		return ""
+		return nil
 	}
-	msg := "⏳ " + strings.Join(lines, "\n")
-	const max = 1800
-	if r := []rune(msg); len(r) > max {
-		msg = string(r[:max]) + "\n… (截斷)"
-		// Close any code fence left open by truncation so rendering stays sane.
-		if strings.Count(msg, "```")%2 == 1 {
-			msg += "\n```"
+	var msgs []string
+	var cur strings.Builder
+	flush := func() {
+		if cur.Len() > 0 {
+			msgs = append(msgs, cur.String())
+			cur.Reset()
 		}
 	}
-	return msg
+	for _, entry := range lines {
+		for _, piece := range splitEntry(entry, activityMsgMax) {
+			// +1 for the joining newline.
+			if cur.Len() > 0 && cur.Len()+1+len(piece) > activityMsgMax {
+				flush()
+			}
+			if cur.Len() > 0 {
+				cur.WriteString("\n")
+			}
+			cur.WriteString(piece)
+		}
+	}
+	flush()
+	// Prefix the hourglass on the first message only.
+	if len(msgs) > 0 {
+		msgs[0] = "⏳ " + msgs[0]
+	}
+	return msgs
+}
+
+// splitEntry breaks a single activity entry that exceeds max into fence-safe
+// pieces. Most entries fit and are returned as-is.
+func splitEntry(entry string, max int) []string {
+	if len([]rune(entry)) <= max {
+		return []string{entry}
+	}
+	inDiff := strings.HasPrefix(entry, "🔧") || strings.Contains(entry, "```diff")
+	fenceOpen := "```diff"
+	if !inDiff {
+		fenceOpen = "```"
+	}
+	var out []string
+	var b strings.Builder
+	reopen := false
+	for _, ln := range strings.Split(entry, "\n") {
+		add := ln
+		if reopen {
+			add = fenceOpen + "\n" + ln
+			reopen = false
+		}
+		if b.Len() > 0 && b.Len()+1+len(add) > max {
+			s := b.String()
+			if strings.Count(s, "```")%2 == 1 {
+				s += "\n```" // close dangling fence
+				reopen = true
+			}
+			out = append(out, s)
+			b.Reset()
+		}
+		if b.Len() > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString(add)
+	}
+	if b.Len() > 0 {
+		out = append(out, b.String())
+	}
+	return out
 }
 
 // activitySender builds the Sender that delivers a binding's activity to its
@@ -302,6 +374,9 @@ func RunActivityStreamOnce(ctx context.Context, root string, cfg Config) {
 		if len(lines) == 0 {
 			continue
 		}
-		_ = activitySender(b, cfg, tokens).Send(ctx, OutputJob{Schema: 1, Send: true, Text: activityMessage(lines)})
+		sender := activitySender(b, cfg, tokens)
+		for _, msg := range activityMessages(lines) {
+			_ = sender.Send(ctx, OutputJob{Schema: 1, Send: true, Text: msg})
+		}
 	}
 }

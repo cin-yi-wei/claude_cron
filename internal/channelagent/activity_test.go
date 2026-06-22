@@ -34,12 +34,45 @@ func TestCondense(t *testing.T) {
 	}
 }
 
-func TestActivityMessage(t *testing.T) {
-	if activityMessage(nil) != "" {
-		t.Fatal("empty lines should give empty message")
+func TestActivityMessages(t *testing.T) {
+	if len(activityMessages(nil)) != 0 {
+		t.Fatal("empty lines should give no messages")
 	}
-	got := activityMessage([]string{"🔧 Edit a.go", "▶ go test"})
-	if !strings.HasPrefix(got, "⏳ ") || !strings.Contains(got, "🔧 Edit a.go") || !strings.Contains(got, "▶ go test") {
-		t.Fatalf("activityMessage = %q", got)
+	got := activityMessages([]string{"🔧 Edit a.go", "▶ go test"})
+	if len(got) != 1 {
+		t.Fatalf("short activity should be one message, got %d", len(got))
+	}
+	if !strings.HasPrefix(got[0], "⏳ ") || !strings.Contains(got[0], "🔧 Edit a.go") || !strings.Contains(got[0], "▶ go test") {
+		t.Fatalf("activityMessages[0] = %q", got[0])
+	}
+}
+
+func TestActivityMessagesSplitsInsteadOfTruncating(t *testing.T) {
+	// Two large entries that together exceed one message must spill to >1 message,
+	// and the full content must survive (no "截斷").
+	big := func(tag string) string {
+		var b strings.Builder
+		b.WriteString("🔧 Edit " + tag + ".go\n```diff\n")
+		for i := 0; i < 60; i++ {
+			b.WriteString("+ " + tag + " line with some length to add bulk here\n")
+		}
+		b.WriteString("```")
+		return b.String()
+	}
+	msgs := activityMessages([]string{big("a"), big("b")})
+	if len(msgs) < 2 {
+		t.Fatalf("expected split into multiple messages, got %d", len(msgs))
+	}
+	for i, m := range msgs {
+		if n := len([]rune(m)); n > activityMsgMax {
+			t.Fatalf("message %d over cap: %d > %d", i, n, activityMsgMax)
+		}
+		if strings.Count(m, "```")%2 != 0 {
+			t.Fatalf("message %d has an unbalanced code fence:\n%s", i, m)
+		}
+	}
+	joined := strings.Join(msgs, "\n")
+	if strings.Contains(joined, "截斷") {
+		t.Fatal("content should be split, not truncated")
 	}
 }
