@@ -198,7 +198,7 @@
   .chat .log { height: 68vh; min-height: 360px; overflow-y: auto; display: flex; flex-direction: column; gap: .55rem; padding: .5rem .3rem; }
   /* Bubble layout: each message gets its own tinted box. User (我方) goes to the
      right, Claude (assistant) to the left, like a normal IM. */
-  .msg { display: flex; gap: .5rem; font-size: .98rem; line-height: 1.5; align-items: flex-end; }
+  .msg { display: flex; gap: .5rem; font-size: .98rem; line-height: 1.5; align-items: flex-start; }
   .msg.user { flex-direction: row-reverse; }
   /* Circular avatar: the emoji sits in a round filled badge so its transparent
      corners get a background → easier to tell speakers apart at a glance. */
@@ -206,12 +206,13 @@
   .msg.assistant .who { background: #2d4636; }
   .msg.user .who { background: var(--pico-primary); }
   .msg.error .who { background: var(--pico-del-color); }
-  .msg .txt { white-space: pre-wrap; word-break: break-word; max-width: 82%; padding: .5rem .75rem; border-radius: 14px; border: 1px solid var(--pico-muted-border-color); background: var(--pico-card-background-color, #21232e); }
-  .msg .txt .code { white-space: pre; overflow-x: auto; margin: .3rem 0; padding: .5rem .7rem; border-radius: 6px; background: var(--pico-code-background-color, #1e2030); font-size: .9rem; line-height: 1.45; }
+  /* Both speakers use the same blue bubble (distinguished by side + avatar). */
+  .msg .txt { white-space: pre-wrap; word-break: break-word; max-width: 82%; padding: .5rem .75rem; border-radius: 14px; border-color: transparent; background: var(--pico-primary-background); color: var(--pico-primary-inverse); }
+  .msg .txt .code { white-space: pre; overflow-x: auto; margin: .3rem 0; padding: .5rem .7rem; border-radius: 6px; background: var(--pico-code-background-color, #1e2030); color: var(--pico-color); font-size: .9rem; line-height: 1.45; }
   /* diff line colours are applied inline (Svelte can't keep CSS for runtime-only classes). */
-  .msg.assistant .txt { border-bottom-left-radius: 4px; }
-  .msg.user .txt { background: var(--pico-primary-background); color: var(--pico-primary-inverse); border-color: transparent; border-bottom-right-radius: 4px; }
-  .msg.error .txt { background: var(--pico-del-color); color: #fff; border-color: transparent; }
+  .msg.assistant .txt { border-top-left-radius: 4px; }
+  .msg.user .txt { border-top-right-radius: 4px; }
+  .msg.error .txt { background: var(--pico-del-color); color: #fff; }
   .muted { color: var(--pico-muted-color); }
   .center { text-align: center; margin: 0; }
   /* Composer: multi-line textarea (Enter sends, Shift+Enter newline), send
