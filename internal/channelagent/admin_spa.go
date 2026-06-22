@@ -33,12 +33,24 @@ var adminSPA = func() http.Handler {
 		p := strings.TrimPrefix(r.URL.Path, "/app")
 		p = strings.TrimPrefix(p, "/")
 		r2 := r.Clone(r.Context())
+		isEntry := false
 		if p == "" || p == "index.html" {
 			r2.URL.Path = "/"
+			isEntry = true
 		} else if _, err := fs.Stat(sub, p); err != nil {
 			r2.URL.Path = "/" // not a real asset → SPA entry (client routing)
+			isEntry = true
 		} else {
 			r2.URL.Path = "/" + p
+		}
+		// Cache policy: index.html (the SPA entry) must NOT be cached, so the
+		// browser always re-fetches it and picks up the new hashed bundle after a
+		// deploy. The hashed assets (/assets/index-<hash>.{js,css}) are immutable,
+		// so cache them hard. This kills the "I still see the old UI" problem.
+		if isEntry {
+			w.Header().Set("Cache-Control", "no-cache, must-revalidate")
+		} else if strings.HasPrefix(r2.URL.Path, "/assets/") {
+			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 		}
 		fileServer.ServeHTTP(w, r2)
 	})
