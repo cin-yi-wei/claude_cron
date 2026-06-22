@@ -96,7 +96,7 @@
   .chatlist { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: .25rem; }
   .chatlist a { display: flex; justify-content: space-between; align-items: center; gap: .4rem; padding: .35rem .5rem; border-radius: var(--pico-border-radius); text-decoration: none; border: 1px solid var(--pico-muted-border-color); }
   .chatlist a.active { background: var(--pico-primary-background); color: var(--pico-primary-inverse); border-color: var(--pico-primary); }
-  .chatlist .nm { font-weight: 600; word-break: break-all; }
+  .chatlist .nm { flex: 1 1 auto; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
   .chatlist .meta { display: flex; align-items: center; gap: .3rem; white-space: nowrap; font-size: .8rem; }
   .pager { display: flex; align-items: center; justify-content: center; gap: .6rem; margin-top: auto; padding-top: .6rem; border-top: 1px solid var(--pico-muted-border-color); }
   .mini { width: auto; padding: .15rem .5rem; margin: 0; font-size: .85rem; }
