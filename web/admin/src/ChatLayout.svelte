@@ -89,12 +89,13 @@
   /* min-height (not fixed height) so a full page of 6 never gets clipped: short
      content → column is 68vh tall and the pager pins to the bottom; tall content
      → the column grows to fit (no clip, no scrollbar). */
-  .picker { order: -1; flex: 0 0 12rem; position: sticky; top: 4rem; font-size: .9rem; display: flex; flex-direction: column; min-height: 68vh; }
+  .picker { order: -1; flex: 0 0 12rem; width: 12rem; max-width: 12rem; position: sticky; top: 4rem; font-size: .9rem; display: flex; flex-direction: column; min-height: 68vh; }
   .picker-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: .4rem; }
   .search { margin: 0 0 .5rem; padding: .35rem .55rem; font-size: .85rem; height: auto; }
   /* No scrollbar — pagination handles overflow (more items → next page). */
   .chatlist { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: .25rem; }
-  .chatlist a { display: flex; justify-content: space-between; align-items: center; gap: .4rem; padding: .35rem .5rem; border-radius: var(--pico-border-radius); text-decoration: none; border: 1px solid var(--pico-muted-border-color); }
+  .chatlist li { min-width: 0; }
+  .chatlist a { display: flex; justify-content: space-between; align-items: center; gap: .4rem; padding: .35rem .5rem; border-radius: var(--pico-border-radius); text-decoration: none; border: 1px solid var(--pico-muted-border-color); min-width: 0; overflow: hidden; }
   .chatlist a.active { background: var(--pico-primary-background); color: var(--pico-primary-inverse); border-color: var(--pico-primary); }
   .chatlist .nm { flex: 1 1 auto; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
   .chatlist .meta { display: flex; align-items: center; gap: .3rem; white-space: nowrap; font-size: .8rem; }
@@ -106,7 +107,7 @@
   /* Mobile: picker drops below the conversation, list goes horizontal-scroll. */
   @media (max-width: 720px) {
     .chatwrap { flex-direction: column; }
-    .picker { flex: 1 1 auto; width: 100%; position: static; order: -1; height: auto; min-height: 0; }
+    .picker { flex: 1 1 auto; width: 100%; max-width: none; position: static; order: -1; height: auto; min-height: 0; }
     .chatlist { flex-direction: row; overflow-x: auto; overflow-y: visible; }
     .chatlist a { white-space: nowrap; }
     .pager { margin-top: .5rem; border-top: none; }
