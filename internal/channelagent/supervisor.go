@@ -341,13 +341,15 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 		injector := TmuxInjector{Session: b.TmuxSession, Root: b.Root, AutoStart: true}
 		readyWorkers = append(readyWorkers, readyWorker{b: b, ingester: ingester, sender: sender, injector: injector})
 	}
-	// Concurrent phase: each binding's serve cycle is independent (own root/lock),
-	// so run them in parallel. stdout writes may interleave (cosmetic).
-	var workerWG sync.WaitGroup
+	// Concurrent phase: each binding's serve cycle is independent (own root/lock).
+	// Run them DETACHED — do NOT block the cycle until they finish. A worker can
+	// now wait up to `timeout` (minutes) for a long reply; blocking the cycle on
+	// that would stall session lifecycle (recreating a dead session, sleep/wake)
+	// for every other binding. Per-binding claude.lock is fail-fast, so the next
+	// cycle's worker for a still-busy binding just no-ops instead of double-
+	// processing, and goroutines stay bounded (~one in-flight per binding).
 	for _, rw := range readyWorkers {
-		workerWG.Add(1)
 		go func(rw readyWorker) {
-			defer workerWG.Done()
 			res, err := RunServeOnce(ctx, rw.b.Root, rw.ingester, rw.injector, rw.sender, timeout)
 			if err != nil {
 				fmt.Fprintf(stdout, "binding %s error: %v\n", rw.b.Name, err)
@@ -356,7 +358,6 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 			fmt.Fprintf(stdout, "binding=%s created=%d processed=%t sent=%d\n", rw.b.Name, res.Created, res.Processed, res.Sent)
 		}(rw)
 	}
-	workerWG.Wait()
 	// Registry-defined control bindings (unified control model). Each runs the
 	// control pipeline against its own root/session, fed by its platform's source
 	// and replying via the hub (web) or the platform sender teed to the hub
@@ -411,17 +412,15 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 		inj := TmuxInjector{Session: b.TmuxSession, Root: b.Root, AutoStart: false}
 		readyControls = append(readyControls, readyControl{b: b, inj: inj, snd: snd})
 	}
-	var controlWG sync.WaitGroup
+	// Detached, same rationale as workers: a long control-assistant turn must not
+	// block the cycle (per-root claude.lock keeps it safe / non-overlapping).
 	for _, rc := range readyControls {
-		controlWG.Add(1)
 		go func(rc readyControl) {
-			defer controlWG.Done()
 			if err := runControlAssistant(ctx, rc.b, rc.inj, rc.snd, timeout); err != nil {
 				fmt.Fprintf(stdout, "control-binding[%s] assistant error: %v\n", rc.b.Name, err)
 			}
 		}(rc)
 	}
-	controlWG.Wait()
 
 	// Stop push ingesters whose binding was removed or flipped to poll.
 	if push != nil {
