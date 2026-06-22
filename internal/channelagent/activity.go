@@ -376,7 +376,9 @@ func RunActivityStreamOnce(ctx context.Context, root string, cfg Config) {
 		}
 		sender := activitySender(b, cfg, tokens)
 		for _, msg := range activityMessages(lines) {
-			_ = sender.Send(ctx, OutputJob{Schema: 1, Send: true, Text: msg})
+			if err := sender.Send(ctx, OutputJob{Schema: 1, Send: true, Text: msg}); err != nil {
+				fmt.Fprintf(os.Stderr, "activity send [%s] failed (%d chars): %v\n", b.Name, len([]rune(msg)), err)
+			}
 		}
 	}
 }

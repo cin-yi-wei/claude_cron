@@ -10,7 +10,12 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
+
+// httpClient15s is a shared bounded client for outbound channel sends, so a hung
+// connection can't stall the (sequential) activity ticker for every binding.
+var httpClient15s = &http.Client{Timeout: 15 * time.Second}
 
 var discordDiffFenceRE = regexp.MustCompile("(?s)```diff\\n(.*?)```")
 
@@ -145,7 +150,7 @@ func (s DiscordSender) Send(ctx context.Context, output OutputJob) error {
 	}
 	client := s.Client
 	if client == nil {
-		client = http.DefaultClient
+		client = httpClient15s // bounded: a hung send must not stall the activity ticker
 	}
 	body, err := json.Marshal(map[string]string{"content": discordColorDiff(output.Text)})
 	if err != nil {

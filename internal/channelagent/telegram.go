@@ -68,7 +68,7 @@ func (s TelegramSource) Fetch(ctx context.Context) ([]SourceMessage, error) {
 	}
 	client := s.Client
 	if client == nil {
-		client = http.DefaultClient
+		client = httpClient15s
 	}
 
 	endpoint, err := url.Parse(baseURL + "/bot" + s.Token + "/getUpdates")
@@ -228,7 +228,7 @@ func (s TelegramSender) Send(ctx context.Context, output OutputJob) error {
 	}
 	client := s.Client
 	if client == nil {
-		client = http.DefaultClient
+		client = httpClient15s
 	}
 	// Messages with ```fenced``` blocks (e.g. activity diffs) are sent as HTML so
 	// Telegram renders code blocks + diff colouring; plain messages stay plain
