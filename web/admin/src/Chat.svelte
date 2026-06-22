@@ -196,7 +196,7 @@
   .chat .log { height: 68vh; min-height: 360px; overflow-y: auto; display: flex; flex-direction: column; gap: .55rem; padding: .5rem .3rem; }
   /* Bubble layout: each message gets its own tinted box. User (我方) goes to the
      right, Claude (assistant) to the left, like a normal IM. */
-  .msg { display: flex; gap: .5rem; font-size: .98rem; line-height: 1.5; align-items: flex-start; }
+  .msg { display: flex; gap: .5rem; font-size: .98rem; line-height: 1.5; align-items: flex-start; max-width: 100%; min-width: 0; }
   .msg.user { flex-direction: row-reverse; }
   /* Circular avatar: the emoji sits in a round filled badge so its transparent
      corners get a background → easier to tell speakers apart at a glance. */
@@ -206,7 +206,7 @@
   .msg.error .who { background: var(--pico-del-color); }
   /* Both speakers use the same blue bubble + the SAME uniform rounding
      (distinguished by side + avatar). */
-  .msg .txt { white-space: pre-wrap; word-break: break-word; max-width: 82%; padding: .55rem .8rem; border-radius: 18px; border-color: transparent; background: var(--pico-primary-background); color: var(--pico-primary-inverse); }
+  .msg .txt { white-space: pre-wrap; word-break: break-word; overflow-wrap: anywhere; min-width: 0; max-width: 82%; padding: .55rem .8rem; border-radius: 18px; border-color: transparent; background: var(--pico-primary-background); color: var(--pico-primary-inverse); }
   .msg .txt .code { white-space: pre; overflow-x: auto; margin: .3rem 0; padding: .5rem .7rem; border-radius: 10px; background: var(--pico-code-background-color, #1e2030); color: var(--pico-color); font-size: .9rem; line-height: 1.45; }
   /* diff line colours are applied inline (Svelte can't keep CSS for runtime-only classes). */
   .msg.error .txt { background: var(--pico-del-color); color: #fff; }
