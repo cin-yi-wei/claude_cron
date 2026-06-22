@@ -184,11 +184,12 @@
 </article>
 
 <style>
-  .chat .log { max-height: 320px; overflow-y: auto; display: flex; flex-direction: column; gap: .4rem; padding: .3rem 0; }
-  .msg { display: flex; gap: .5rem; font-size: .85rem; }
-  .msg .who { flex: 0 0 1.4rem; }
+  /* Fill most of the viewport instead of a tiny fixed 320px box. */
+  .chat .log { height: 68vh; min-height: 360px; overflow-y: auto; display: flex; flex-direction: column; gap: .55rem; padding: .5rem .3rem; }
+  .msg { display: flex; gap: .6rem; font-size: .98rem; line-height: 1.5; }
+  .msg .who { flex: 0 0 1.6rem; }
   .msg .txt { white-space: pre-wrap; word-break: break-word; }
-  .msg .txt .code { white-space: pre; overflow-x: auto; margin: .2rem 0; padding: .3rem .5rem; border-radius: 4px; background: var(--pico-code-background-color, #1e2030); font-size: .78rem; line-height: 1.3; }
+  .msg .txt .code { white-space: pre; overflow-x: auto; margin: .3rem 0; padding: .5rem .7rem; border-radius: 6px; background: var(--pico-code-background-color, #1e2030); font-size: .9rem; line-height: 1.45; }
   /* diff line colours are applied inline (Svelte can't keep CSS for runtime-only classes). */
   .msg.assistant .txt { color: var(--pico-color); }
   .msg.user .txt { color: var(--pico-primary); }
