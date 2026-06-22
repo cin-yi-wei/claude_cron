@@ -73,12 +73,7 @@ func (i TmuxInjector) LooksGlitched(ctx context.Context) bool {
 	if err != nil {
 		return false
 	}
-	for _, sig := range []string{"<invoke name=", "<parameter name=", "</invoke>", "<function_calls>"} {
-		if strings.Contains(pane, sig) {
-			return true
-		}
-	}
-	return false
+	return classifyScreen(pane) == ScreenGlitch
 }
 
 // typeAndSubmit runs the one recipe observed to reliably submit in the Claude

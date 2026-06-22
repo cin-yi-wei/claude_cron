@@ -35,9 +35,10 @@ type adminBindingDTO struct {
 	// legacy poll/push mode). Mode is kept for reference but is fallback-only.
 	Transport string `json:"transport"`
 	// Control marks a control-plane binding; Default marks the protected one.
-	Control  bool `json:"control"`
-	Default  bool `json:"default"`
-	Sleeping bool `json:"sleeping"`
+	Control     bool `json:"control"`
+	Default     bool `json:"default"`
+	Sleeping    bool `json:"sleeping"`
+	AutoApprove bool `json:"auto_approve"`
 }
 
 type adminStatusDTO struct {
@@ -168,6 +169,10 @@ func (h AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			h.pauseResume(w, r, name, "resume")
 			return
 		}
+		if name, ok := strings.CutSuffix(rest, "/autoapprove"); ok {
+			h.autoApprove(w, r, name)
+			return
+		}
 		switch r.Method {
 		case http.MethodGet:
 			h.bindingStatus(w, rest)
@@ -202,7 +207,7 @@ func (h AdminHandler) listBindings(w http.ResponseWriter) {
 			Name: b.Name, Platform: b.PlatformOf(), Mode: b.ModeOf(),
 			ChannelID: b.ChannelID, Branch: b.Branch, TmuxSession: b.TmuxSession,
 			Plane: b.PlaneOf(), Paused: b.Paused, Transport: cfg.Transport(b),
-			Control: b.Control, Default: b.Default, Sleeping: b.Sleeping,
+			Control: b.Control, Default: b.Default, Sleeping: b.Sleeping, AutoApprove: b.AutoApprove,
 		})
 	}
 	writeJSONResponse(w, out)
@@ -355,6 +360,24 @@ func (h AdminHandler) pauseResume(w http.ResponseWriter, r *http.Request, name, 
 		return
 	}
 	h.runWrite(w, Command{Name: action, Args: []string{name}, Flags: map[string]bool{}}, http.StatusOK)
+}
+
+// autoApprove handles POST /api/bindings/<name>/autoapprove?on=true|false,
+// toggling the binding's permission-bypass via the shared command path.
+func (h AdminHandler) autoApprove(w http.ResponseWriter, r *http.Request, name string) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if h.Deps == nil {
+		http.Error(w, "writes disabled", http.StatusServiceUnavailable)
+		return
+	}
+	sw := "on"
+	if r.URL.Query().Get("on") == "false" {
+		sw = "off"
+	}
+	h.runWrite(w, Command{Name: "auto-approve", Args: []string{name, sw}, Flags: map[string]bool{}}, http.StatusOK)
 }
 
 func (h AdminHandler) restartBinding(w http.ResponseWriter, r *http.Request, name string) {

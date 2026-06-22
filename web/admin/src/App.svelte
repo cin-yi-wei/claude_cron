@@ -79,7 +79,6 @@
   .navrow .spacer { flex: 1 1 auto; }
   .topnav a { display: block; padding: .35rem .55rem; border-radius: var(--pico-border-radius); text-decoration: none; white-space: nowrap; }
   .topnav a.active { background: var(--pico-primary-background); color: var(--pico-primary-inverse); }
-  .muted { color: var(--pico-muted-color); }
   .themebtn { width: auto; padding: .2rem .4rem; margin: 0; background: transparent; border: 1px solid var(--pico-muted-border-color); border-radius: var(--pico-border-radius); line-height: 1; cursor: pointer; }
   .lang { width: auto; font-size: .8rem; padding: .15rem 1.2rem .15rem .35rem; margin: 0; }
   main.container { max-width: 1280px; padding-top: 1.2rem; }

@@ -72,7 +72,7 @@ type ControlDeps struct {
 	NotifyChannel func(ctx context.Context, platform, channelID, text string) error
 }
 
-const controlUsage = "指令: /bind <name> <project-dir> <branch> [--platform=dc|tg] [--mode=poll|push] [--chat-id=<id> (tg)] | /bind <name> --control [--platform=web|dc|tg] [--chat-id=<id>] | /unbind <name> [--delete-channel] | /pause <name> | /resume <name> | /set-default <name> | /list | /status <name> | /help"
+const controlUsage = "指令: /bind <name> <project-dir> <branch> [--platform=dc|tg] [--mode=poll|push] [--chat-id=<id> (tg)] | /bind <name> --control [--platform=web|dc|tg] [--chat-id=<id>] | /unbind <name> [--delete-channel] | /pause <name> | /resume <name> | /set-default <name> | /auto-approve <name> [on|off] | /list | /status <name> | /help"
 
 // HandleCommand executes a parsed control command against the registry, using
 // deps for side effects. Returns a reply to post to the control channel and
@@ -89,6 +89,8 @@ func HandleCommand(ctx context.Context, deps ControlDeps, reg *Registry, cmd Com
 		return handleResume(reg, cmd, plane)
 	case "set-default":
 		return handleSetDefault(reg, cmd, plane)
+	case "auto-approve", "autoapprove":
+		return handleAutoApprove(reg, cmd, plane)
 	case "list":
 		return handleList(reg, plane), false, nil
 	case "status":
@@ -434,6 +436,31 @@ func handleResume(reg *Registry, cmd Command, plane ControlPlane) (string, bool,
 	}
 	reg.SetPaused(name, false)
 	return fmt.Sprintf("▶️ 已恢復 %s（下個 cycle 重開 session %s 並 resume 對話）", name, b.TmuxSession), true, nil
+}
+
+// handleAutoApprove toggles a binding's permission-bypass. on/true/1 enable;
+// anything else disables. Auto-approved bindings skip the channel y/n.
+func handleAutoApprove(reg *Registry, cmd Command, plane ControlPlane) (string, bool, error) {
+	if len(cmd.Args) < 1 {
+		return "用法: /auto-approve <name> [on|off]（不帶開關預設 on）", false, nil
+	}
+	name := cmd.Args[0]
+	b, ok := reg.Get(name)
+	if !ok || !plane.ownsBinding(b) {
+		return fmt.Sprintf("找不到 binding %q", name), false, nil
+	}
+	on := true
+	if len(cmd.Args) >= 2 {
+		switch strings.ToLower(cmd.Args[1]) {
+		case "off", "false", "0", "no":
+			on = false
+		}
+	}
+	reg.SetAutoApprove(name, on)
+	if on {
+		return fmt.Sprintf("🔓 %s 已開『自動放行』：之後 Bash/WebFetch/MCP 等不再問你 y/n，全自動允許。要關回去：/auto-approve %s off", name, name), true, nil
+	}
+	return fmt.Sprintf("🔒 %s 已關自動放行，恢復成每次發到頻道問 y/n。", name), true, nil
 }
 
 // handleSetDefault transfers the protected-default flag to another control

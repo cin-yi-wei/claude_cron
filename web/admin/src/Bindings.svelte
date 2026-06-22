@@ -84,6 +84,10 @@
               {#if active(b)}
                 <button class="mini secondary" onclick={() => act(b.name, 'restart')}>⟳</button>
               {/if}
+              <button class="mini secondary" title={b.auto_approve ? t('bindings.autoapprove.on') : t('bindings.autoapprove.off')}
+                onclick={() => act(b.name, 'autoapprove', 'POST', '/api/bindings/' + encodeURIComponent(b.name) + '/autoapprove?on=' + (!b.auto_approve))}>
+                {b.auto_approve ? '🔓' : '🔒'}
+              </button>
               {#if !(b.control && b.default)}
                 <button class="mini contrast outline" onclick={() => del(b)}>🗑</button>
               {/if}

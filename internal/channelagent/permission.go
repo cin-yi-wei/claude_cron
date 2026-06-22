@@ -191,6 +191,11 @@ func RunPermissionGate(ctx context.Context, registryRoot string, in io.Reader, o
 		fmt.Fprint(out, hookDecisionJSON(true, "permission gate: no binding for cwd, allowing"))
 		return nil
 	}
+	// Auto-approve (trusted-binding bypass): skip the channel y/n entirely.
+	if b.AutoApprove {
+		fmt.Fprint(out, hookDecisionJSON(true, "permission gate: auto-approved (binding bypass)"))
+		return nil
+	}
 
 	// Only escalate the things worth a human decision (installs / downloads /
 	// privilege / destructive, and all MCP). Ordinary Bash — file edits via

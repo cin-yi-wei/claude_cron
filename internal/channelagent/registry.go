@@ -46,6 +46,9 @@ type Binding struct {
 	// to free RAM (like Paused) BUT it auto-wakes when a new message arrives.
 	// Distinct from Paused (manual; stays down + ignores messages until /resume).
 	Sleeping bool `json:"sleeping,omitempty"`
+	// AutoApprove makes the permission gate auto-allow every gated tool for this
+	// binding (no channel y/n) — a trusted-binding "bypass" mode, off by default.
+	AutoApprove bool `json:"auto_approve,omitempty"`
 }
 
 // ControlBindingDefaults derives a control binding's session/root/workspace.
@@ -273,6 +276,17 @@ func (r *Registry) SetSleeping(name string, sleeping bool) bool {
 	for i := range r.Bindings {
 		if r.Bindings[i].Name == name {
 			r.Bindings[i].Sleeping = sleeping
+			return true
+		}
+	}
+	return false
+}
+
+// SetAutoApprove flips the auto-approve (permission bypass) flag. Caller persists.
+func (r *Registry) SetAutoApprove(name string, on bool) bool {
+	for i := range r.Bindings {
+		if r.Bindings[i].Name == name {
+			r.Bindings[i].AutoApprove = on
 			return true
 		}
 	}
