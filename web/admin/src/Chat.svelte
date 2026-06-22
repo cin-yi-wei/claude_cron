@@ -176,8 +176,18 @@
     {#if messages.length === 0}<p class="muted"><em>{t('chat.empty', { name })}</em></p>{/if}
   </div>
   <form onsubmit={(e) => { e.preventDefault(); send(); }}>
-    <div role="group">
-      <input bind:value={input} placeholder={t('chat.placeholder', { name })} />
+    <div role="group" class="composer">
+      <textarea
+        bind:value={input}
+        rows="2"
+        placeholder={t('chat.placeholder', { name })}
+        onkeydown={(e) => {
+          if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+            e.preventDefault();
+            send();
+          }
+        }}
+      ></textarea>
       <button type="submit">{t('chat.send')}</button>
     </div>
   </form>
@@ -196,4 +206,9 @@
   .msg.error .txt { color: var(--pico-del-color); }
   .muted { color: var(--pico-muted-color); }
   .center { text-align: center; margin: 0; }
+  /* Composer: multi-line textarea (Enter sends, Shift+Enter newline), send
+     button aligned to the bottom so it doesn't stretch with the textarea. */
+  .composer { align-items: stretch; }
+  .composer textarea { resize: vertical; min-height: 2.6rem; max-height: 40vh; line-height: 1.45; margin: 0; }
+  .composer button { white-space: nowrap; align-self: stretch; }
 </style>
