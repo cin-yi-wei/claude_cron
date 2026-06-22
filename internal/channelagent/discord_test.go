@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -139,5 +140,30 @@ func TestDiscordAdminCreateChannel(t *testing.T) {
 	}
 	if gotName != "proj-a" {
 		t.Fatalf("name = %q, want proj-a", gotName)
+	}
+}
+
+func TestChunkDiscordKeepsPiecesUnderLimitAndFencesBalanced(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("```ansi\n")
+	for i := 0; i < 120; i++ {
+		b.WriteString("[0;32m+ a fairly long colored diff line number to add width[0m\n")
+	}
+	b.WriteString("```")
+	pieces := chunkDiscord(b.String(), 2000)
+	if len(pieces) < 2 {
+		t.Fatalf("expected multiple chunks, got %d", len(pieces))
+	}
+	for i, p := range pieces {
+		if n := len([]rune(p)); n > 2000 {
+			t.Fatalf("chunk %d over 2000: %d", i, n)
+		}
+		if strings.Count(p, "```")%2 != 0 {
+			t.Fatalf("chunk %d unbalanced fence:\n%s", i, p)
+		}
+	}
+	// Short content passes through untouched.
+	if got := chunkDiscord("hello", 2000); len(got) != 1 || got[0] != "hello" {
+		t.Fatalf("short content should be one piece: %#v", got)
 	}
 }

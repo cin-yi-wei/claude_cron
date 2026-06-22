@@ -152,22 +152,89 @@ func (s DiscordSender) Send(ctx context.Context, output OutputJob) error {
 	if client == nil {
 		client = httpClient15s // bounded: a hung send must not stall the activity ticker
 	}
-	body, err := json.Marshal(map[string]string{"content": discordColorDiff(output.Text)})
-	if err != nil {
-		return err
+	// discordColorDiff rewrites ```diff→```ansi, injecting colour codes that can
+	// push the content past Discord's 2000-char hard limit. Chunk the FINAL text
+	// so every POST is under the limit (the upstream splitter is colour-blind).
+	for _, content := range chunkDiscord(discordColorDiff(output.Text), 2000) {
+		body, err := json.Marshal(map[string]string{"content": content})
+		if err != nil {
+			return err
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/channels/"+url.PathEscape(s.ChannelID)+"/messages", bytes.NewReader(body))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Authorization", "Bot "+s.Token)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(req)
+		if err != nil {
+			return err
+		}
+		err = checkHTTPResponse(resp)
+		resp.Body.Close()
+		if err != nil {
+			return err
+		}
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/channels/"+url.PathEscape(s.ChannelID)+"/messages", bytes.NewReader(body))
-	if err != nil {
-		return err
+	return nil
+}
+
+// chunkDiscord splits content into pieces ≤ max runes, breaking on line
+// boundaries and reopening a ```lang fence that a split leaves open so colour
+// rendering stays valid across pieces. Content already under the limit is
+// returned as-is (single element).
+func chunkDiscord(content string, max int) []string {
+	if len([]rune(content)) <= max {
+		return []string{content}
 	}
-	req.Header.Set("Authorization", "Bot "+s.Token)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
+	var out []string
+	var b strings.Builder
+	openFence := "" // e.g. "```ansi" while inside a fenced block
+	reopen := ""
+	flush := func() {
+		s := b.String()
+		if strings.Count(s, "```")%2 == 1 {
+			s += "\n```" // close a fence left open by the cut
+			reopen = openFence
+		} else {
+			reopen = ""
+		}
+		out = append(out, s)
+		b.Reset()
 	}
-	defer resp.Body.Close()
-	return checkHTTPResponse(resp)
+	for _, ln := range strings.Split(content, "\n") {
+		// Track fence state from this line before deciding to cut.
+		add := ln
+		if reopen != "" {
+			add = reopen + "\n" + ln
+			reopen = ""
+		}
+		if b.Len() > 0 && len([]rune(b.String()))+1+len([]rune(add)) > max {
+			flush()
+			if reopen != "" {
+				add = reopen + "\n" + ln
+				reopen = ""
+			} else {
+				add = ln
+			}
+		}
+		if b.Len() > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString(add)
+		// Update fence tracking: a line that is exactly a fence open/close toggles.
+		if strings.HasPrefix(strings.TrimSpace(ln), "```") {
+			if openFence == "" {
+				openFence = strings.TrimSpace(ln)
+			} else {
+				openFence = ""
+			}
+		}
+	}
+	if b.Len() > 0 {
+		out = append(out, b.String())
+	}
+	return out
 }
 
 type DiscordAdmin struct {

@@ -262,8 +262,12 @@ func condense(s string, max int) string {
 }
 
 // activityMsgMax bounds one message under Discord's 2000-char hard limit (TG is
-// 4096, web has none, so Discord is the binding constraint).
-const activityMsgMax = 1900
+// 4096, web has none, so Discord is the binding constraint). Kept well below
+// 2000 because the Discord sender rewrites ```diff blocks to ```ansi, injecting
+// ~11 bytes of colour codes PER diff line — a 1838-char message ballooned past
+// 2000 after conversion and got rejected (code 50035). 1500 leaves headroom for
+// the ansi expansion on realistic diff line counts.
+const activityMsgMax = 1500
 
 // activityMessages packs activity entries into as FEW messages as possible while
 // keeping each under activityMsgMax — instead of truncating, it spills to more
