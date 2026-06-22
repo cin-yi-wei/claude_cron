@@ -153,9 +153,11 @@ func summarizeToolInput(toolName string, raw json.RawMessage) string {
 	if q, ok := m["query"].(string); ok && q != "" { // WebSearch
 		return q
 	}
+	// MCP / other tools: show the full input so you can judge safety. Only clamp
+	// absurdly large payloads, and say how much was hidden (never silently abbreviate).
 	s := string(raw)
-	if len(s) > 200 {
-		s = s[:200] + "…"
+	if n := len([]rune(s)); n > 1500 {
+		s = string([]rune(s)[:1500]) + fmt.Sprintf("… (截斷，完整共 %d 字)", n)
 	}
 	return s
 }

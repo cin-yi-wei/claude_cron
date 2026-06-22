@@ -155,7 +155,7 @@ func formatToolUse(name string, input json.RawMessage) string {
 	}
 	switch name {
 	case "Bash":
-		return "▶ " + condense(str("command"), 160)
+		return "▶ " + condense(str("command"), 400)
 	case "Edit":
 		f := base(str("file_path"))
 		o, n := str("old_string"), str("new_string")
