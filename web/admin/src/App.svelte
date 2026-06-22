@@ -2,7 +2,7 @@
   import Bindings from './Bindings.svelte';
   import Settings from './Settings.svelte';
   import CreateBinding from './CreateBinding.svelte';
-  import Chat from './Chat.svelte';
+  import ChatLayout from './ChatLayout.svelte';
   import { t, getLocale, setLocale, LOCALES } from './lib/i18n.svelte.js';
 
   let token = $state(localStorage.getItem('cc_admin_token') || '');
@@ -53,15 +53,7 @@
   {:else if route.view === 'settings'}
     <Settings {token} />
   {:else if route.view === 'chat'}
-    {#if route.arg}
-      <Chat name={route.arg} {token} />
-      <p><a href="#/bindings">{t('chat.back')}</a></p>
-    {:else}
-      <article>
-        <header><strong>{t('nav.chat')}</strong></header>
-        <p class="muted">{t('chat.pick')}</p>
-      </article>
-    {/if}
+    <ChatLayout name={route.arg || ''} {token} />
   {/if}
 </main>
 
