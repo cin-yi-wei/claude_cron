@@ -64,6 +64,23 @@ func (i TmuxInjector) Inject(ctx context.Context, job InputJob, outputPath strin
 	return lastErr
 }
 
+// LooksGlitched reports whether the session printed raw tool-call markup as text
+// (e.g. "<invoke name=...>" / "<parameter name=...>") instead of executing it — a
+// transient model glitch that ends the turn with no reply. Normal tool use
+// renders as "● Read(...)", never the raw XML, so this signature is safe.
+func (i TmuxInjector) LooksGlitched(ctx context.Context) bool {
+	pane, err := runExternalCommandOutput(ctx, "tmux", "capture-pane", "-pt", i.Session)
+	if err != nil {
+		return false
+	}
+	for _, sig := range []string{"<invoke name=", "<parameter name=", "</invoke>", "<function_calls>"} {
+		if strings.Contains(pane, sig) {
+			return true
+		}
+	}
+	return false
+}
+
 // typeAndSubmit runs the one recipe observed to reliably submit in the Claude
 // TUI: Ctrl-C to clear the box, the prompt as a literal paste, a pause for the
 // long paste to settle, then a SEPARATE Enter.

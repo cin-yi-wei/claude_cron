@@ -19,6 +19,39 @@ func (f fakeInjector) Inject(_ context.Context, job InputJob, outputPath string)
 	return f.write(job, outputPath)
 }
 
+// glitchInjector writes no reply (simulating a glitched turn) and reports
+// glitched=true, so a no-reply timeout should requeue instead of failing.
+type glitchInjector struct{ glitched bool }
+
+func (g glitchInjector) Inject(context.Context, InputJob, string) error { return nil }
+func (g glitchInjector) LooksGlitched(context.Context) bool             { return g.glitched }
+
+func TestWorkerRequeuesOnGlitchTimeout(t *testing.T) {
+	root := filepath.Join(t.TempDir(), ".channel-agent")
+	job := seedPendingJob(t, root, "m1")
+
+	// No reply + glitched session → job goes back to pending (Attempt incremented),
+	// NOT to failed.
+	_, err := RunWorkerOnce(context.Background(), root, glitchInjector{glitched: true}, 80*time.Millisecond)
+	if err == nil {
+		t.Fatal("expected timeout error")
+	}
+	assertExists(t, filepath.Join(root, "inbox", "pending", job.JobID+".json"))
+	assertNotExists(t, filepath.Join(root, "inbox", "failed", job.JobID+".json"))
+}
+
+func TestWorkerFailsOnNonGlitchTimeout(t *testing.T) {
+	root := filepath.Join(t.TempDir(), ".channel-agent")
+	job := seedPendingJob(t, root, "m1")
+
+	// No reply + NOT glitched (e.g. a long-running task) → failed as before.
+	_, err := RunWorkerOnce(context.Background(), root, glitchInjector{glitched: false}, 80*time.Millisecond)
+	if err == nil {
+		t.Fatal("expected timeout error")
+	}
+	assertExists(t, filepath.Join(root, "inbox", "failed", job.JobID+".json"))
+}
+
 func TestWorkerAcceptsValidOutputAndMovesInputToDone(t *testing.T) {
 	root := filepath.Join(t.TempDir(), ".channel-agent")
 	job := seedPendingJob(t, root, "m1")

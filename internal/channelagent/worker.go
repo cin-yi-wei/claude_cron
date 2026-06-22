@@ -15,6 +15,13 @@ type Injector interface {
 	Inject(ctx context.Context, job InputJob, outputPath string) error
 }
 
+// glitchInspector is an optional Injector capability: report whether the session
+// is sitting in a broken turn (literal tool-call markup printed as text) rather
+// than actually working. Used to decide whether a no-reply timeout should retry.
+type glitchInspector interface {
+	LooksGlitched(ctx context.Context) bool
+}
+
 func RunWorkerOnce(ctx context.Context, root string, injector Injector, timeout time.Duration) (bool, error) {
 	if err := Init(root); err != nil {
 		return false, err
@@ -88,6 +95,16 @@ func RunWorkerOnce(ctx context.Context, root string, injector Injector, timeout 
 
 	output, err := waitOutput(ctx, outputPath, timeout)
 	if err != nil {
+		// No reply within the window. If the session emitted a broken turn — e.g.
+		// it printed the literal tool-call markup as text instead of executing it,
+		// a known transient model glitch — re-queue for a fresh retry rather than
+		// dropping the user's message. A genuinely-working long task (still showing
+		// a spinner) is NOT glitched, so it falls through to failed as before (its
+		// reply, if it lands later, is still delivered by the sender).
+		if g, ok := injector.(glitchInspector); ok && g.LooksGlitched(ctx) {
+			requeueOrFail(root, processingPath, name, job)
+			return true, err
+		}
 		_ = moveFile(processingPath, pathIn(root, "inbox", "failed", name))
 		return true, err
 	}
