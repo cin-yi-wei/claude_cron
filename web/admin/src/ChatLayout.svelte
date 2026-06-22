@@ -97,7 +97,9 @@
   .chatlist li { min-width: 0; }
   .chatlist a { display: flex; justify-content: space-between; align-items: center; gap: .4rem; padding: .35rem .5rem; border-radius: var(--pico-border-radius); text-decoration: none; border: 1px solid var(--pico-muted-border-color); min-width: 0; overflow: hidden; }
   .chatlist a.active { background: var(--pico-primary-background); color: var(--pico-primary-inverse); border-color: var(--pico-primary); }
-  .chatlist .nm { flex: 1 1 auto; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  /* Wrap long names (up to 2 lines, then ellipsis) inside the fixed-width
+     column — readable full name without widening the column. */
+  .chatlist .nm { flex: 1 1 auto; min-width: 0; font-weight: 600; white-space: normal; word-break: break-all; display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
   .chatlist .meta { display: flex; align-items: center; gap: .3rem; white-space: nowrap; font-size: .8rem; }
   .pager { display: flex; align-items: center; justify-content: center; gap: .6rem; margin-top: auto; padding-top: .6rem; border-top: 1px solid var(--pico-muted-border-color); }
   .mini { width: auto; padding: .15rem .5rem; margin: 0; font-size: .85rem; }
@@ -114,6 +116,8 @@
     .chatlist a { flex: 0 0 auto; min-width: 8.5rem; max-width: 11rem; white-space: nowrap; justify-content: flex-start; gap: .3rem; }
     /* Hide the platform sub-label on mobile — too cramped next to the name. */
     .chatlist .meta small { display: none; }
+    /* Mobile tiles stay single-line (horizontal scroll), ellipsis if long. */
+    .chatlist .nm { white-space: nowrap; text-overflow: ellipsis; -webkit-line-clamp: 1; line-clamp: 1; }
     .pager { margin-top: .5rem; border-top: none; }
   }
 </style>
