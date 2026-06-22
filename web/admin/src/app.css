@@ -1,10 +1,13 @@
 /* Layout/typography come from Pico.css (loaded in index.html). Only
    app-specific overrides live here. */
 :root {
-  --pico-font-size: 92%;
+  /* Was 92% (deliberately shrunk) — that's what made the whole admin feel
+     cramped/too small. Back to full + roomier line height. */
+  --pico-font-size: 106%;
+  --pico-line-height: 1.6;
 }
 main.container {
-  max-width: 1100px;
+  max-width: 1280px;
 }
 
 /* Mobile (RWD): tighten spacing, keep wide content scrollable, enlarge tap

@@ -73,7 +73,7 @@
   .muted { color: var(--pico-muted-color); }
   .lang { width: auto; font-size: .75rem; padding: .15rem 1.4rem .15rem .4rem; margin: 0; }
   .tok { width: 120px; font-size: .75rem; padding: .2rem .4rem; margin: 0; }
-  main.container { max-width: 1000px; padding-top: 1rem; }
+  main.container { max-width: 1280px; padding-top: 1.2rem; }
 
   /* Mobile: stack the brand above a wrapping link row; token input goes
      full-width on its own line so the nav never overflows. */

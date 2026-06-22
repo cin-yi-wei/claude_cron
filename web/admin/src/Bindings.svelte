@@ -123,7 +123,8 @@
   .muted { color: var(--pico-muted-color); }
   .bad { color: var(--pico-del-color); }
   .ok { color: var(--pico-ins-color); }
-  table { font-size: .85rem; }
+  table { font-size: .95rem; }
+  table td, table th { padding: .6rem .7rem; vertical-align: middle; }
   .actions { white-space: nowrap; }
-  .mini { width: auto; padding: .1rem .45rem; font-size: .8rem; margin: 0 .1rem; }
+  .mini { width: auto; padding: .3rem .6rem; font-size: .9rem; margin: 0 .15rem; }
 </style>
