@@ -16,13 +16,19 @@ func RunServeOnce(ctx context.Context, root string, ingester Ingester, injector 
 	if err != nil {
 		return ServeResult{}, err
 	}
-	processed, err := RunWorkerOnce(ctx, root, injector, timeout)
-	if err != nil {
-		return ServeResult{Created: created, Processed: processed}, err
+	processed, werr := RunWorkerOnce(ctx, root, injector, timeout)
+	// ALWAYS flush the outbox, even if the worker errored or its claude.lock was
+	// held by a still-running (long) worker from a prior cycle. A session blocked
+	// mid-job writes permission prompts + replies to the outbox; the sender has
+	// its own sender.lock + dedup, so delivering them must not be gated behind the
+	// worker — otherwise a long task starves the channel (the prompt the user must
+	// answer never arrives → deadlock).
+	sent, serr := RunSenderOnce(ctx, root, sender)
+	if werr != nil {
+		return ServeResult{Created: created, Processed: processed, Sent: sent}, werr
 	}
-	sent, err := RunSenderOnce(ctx, root, sender)
-	if err != nil {
-		return ServeResult{Created: created, Processed: processed}, err
+	if serr != nil {
+		return ServeResult{Created: created, Processed: processed, Sent: sent}, serr
 	}
 	return ServeResult{Created: created, Processed: processed, Sent: sent}, nil
 }
