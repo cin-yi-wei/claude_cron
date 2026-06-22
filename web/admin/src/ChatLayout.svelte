@@ -52,6 +52,16 @@
       <button class="mini" onclick={load} title="reload">↻</button>
     </header>
     {#if err}<p class="bad">{err}</p>{/if}
+    <select
+      class="chatpick-mobile"
+      value={name}
+      onchange={(e) => { if (e.currentTarget.value) location.hash = '#/chat/' + encodeURIComponent(e.currentTarget.value); }}
+    >
+      <option value="" disabled>{t('chat.pick')}</option>
+      {#each bindings as b}
+        <option value={b.name}>{b.name}{b.control ? ' 🛠' : ''}{b.sleeping ? ' 💤' : b.paused ? ' ⏸' : ''} · {b.platform}</option>
+      {/each}
+    </select>
     <input class="search" type="search" bind:value={query} placeholder={t('chat.search')} />
     <ul class="chatlist">
       {#each shown as b}
@@ -92,6 +102,7 @@
   .picker { order: -1; flex: 0 0 12rem; width: 12rem; max-width: 12rem; position: sticky; top: 4rem; font-size: .9rem; display: flex; flex-direction: column; min-height: 68vh; }
   .picker-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: .4rem; }
   .search { margin: 0 0 .5rem; padding: .35rem .55rem; font-size: .85rem; height: auto; }
+  .chatpick-mobile { display: none; }
   /* No scrollbar — pagination handles overflow (more items → next page). */
   .chatlist { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: .25rem; }
   .chatlist li { min-width: 0; }
@@ -110,14 +121,8 @@
   @media (max-width: 720px) {
     .chatwrap { flex-direction: column; }
     .picker { flex: 1 1 auto; width: 100%; max-width: none; position: static; order: -1; height: auto; min-height: 0; }
-    .chatlist { flex-direction: row; overflow-x: auto; overflow-y: visible; gap: .4rem; padding-bottom: .35rem; }
-    /* Each tile keeps a usable width so the name shows (the desktop 0-width
-       shrink would collapse them to just the emoji on a horizontal row). */
-    .chatlist a { flex: 0 0 auto; min-width: 8.5rem; max-width: 11rem; white-space: nowrap; justify-content: flex-start; gap: .3rem; }
-    /* Hide the platform sub-label on mobile — too cramped next to the name. */
-    .chatlist .meta small { display: none; }
-    /* Mobile tiles stay single-line (horizontal scroll), ellipsis if long. */
-    .chatlist .nm { white-space: nowrap; text-overflow: ellipsis; -webkit-line-clamp: 1; line-clamp: 1; }
-    .pager { margin-top: .5rem; border-top: none; }
+    /* Mobile: replace the tile list + search + pager with a single dropdown. */
+    .chatpick-mobile { display: block; width: 100%; margin: 0; }
+    .picker-head, .search, .chatlist, .pager { display: none; }
   }
 </style>
