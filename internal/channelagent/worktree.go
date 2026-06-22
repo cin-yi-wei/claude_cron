@@ -53,6 +53,9 @@ const agentSettings = `{
   "permissions": {
     "allow": ["Read", "Write", "Edit"]
   },
+  "enabledPlugins": {
+    "ruby-lsp@claude-plugins-official": false
+  },
   "hooks": {
     "SessionStart": [
       { "hooks": [ { "type": "command", "command": "claude-cron session-hook" } ] }
