@@ -39,7 +39,7 @@
 
 <nav class="container-fluid topnav">
   <ul class="navrow">
-    <li class="brand"><strong>claude_cron</strong> <small class="muted">admin</small></li>
+    <li class="brand"><strong>claude_cron</strong></li>
     {#each nav as n}
       <li><a href={n.href} class={route.view === n.id ? 'active' : ''}>{t(n.key)}</a></li>
     {/each}
@@ -71,21 +71,26 @@
 
 <style>
   .topnav { padding: .3rem 1rem; border-bottom: 1px solid var(--pico-muted-border-color); position: sticky; top: 0; background: var(--pico-background-color); z-index: 10; }
-  /* Single row: brand + nav links + (spacer) + theme/lang, all together. */
-  .navrow { display: flex; align-items: center; flex-wrap: wrap; gap: .25rem .4rem; margin: 0; list-style: none; padding: 0; }
-  .navrow .brand { margin-right: .5rem; }
+  /* Single row: brand + nav links + (spacer) + theme/lang. nowrap keeps it on
+     one line; it scrolls horizontally only if a very narrow screen can't fit. */
+  .navrow { display: flex; align-items: center; flex-wrap: nowrap; gap: .25rem .4rem; margin: 0; list-style: none; padding: 0; overflow-x: auto; }
+  .navrow li { flex: 0 0 auto; }
+  .navrow .brand { margin-right: .4rem; white-space: nowrap; }
   .navrow .spacer { flex: 1 1 auto; }
-  .topnav a { padding: .35rem .6rem; border-radius: var(--pico-border-radius); text-decoration: none; }
+  .topnav a { display: block; padding: .35rem .55rem; border-radius: var(--pico-border-radius); text-decoration: none; white-space: nowrap; }
   .topnav a.active { background: var(--pico-primary-background); color: var(--pico-primary-inverse); }
   .muted { color: var(--pico-muted-color); }
-  .themebtn { width: auto; padding: .2rem .45rem; margin: 0; background: transparent; border: 1px solid var(--pico-muted-border-color); border-radius: var(--pico-border-radius); line-height: 1; cursor: pointer; }
-  .lang { width: auto; font-size: .8rem; padding: .15rem 1.4rem .15rem .4rem; margin: 0; }
+  .themebtn { width: auto; padding: .2rem .4rem; margin: 0; background: transparent; border: 1px solid var(--pico-muted-border-color); border-radius: var(--pico-border-radius); line-height: 1; cursor: pointer; }
+  .lang { width: auto; font-size: .8rem; padding: .15rem 1.2rem .15rem .35rem; margin: 0; }
   main.container { max-width: 1280px; padding-top: 1.2rem; }
 
   @media (max-width: 640px) {
-    .topnav { padding: .3rem .6rem; }
+    .topnav { padding: .3rem .5rem; }
+    .navrow { gap: .15rem .2rem; }
     .navrow .spacer { display: none; }
-    .topnav a { padding: .4rem .5rem; font-size: .9rem; }
+    .navrow .brand { font-size: .9rem; margin-right: .25rem; }
+    .topnav a { padding: .35rem .4rem; font-size: .85rem; }
+    .lang { font-size: .75rem; padding: .15rem 1rem .15rem .3rem; }
     main.container { padding-top: .6rem; }
   }
 </style>
