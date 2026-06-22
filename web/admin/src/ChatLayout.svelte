@@ -108,8 +108,10 @@
   @media (max-width: 720px) {
     .chatwrap { flex-direction: column; }
     .picker { flex: 1 1 auto; width: 100%; max-width: none; position: static; order: -1; height: auto; min-height: 0; }
-    .chatlist { flex-direction: row; overflow-x: auto; overflow-y: visible; }
-    .chatlist a { white-space: nowrap; }
+    .chatlist { flex-direction: row; overflow-x: auto; overflow-y: visible; padding-bottom: .3rem; }
+    /* Each tile keeps a usable width so the name shows (the desktop 0-width
+       shrink would collapse them to just the emoji on a horizontal row). */
+    .chatlist a { flex: 0 0 auto; min-width: 8.5rem; max-width: 11rem; white-space: nowrap; }
     .pager { margin-top: .5rem; border-top: none; }
   }
 </style>

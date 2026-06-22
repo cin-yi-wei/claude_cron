@@ -25,7 +25,7 @@ const dict = {
     'chat.windows': '聊天視窗',
     'chat.search': '搜尋…',
     'chat.nomatch': '無相符',
-    'chat.pick': '從右側清單選一個 binding 開始聊天。',
+    'chat.pick': '從清單選一個 binding 開始聊天。',
     'chat.empty': '還沒有訊息。輸入後送出，會注入 cc-{name} session。',
     'chat.send': '送出',
     'chat.placeholder': '輸入訊息給 {name}…',
