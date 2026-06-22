@@ -8,7 +8,12 @@
 }
 main.container {
   max-width: 1280px;
+  /* Hard guard against any element (wide code block, long token) creating
+     horizontal page scroll that pushes content off-screen on mobile. Code
+     blocks keep their own inner overflow-x:auto, so they still scroll. */
+  overflow-x: hidden;
 }
+html, body { overflow-x: hidden; max-width: 100%; }
 
 /* Dark mode = Atom One Dark palette. Override Pico's dark vars so the whole
    admin matches the editor look. */
