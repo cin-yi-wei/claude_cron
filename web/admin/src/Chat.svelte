@@ -204,12 +204,11 @@
   .msg.assistant .who { background: #2d4636; }
   .msg.user .who { background: var(--pico-primary); }
   .msg.error .who { background: var(--pico-del-color); }
-  /* Both speakers use the same blue bubble (distinguished by side + avatar). */
-  .msg .txt { white-space: pre-wrap; word-break: break-word; max-width: 82%; padding: .5rem .75rem; border-radius: 14px; border-color: transparent; background: var(--pico-primary-background); color: var(--pico-primary-inverse); }
-  .msg .txt .code { white-space: pre; overflow-x: auto; margin: .3rem 0; padding: .5rem .7rem; border-radius: 6px; background: var(--pico-code-background-color, #1e2030); color: var(--pico-color); font-size: .9rem; line-height: 1.45; }
+  /* Both speakers use the same blue bubble + the SAME uniform rounding
+     (distinguished by side + avatar). */
+  .msg .txt { white-space: pre-wrap; word-break: break-word; max-width: 82%; padding: .5rem .75rem; border-radius: 16px; border-color: transparent; background: var(--pico-primary-background); color: var(--pico-primary-inverse); }
+  .msg .txt .code { white-space: pre; overflow-x: auto; margin: .3rem 0; padding: .5rem .7rem; border-radius: 10px; background: var(--pico-code-background-color, #1e2030); color: var(--pico-color); font-size: .9rem; line-height: 1.45; }
   /* diff line colours are applied inline (Svelte can't keep CSS for runtime-only classes). */
-  .msg.assistant .txt { border-top-left-radius: 4px; }
-  .msg.user .txt { border-top-right-radius: 4px; }
   .msg.error .txt { background: var(--pico-del-color); color: #fff; }
   .muted { color: var(--pico-muted-color); }
   .center { text-align: center; margin: 0; }
