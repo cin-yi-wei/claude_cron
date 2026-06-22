@@ -4,8 +4,8 @@
 
 const dict = {
   'zh-TW': {
-    'app.subtitle': 'bindings + 瀏覽器聊天窗',
-    'nav.bindings': 'Bindings',
+    'app.subtitle': '綁定 + 瀏覽器聊天窗',
+    'nav.bindings': '綁定',
     'nav.chat': '聊天',
     'nav.create': '新增',
     'nav.settings': '設定',

@@ -8,6 +8,15 @@
   let token = $state(localStorage.getItem('cc_admin_token') || '');
   $effect(() => { localStorage.setItem('cc_admin_token', token); });
 
+  // Theme: default to the saved choice, else follow the OS. Applied to <html>
+  // via Pico's data-theme.
+  const osDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+  let theme = $state(localStorage.getItem('cc_theme') || (osDark ? 'dark' : 'light'));
+  $effect(() => {
+    document.documentElement.setAttribute('data-theme', theme);
+    localStorage.setItem('cc_theme', theme);
+  });
+
   function parseHash() {
     const h = location.hash.replace(/^#\/?/, '');
     const [view, arg] = h.split('/');
@@ -37,6 +46,11 @@
       <li><a href={n.href} class={route.view === n.id ? 'active' : ''}>{t(n.key)}</a></li>
     {/each}
     <li>
+      <button class="themebtn" title="theme" onclick={() => (theme = theme === 'dark' ? 'light' : 'dark')}>
+        {theme === 'dark' ? '☀️' : '🌙'}
+      </button>
+    </li>
+    <li>
       <select class="lang" value={getLocale()} onchange={(e) => setLocale(e.currentTarget.value)}>
         {#each LOCALES as l}<option value={l.id}>{l.label}</option>{/each}
       </select>
@@ -63,6 +77,7 @@
   .topnav a { padding: .4rem .6rem; border-radius: var(--pico-border-radius); text-decoration: none; }
   .topnav a.active { background: var(--pico-primary-background); color: var(--pico-primary-inverse); }
   .muted { color: var(--pico-muted-color); }
+  .themebtn { width: auto; padding: .2rem .45rem; margin: 0; background: transparent; border: 1px solid var(--pico-muted-border-color); border-radius: var(--pico-border-radius); line-height: 1; cursor: pointer; }
   .lang { width: auto; font-size: .75rem; padding: .15rem 1.4rem .15rem .4rem; margin: 0; }
   .tok { width: 120px; font-size: .75rem; padding: .2rem .4rem; margin: 0; }
   main.container { max-width: 1280px; padding-top: 1.2rem; }
