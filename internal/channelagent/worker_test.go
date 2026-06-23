@@ -137,6 +137,106 @@ func TestWorkerRecoversOrphanedProcessingJob(t *testing.T) {
 	assertExists(t, filepath.Join(root, "inbox", "done", job.JobID+".json"))
 }
 
+// TestResolvePendingDecisionWithoutLock proves the deadlock fix: a y/n reply is
+// resolved while claude.lock is held (simulating the turn blocked in the gate
+// hook). The decision file must be written, the pending request cleared, and the
+// reply archived — none of which the lock-holding worker side-route could do.
+func TestResolvePendingDecisionWithoutLock(t *testing.T) {
+	root := filepath.Join(t.TempDir(), ".channel-agent")
+	if err := Init(root); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	// A permission is pending (a turn is blocked in the gate hook).
+	const permID = "mcp__openobserve__search_sql-20260623T074512000"
+	if err := AtomicWriteJSON(filepath.Join(root, "permissions", "pending", permID+".json"),
+		map[string]string{"id": permID, "tool": "mcp__openobserve__search_sql"}); err != nil {
+		t.Fatalf("seed pending perm: %v", err)
+	}
+	// Hold claude.lock the whole time — exactly the deadlock condition.
+	lock, err := AcquireLock(filepath.Join(root, "locks", "claude.lock"))
+	if err != nil {
+		t.Fatalf("AcquireLock: %v", err)
+	}
+	defer lock.Release()
+
+	job := seedDecisionJob(t, root, "y")
+
+	consumed, err := ResolvePendingDecisionOnce(root)
+	if err != nil {
+		t.Fatalf("ResolvePendingDecisionOnce: %v", err)
+	}
+	if !consumed {
+		t.Fatal("consumed = false, want true (the y reply should resolve the pending perm)")
+	}
+	// Decision recorded so the gate hook unblocks with allow.
+	var d struct {
+		Allow    bool `json:"allow"`
+		Remember bool `json:"remember"`
+	}
+	if err := ReadJSON(filepath.Join(root, "permissions", "decisions", permID+".json"), &d); err != nil {
+		t.Fatalf("read decision: %v", err)
+	}
+	if !d.Allow {
+		t.Fatalf("decision allow = false, want true")
+	}
+	// Pending request cleared + reply archived to done (not re-injected later).
+	assertNotExists(t, filepath.Join(root, "permissions", "pending", permID+".json"))
+	assertExists(t, filepath.Join(root, "inbox", "done", job.JobID+".json"))
+	assertNotExists(t, filepath.Join(root, "inbox", "pending", job.JobID+".json"))
+}
+
+// TestResolvePendingDecisionIgnoresNonDecision leaves a normal message for the
+// worker when a permission is pending but the message is not a y/n.
+func TestResolvePendingDecisionIgnoresNonDecision(t *testing.T) {
+	root := filepath.Join(t.TempDir(), ".channel-agent")
+	if err := Init(root); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	const permID = "Bash-20260623T074512000"
+	if err := AtomicWriteJSON(filepath.Join(root, "permissions", "pending", permID+".json"),
+		map[string]string{"id": permID, "tool": "Bash"}); err != nil {
+		t.Fatalf("seed pending perm: %v", err)
+	}
+	job := seedDecisionJob(t, root, "do the thing please")
+	consumed, err := ResolvePendingDecisionOnce(root)
+	if err != nil {
+		t.Fatalf("ResolvePendingDecisionOnce: %v", err)
+	}
+	if consumed {
+		t.Fatal("consumed = true, want false (a non-decision message must be left for the worker)")
+	}
+	assertExists(t, filepath.Join(root, "inbox", "pending", job.JobID+".json"))
+}
+
+// seedDecisionJob writes a pending inbox message with the given content.
+func seedDecisionJob(t *testing.T, root, content string) InputJob {
+	t.Helper()
+	source := SourceMessage{
+		Platform:  "mock",
+		ChannelID: "local",
+		MessageID: "m-" + content,
+		AuthorID:  "u1",
+		CreatedAt: "2026-06-23T15:45:12+08:00",
+		Content:   content,
+	}
+	hash, err := HashSource(source)
+	if err != nil {
+		t.Fatalf("HashSource: %v", err)
+	}
+	job := InputJob{
+		Schema:    1,
+		JobID:     buildJobID(source, hash),
+		RequestID: buildRequestID(source, hash),
+		InputHash: hash,
+		Source:    source,
+		CreatedAt: source.CreatedAt,
+	}
+	if err := AtomicWriteJSON(filepath.Join(root, "inbox", "pending", job.JobID+".json"), job); err != nil {
+		t.Fatalf("write decision job: %v", err)
+	}
+	return job
+}
+
 func seedPendingJob(t *testing.T, root, messageID string) InputJob {
 	t.Helper()
 	if err := Init(root); err != nil {

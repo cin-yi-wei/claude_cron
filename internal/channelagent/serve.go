@@ -16,6 +16,12 @@ func RunServeOnce(ctx context.Context, root string, ingester Ingester, injector 
 	if err != nil {
 		return ServeResult{}, err
 	}
+	// Resolve a pending permission reply (y/n) BEFORE acquiring claude.lock. The
+	// turn blocked in the gate hook holds that lock for its whole duration, so the
+	// worker's own side-route can never write the decision — a deadlock that ends
+	// in a gate timeout/deny ("I replied y but it died"). This out-of-band step is
+	// a no-op unless a permission is actually pending. Best-effort.
+	_, _ = ResolvePendingDecisionOnce(root)
 	processed, werr := RunWorkerOnce(ctx, root, injector, timeout)
 	// ALWAYS flush the outbox, even if the worker errored or its claude.lock was
 	// held by a still-running (long) worker from a prior cycle. A session blocked

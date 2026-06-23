@@ -118,6 +118,52 @@ func RunWorkerOnce(ctx context.Context, root string, injector Injector, timeout 
 	return true, nil
 }
 
+// ResolvePendingDecisionOnce resolves a y/n permission reply WITHOUT taking
+// claude.lock, then archives the reply message. It exists to break a deadlock:
+// when a tool triggers the gate, the Claude turn blocks inside the gate hook
+// waiting for the decision — but that turn is mid-Inject/waitOutput inside
+// RunWorkerOnce, which holds claude.lock for its whole duration. The user's "y"
+// arrives as a new inbox message, but the only code that writes the decision
+// (the worker side-route) also needs claude.lock, which it can never get while
+// the blocked turn holds it. The gate then times out and denies — exactly the
+// "I replied y but it died" symptom. Running the resolution out-of-band, before
+// the lock, lets the decision through to the waiting hook.
+//
+// It only acts when a permission is actually pending (which means a turn is
+// blocked and the lock is held), so it never races the normal worker path:
+// in that state the locked worker cannot process the inbox anyway.
+// Returns true if it consumed a message as a decision.
+func ResolvePendingDecisionOnce(root string) (bool, error) {
+	if err := Init(root); err != nil {
+		return false, err
+	}
+	id := oldestPendingPermission(root)
+	if id == "" {
+		return false, nil // nothing waiting → let the normal worker handle the inbox
+	}
+	pendingPath, err := oldestJSON(pathIn(root, "inbox", "pending"))
+	if err != nil || pendingPath == "" {
+		return false, err
+	}
+	var job InputJob
+	if err := ReadJSON(pendingPath, &job); err != nil {
+		return false, nil // malformed → leave it for the worker to fail properly
+	}
+	allow, remember, ok := parseDecision(job.Source.Content)
+	if !ok {
+		return false, nil // not a y/n → leave for normal injection once the turn ends
+	}
+	// Write the decision first (idempotent), then clear the pending request so the
+	// gate hook unblocks, then archive the reply so it isn't re-injected later.
+	if err := resolvePermission(root, id, allow, remember); err != nil {
+		return false, err
+	}
+	_ = os.Remove(pathIn(root, "permissions", "pending", id+".json"))
+	name := filepath.Base(pendingPath)
+	_ = moveFile(pendingPath, pathIn(root, "inbox", "done", name))
+	return true, nil
+}
+
 // maxJobAttempts bounds inject retries before a job is moved to failed.
 const maxJobAttempts = 3
 
