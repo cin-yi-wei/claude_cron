@@ -210,11 +210,25 @@ func StartTmuxClaude(ctx context.Context, session, cwd, registryRoot string) err
 	// (to resolve this worktree's binding + channel) without per-binding config.
 	// claudeArgs resumes the latest transcript so a (re)created session — on
 	// reap, serve restart, or reboot — keeps its prior conversation.
-	args := append([]string{"new-session", "-d", "-s", session, "-c", cwd, "-e", "CC_REGISTRY_ROOT=" + registryRoot}, claudeArgs(cwd)...)
+	base := []string{"new-session", "-d", "-s", session, "-c", cwd, "-e", "CC_REGISTRY_ROOT=" + registryRoot}
+	base = append(base, oauthTokenEnvArgs()...)
+	args := append(base, claudeArgs(cwd)...)
 	if err := runExternalCommand(ctx, "tmux", args...); err != nil {
 		return err
 	}
 	waitSessionReady(ctx, session)
+	return nil
+}
+
+// oauthTokenEnvArgs passes a long-lived subscription token (from `claude
+// setup-token`, set in serve's env via .env) into the session so it never needs
+// an interactive /login. Empty when not configured. CLAUDE_CODE_OAUTH_TOKEN is a
+// subscription OAuth token (NOT a pay-per-token API key), so billing stays on
+// the plan; it is deliberately NOT stripped by claudeArgs.
+func oauthTokenEnvArgs() []string {
+	if t := os.Getenv("CLAUDE_CODE_OAUTH_TOKEN"); t != "" {
+		return []string{"-e", "CLAUDE_CODE_OAUTH_TOKEN=" + t}
+	}
 	return nil
 }
 
@@ -298,6 +312,7 @@ func StartControlSession(ctx context.Context, session, cwd, registryRoot, tokenE
 		// A web control plane has no bot token; only inject -e when there is one.
 		base = append(base, "-e", tokenEnv+"="+tokenValue)
 	}
+	base = append(base, oauthTokenEnvArgs()...)
 	args := append(base, claudeArgs(cwd, "--append-system-prompt", systemPrompt)...)
 	if err := runExternalCommand(ctx, "tmux", args...); err != nil {
 		return err
