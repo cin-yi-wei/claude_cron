@@ -14,7 +14,38 @@ import (
 var (
 	unboundAnnounceMu  sync.Mutex
 	unboundAnnouncedAt = map[string]time.Time{}
+	loginNotifiedAt    = map[string]time.Time{}
 )
+
+// capturePane returns the tmux pane snapshot for a session (empty on error).
+func capturePane(ctx context.Context, session string) string {
+	out, err := runExternalCommandOutput(ctx, "tmux", "capture-pane", "-pt", session)
+	if err != nil {
+		return ""
+	}
+	return out
+}
+
+const loginNotifyCooldown = 20 * time.Minute
+
+// notifyLoginNeeded posts to the Discord control channel that a session's OAuth
+// token expired and a human /login is required (the creds file is also expired,
+// so a restart can't fix it). Debounced per binding so it doesn't spam.
+func notifyLoginNeeded(ctx context.Context, cfg Config, token, binding string) {
+	ch := cfg.Discord.ChannelID
+	if ch == "" || token == "" {
+		return
+	}
+	unboundAnnounceMu.Lock()
+	if last, seen := loginNotifiedAt[binding]; seen && time.Since(last) < loginNotifyCooldown {
+		unboundAnnounceMu.Unlock()
+		return
+	}
+	loginNotifiedAt[binding] = time.Now()
+	unboundAnnounceMu.Unlock()
+	text := fmt.Sprintf("🔑 binding `%s` 的 Claude 登入過期了（憑證也已過期，重啟救不了）。請去『任一個』session 跑一次 /login（tmux attach -t cc-%s 或任意 cc- session），刷新後其他 session 我會自動重啟跟上。", binding, binding)
+	_ = DiscordSender{BaseURL: cfg.Discord.BaseURL, Token: token, ChannelID: ch}.Send(ctx, OutputJob{Schema: 1, Send: true, Text: text})
+}
 
 const unboundAnnounceCooldown = 10 * time.Minute
 
@@ -243,6 +274,21 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 		}
 		if err := StartTmuxClaude(ctx, b.TmuxSession, b.Worktree, root); err != nil {
 			fmt.Fprintf(stdout, "binding %s session error: %v\n", b.Name, err)
+			continue
+		}
+		// Auth watchdog: a session showing "Please run /login" / 401 holds an
+		// expired OAuth token. If the shared credentials file is now valid (the
+		// user logged in on some session), restart this one so it re-reads the
+		// fresh token — fixing it without a per-session /login. If the creds are
+		// ALSO expired, a restart can't help: notify the channel so the user does
+		// one /login.
+		if classifyScreen(capturePane(ctx, b.TmuxSession)) == ScreenLogin {
+			if valid, ok := claudeCredsValid(); ok && valid {
+				_ = StopTmuxSession(ctx, b.TmuxSession)
+				fmt.Fprintf(stdout, "binding %s login-needed but creds fresh — restarting to re-read\n", b.Name)
+			} else {
+				notifyLoginNeeded(ctx, cfg, token, b.Name)
+			}
 			continue
 		}
 		// Stall watchdog: if the session has queued work but its transcript has

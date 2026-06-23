@@ -27,3 +27,19 @@ func TestClassifyScreenStripsANSI(t *testing.T) {
 		t.Fatalf("ansi-wrapped working = %q", got)
 	}
 }
+
+func TestClassifyScreenLogin(t *testing.T) {
+	for _, p := range []string{
+		"● Please run /login · API Error: 401 Invalid authentication credentials",
+		"Invalid authentication credentials",
+		"You are not logged in.",
+	} {
+		if got := classifyScreen(p); got != ScreenLogin {
+			t.Errorf("login pane %q => %q", p, got)
+		}
+	}
+	// prose mentioning login must not trigger (no distinctive phrase)
+	if classifyScreen("我等下要 login 一下") == ScreenLogin {
+		t.Fatal("prose false-positive on login")
+	}
+}

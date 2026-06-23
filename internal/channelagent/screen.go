@@ -17,6 +17,7 @@ const (
 	ScreenWorking ScreenState = "working" // generating / running a tool (spinner)
 	ScreenConfirm ScreenState = "confirm" // Claude's own permission/confirm dialog
 	ScreenGlitch  ScreenState = "glitch"  // printed literal tool-call markup as text
+	ScreenLogin   ScreenState = "login"   // auth expired: "Please run /login" / 401
 )
 
 var ansiRE = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
@@ -31,6 +32,14 @@ func stripANSI(s string) string { return ansiRE.ReplaceAllString(s, "") }
 func classifyScreen(pane string) ScreenState {
 	s := stripANSI(pane)
 	low := strings.ToLower(s)
+
+	// Login needed: the OAuth token expired / not authenticated. Distinctive
+	// phrases Claude prints; any one is conclusive.
+	for _, sig := range []string{"please run /login", "invalid authentication credentials", "not logged in", "/login to authenticate"} {
+		if strings.Contains(low, sig) {
+			return ScreenLogin
+		}
+	}
 
 	// Glitch: the model printed raw tool-call markup instead of executing it.
 	// These literals never appear in a normal rendered TUI (tools render as

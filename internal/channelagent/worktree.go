@@ -268,10 +268,11 @@ func latestTranscript(worktree string) string {
 // claudeArgs builds the `claude ...` tail for a tmux launch, resuming the latest
 // transcript for cwd when one exists. extra is appended after (e.g. flags).
 func claudeArgs(cwd string, extra ...string) []string {
-	// `env -u ANTHROPIC_API_KEY` strips an inherited API key so the session always
-	// authenticates with the interactive Claude subscription (credentials.json),
-	// never pay-per-token API — even if a key gets added to .env later.
-	args := []string{"env", "-u", "ANTHROPIC_API_KEY", "claude"}
+	// `env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN` strips inherited API
+	// credentials so the session always authenticates with the interactive Claude
+	// subscription (credentials.json), never pay-per-token API — even if a key
+	// gets added to .env later. (pikiloom strips both vars for the same reason.)
+	args := []string{"env", "-u", "ANTHROPIC_API_KEY", "-u", "ANTHROPIC_AUTH_TOKEN", "claude"}
 	if id := latestTranscript(cwd); id != "" {
 		args = append(args, "--resume", id)
 	}
