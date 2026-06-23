@@ -64,19 +64,48 @@ func TestBuildClaudePromptTeachesNotify(t *testing.T) {
 		InputHash: "h1",
 		Source:    SourceMessage{Platform: "discord", ChannelID: "chan99", Content: "hi"},
 	}
-	p := BuildClaudePrompt(".channel-agent", job, ".channel-agent/outbox/pending/j1.json", nil)
+	p := BuildClaudePrompt(".channel-agent", job, ".channel-agent/outbox/pending/j1.json", nil, nil)
 	if !strings.Contains(p, "claude-cron notify") {
 		t.Fatalf("prompt should teach notify:\n%s", p)
 	}
 	if !strings.Contains(p, "chan99") {
 		t.Fatalf("prompt should include the job's channel id:\n%s", p)
 	}
-	if strings.Contains(p, "附帶圖片") {
-		t.Fatalf("no images → prompt must not mention attachments:\n%s", p)
+	if strings.Contains(p, "附帶圖片") || strings.Contains(p, "附帶文字檔") {
+		t.Fatalf("no attachments → prompt must not mention them:\n%s", p)
 	}
-	withImg := BuildClaudePrompt(".channel-agent", job, ".channel-agent/outbox/pending/j1.json", []string{"/tmp/a.png"})
+	withImg := BuildClaudePrompt(".channel-agent", job, ".channel-agent/outbox/pending/j1.json", []string{"/tmp/a.png"}, nil)
 	if !strings.Contains(withImg, "/tmp/a.png") || !strings.Contains(withImg, "附帶圖片") {
 		t.Fatalf("with images → prompt must point at the local path:\n%s", withImg)
+	}
+	withTxt := BuildClaudePrompt(".channel-agent", job, ".channel-agent/outbox/pending/j1.json", nil, []string{"/tmp/m.txt"})
+	if !strings.Contains(withTxt, "/tmp/m.txt") || !strings.Contains(withTxt, "附帶文字檔") {
+		t.Fatalf("with text → prompt must point at the local path:\n%s", withTxt)
+	}
+}
+
+func TestTextAttachmentDetection(t *testing.T) {
+	cases := []struct {
+		a      Attachment
+		isText bool
+		ext    string
+	}{
+		{Attachment{URL: "https://files.slack.com/snippet.txt", Type: "text/plain"}, true, ".txt"},
+		{Attachment{URL: "https://cdn/log.log?t=1"}, true, ".log"},
+		{Attachment{URL: "https://cdn/x", Type: "application/json"}, true, ".json"},
+		{Attachment{URL: "https://cdn/x.png", Type: "image/png"}, false, ""},
+		{Attachment{URL: "https://cdn/doc.pdf", Type: "application/pdf"}, false, ""},
+	}
+	for _, c := range cases {
+		got := isTextAttachment(c.a) && !isImageAttachment(c.a)
+		if got != c.isText {
+			t.Fatalf("text detect(%v) = %v, want %v", c.a, got, c.isText)
+		}
+		if c.isText {
+			if e := textExt(c.a); e != c.ext {
+				t.Fatalf("textExt(%v) = %q, want %q", c.a, e, c.ext)
+			}
+		}
 	}
 }
 

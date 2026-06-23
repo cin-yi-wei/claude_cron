@@ -40,10 +40,14 @@ func (i TmuxInjector) Inject(ctx context.Context, job InputJob, outputPath strin
 	// Download any image attachments to local files so Claude can actually read
 	// them (vision); the prompt then points at the local paths. Best-effort.
 	images := downloadImageAttachments(i.Root, job)
+	// Some platforms (e.g. Slack) turn an over-long text message into a file
+	// attachment (.txt snippet). Download those too so the prompt can point
+	// Claude at them — otherwise the actual message body is lost. Best-effort.
+	texts := downloadTextAttachments(i.Root, job)
 	// Collapse the prompt to a single line. Embedded newlines sent to the Claude
 	// TUI via send-keys are interpreted as Enter keypresses, which submit the
 	// input prematurely and fragment the prompt. A single line submits cleanly.
-	prompt := collapseWhitespace(BuildClaudePrompt(i.Root, job, outputPath, images))
+	prompt := collapseWhitespace(BuildClaudePrompt(i.Root, job, outputPath, images, texts))
 
 	// The Enter occasionally fails to submit (drops), leaving the prompt sitting
 	// in the input box and never processed. So submit, then VERIFY the input box
@@ -166,7 +170,7 @@ func (i TmuxInjector) ensureSession(ctx context.Context) error {
 	return runExternalCommand(ctx, "tmux", "new-session", "-d", "-s", i.Session, "claude")
 }
 
-func BuildClaudePrompt(root string, job InputJob, outputPath string, imagePaths []string) string {
+func BuildClaudePrompt(root string, job InputJob, outputPath string, imagePaths, textPaths []string) string {
 	// Use absolute paths so the prompt resolves correctly regardless of the
 	// agent's current working directory (the agent may `cd` while renaming the
 	// output file, which would otherwise break the next job's relative paths).
@@ -180,7 +184,11 @@ func BuildClaudePrompt(root string, job InputJob, outputPath string, imagePaths 
 	if len(imagePaths) > 0 {
 		images = "\n\n本則訊息附帶圖片，已下載到本地檔，請用 Read 工具讀取這些路徑並一併分析（Read 支援圖片）：\n" + strings.Join(imagePaths, "\n")
 	}
-	return fmt.Sprintf(`請讀取 %s/current_job.json。%s
+	texts := ""
+	if len(textPaths) > 0 {
+		texts = "\n\n本則訊息附帶文字檔（平台把過長訊息轉存成檔案，例如 Slack 的 snippet），實際訊息正文在這些檔案裡，請用 Read 工具讀取其內容，當作使用者訊息的一部分一併處理：\n" + strings.Join(textPaths, "\n")
+	}
+	return fmt.Sprintf(`請讀取 %s/current_job.json。%s%s
 
 根據目前 Claude Code session / project context，分析裡面的新對話內容，產生要回覆使用者的訊息。
 
@@ -208,7 +216,7 @@ JSON 必須是這個格式（注意 send 要設成布林 true 才會把回覆送
 
 若你啟動了長時間的背景任務（detached，例如安裝、編譯、長測試），請在 shell 指令鏈的最後加上：
 && claude-cron notify %s "完成訊息" --root %s
-這樣任務跑完會自動通知使用者；不要為了等它而卡住這次回覆。`, root, images, outputPath, outputPath, 1, job.JobID, job.RequestID, job.InputHash, root, job.Source.ChannelID, root)
+這樣任務跑完會自動通知使用者；不要為了等它而卡住這次回覆。`, root, images, texts, outputPath, outputPath, 1, job.JobID, job.RequestID, job.InputHash, root, job.Source.ChannelID, root)
 }
 
 // downloadImageAttachments saves a job's image attachments under
@@ -235,6 +243,61 @@ func downloadImageAttachments(root string, job InputJob) []string {
 		out = append(out, dst)
 	}
 	return out
+}
+
+// downloadTextAttachments saves a job's text/document attachments under
+// <root>/attachments/<jobid>/ and returns their absolute local paths. Platforms
+// like Slack convert an over-long message into a .txt snippet file; without this
+// the message body would be lost. Best effort: non-text or failed downloads are
+// skipped. Images are handled separately by downloadImageAttachments.
+func downloadTextAttachments(root string, job InputJob) []string {
+	var out []string
+	dir := pathIn(root, "attachments", sanitize(job.JobID))
+	for idx, a := range job.Source.Attachments {
+		if a.URL == "" || isImageAttachment(a) || !isTextAttachment(a) {
+			continue
+		}
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return out
+		}
+		dst := filepath.Join(dir, fmt.Sprintf("%d%s", idx, textExt(a)))
+		if err := httpDownloadFile(a.URL, dst); err != nil {
+			continue
+		}
+		if abs, err := filepath.Abs(dst); err == nil {
+			dst = abs
+		}
+		out = append(out, dst)
+	}
+	return out
+}
+
+func isTextAttachment(a Attachment) bool {
+	t := strings.ToLower(a.Type)
+	if strings.HasPrefix(t, "text/") {
+		return true
+	}
+	switch t {
+	case "application/json", "application/xml", "application/x-yaml", "application/yaml",
+		"application/x-log", "application/csv", "application/x-ndjson":
+		return true
+	}
+	switch strings.ToLower(filepath.Ext(strings.SplitN(a.URL, "?", 2)[0])) {
+	case ".txt", ".text", ".log", ".md", ".markdown", ".csv", ".tsv",
+		".json", ".jsonl", ".ndjson", ".xml", ".yaml", ".yml", ".ini", ".conf":
+		return true
+	}
+	return false
+}
+
+func textExt(a Attachment) string {
+	if e := filepath.Ext(strings.SplitN(a.URL, "?", 2)[0]); len(e) >= 2 && len(e) <= 10 {
+		return e
+	}
+	if strings.Contains(strings.ToLower(a.Type), "json") {
+		return ".json"
+	}
+	return ".txt"
 }
 
 func isImageAttachment(a Attachment) bool {
