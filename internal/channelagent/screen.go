@@ -33,10 +33,27 @@ func classifyScreen(pane string) ScreenState {
 	s := stripANSI(pane)
 	low := strings.ToLower(s)
 
-	// Login needed: the OAuth token expired / not authenticated. Distinctive
-	// phrases Claude prints; any one is conclusive.
-	for _, sig := range []string{"please run /login", "invalid authentication credentials", "not logged in", "/login to authenticate"} {
+	// Login needed: genuinely logged out / token rejected. These phrases are
+	// conclusive on their own.
+	for _, sig := range []string{"invalid authentication credentials", "not logged in", "/login to authenticate"} {
 		if strings.Contains(low, sig) {
+			return ScreenLogin
+		}
+	}
+	// "Please run /login" is trickier: Claude ALSO prefixes it onto transient
+	// network errors, e.g. "● Please run /login · API Error: 401 The socket
+	// connection was closed unexpectedly". Auth is fine there — only the socket
+	// blipped — and the line replays on --resume. Classifying that as a login
+	// screen makes the auth watchdog kill a healthy, authenticated session every
+	// cycle (a tight restart loop). So treat "please run /login" as login ONLY
+	// when it is NOT part of an inline transient API/network error line.
+	if strings.Contains(low, "please run /login") {
+		transientAPIError := strings.Contains(low, "api error") && (strings.Contains(low, "socket") ||
+			strings.Contains(low, "connection") || strings.Contains(low, "closed unexpectedly") ||
+			strings.Contains(low, "timeout") || strings.Contains(low, "timed out") ||
+			strings.Contains(low, "fetch(") || strings.Contains(low, "econnreset") ||
+			strings.Contains(low, "network") || strings.Contains(low, "etimedout"))
+		if !transientAPIError {
 			return ScreenLogin
 		}
 	}

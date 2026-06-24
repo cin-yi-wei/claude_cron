@@ -4,8 +4,19 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
+
+// claudeOAuthTokenConfigured reports whether a long-lived subscription OAuth
+// token is set (CLAUDE_CODE_OAUTH_TOKEN). When it is, session auth comes from
+// that token — injected into every session at startup — NOT from the interactive
+// ~/.claude/.credentials.json login. A login-looking screen then just means the
+// live process predates the token; a restart re-injects it. Nagging the user to
+// run /login is wrong in that case: /login won't help and isn't needed.
+func claudeOAuthTokenConfigured() bool {
+	return strings.TrimSpace(os.Getenv("CLAUDE_CODE_OAUTH_TOKEN")) != ""
+}
 
 // claudeCredentialsPath is Claude Code's OAuth credentials file (subscription
 // login). Shared by every cc-* session on the host.

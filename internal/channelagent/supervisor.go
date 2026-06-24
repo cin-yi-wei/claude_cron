@@ -15,7 +15,23 @@ var (
 	unboundAnnounceMu  sync.Mutex
 	unboundAnnouncedAt = map[string]time.Time{}
 	loginNotifiedAt    = map[string]time.Time{}
+	loginRestartedAt   = map[string]time.Time{}
 )
+
+const loginRestartCooldown = 3 * time.Minute
+
+// loginRestartAllowed rate-limits the auth-watchdog's "restart on login screen"
+// so a persistent (or misclassified) login screen can't kill the session every
+// cycle. Returns true at most once per loginRestartCooldown per binding.
+func loginRestartAllowed(binding string) bool {
+	unboundAnnounceMu.Lock()
+	defer unboundAnnounceMu.Unlock()
+	if last, seen := loginRestartedAt[binding]; seen && time.Since(last) < loginRestartCooldown {
+		return false
+	}
+	loginRestartedAt[binding] = time.Now()
+	return true
+}
 
 // capturePane returns the tmux pane snapshot for a session (empty on error).
 func capturePane(ctx context.Context, session string) string {
@@ -283,13 +299,25 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 		// ALSO expired, a restart can't help: notify the channel so the user does
 		// one /login.
 		if classifyScreen(capturePane(ctx, b.TmuxSession)) == ScreenLogin {
-			if valid, ok := claudeCredsValid(); ok && valid {
-				_ = StopTmuxSession(ctx, b.TmuxSession)
-				fmt.Fprintf(stdout, "binding %s login-needed but creds fresh — restarting to re-read\n", b.Name)
+			valid, ok := claudeCredsValid()
+			// A configured long-lived OAuth token is injected into every session at
+			// (re)start, so a restart re-reads valid auth without any human /login.
+			// Same when the shared creds file is itself fresh. Only nag for /login
+			// when there is NO token AND the creds are also expired — the one case a
+			// restart genuinely can't fix.
+			if claudeOAuthTokenConfigured() || (ok && valid) {
+				// Restart so the session re-reads fresh auth — but rate-limited, so a
+				// login screen that a restart does NOT clear can't loop-kill it.
+				if loginRestartAllowed(b.Name) {
+					_ = StopTmuxSession(ctx, b.TmuxSession)
+					fmt.Fprintf(stdout, "binding %s login screen — restarting to re-read auth (token/creds fresh)\n", b.Name)
+					continue
+				}
+				fmt.Fprintf(stdout, "binding %s login screen but within restart cooldown — leaving session\n", b.Name)
 			} else {
 				notifyLoginNeeded(ctx, cfg, token, b.Name)
+				continue
 			}
-			continue
 		}
 		// Stall watchdog: if the session has queued work but its transcript has
 		// gone silent past the threshold, it's stuck — kill it so the next cycle
