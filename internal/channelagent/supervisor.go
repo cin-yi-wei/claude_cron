@@ -16,7 +16,27 @@ var (
 	unboundAnnouncedAt = map[string]time.Time{}
 	loginNotifiedAt    = map[string]time.Time{}
 	loginRestartedAt   = map[string]time.Time{}
+
+	confirmPostedMu   sync.Mutex
+	confirmPostedHash = map[string]string{} // binding → hash of last confirm posted
 )
+
+// postConfirmOnce posts a native confirm dialog to the binding's own channel via
+// its outbox (same path the permission prompt uses), debounced so the same
+// dialog isn't re-posted every cycle. The user answers in that channel and
+// resolveConfirmReply types the choice back into the pane.
+func postConfirmOnce(root, binding string, d confirmDialog) {
+	h := d.hash()
+	confirmPostedMu.Lock()
+	if confirmPostedHash[binding] == h {
+		confirmPostedMu.Unlock()
+		return
+	}
+	confirmPostedHash[binding] = h
+	confirmPostedMu.Unlock()
+	_ = AtomicWriteJSON(pathIn(root, "outbox", "pending", "confirm-"+h+".json"),
+		OutputJob{Schema: 1, JobID: "confirm-" + h, Send: true, Text: confirmPromptMessage(d)})
+}
 
 const loginRestartCooldown = 3 * time.Minute
 
@@ -298,7 +318,34 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 		// fresh token — fixing it without a per-session /login. If the creds are
 		// ALSO expired, a restart can't help: notify the channel so the user does
 		// one /login.
-		if classifyScreen(capturePane(ctx, b.TmuxSession)) == ScreenLogin {
+		pane := capturePane(ctx, b.TmuxSession)
+		screen := classifyScreen(pane)
+		// Confirm watchdog: Claude's native confirm dialogs (create SKILL.md, edit
+		// settings, trust folder, proceed?) aren't PreToolUse-gated, so the channel
+		// gate never sees them and the session blocks on a keypress forever. Surface
+		// the dialog to the channel; apply the user's reply by typing it into the
+		// pane (both done out of band, like the permission y/n side-route).
+		if screen == ScreenConfirm {
+			if dlg, ok := parseConfirmDialog(pane); ok {
+				if resolveConfirmReply(ctx, b.Root, b.TmuxSession, dlg) {
+					confirmPostedMu.Lock()
+					delete(confirmPostedHash, b.Name)
+					confirmPostedMu.Unlock()
+					fmt.Fprintf(stdout, "binding %s confirm dialog answered from channel\n", b.Name)
+				} else {
+					postConfirmOnce(b.Root, b.Name, dlg)
+				}
+				// This branch continues (skips the worker — the session is blocked on the
+				// dialog), so the per-binding RunServeOnce below never runs. Flush the
+				// sender HERE or the confirm prompt we just queued never reaches the
+				// channel (the original "怎又卡": prompt stuck in outbox/pending).
+				if s, serr := SelectSender(b, cfg, bindingTokens{discord: token, telegram: os.Getenv(cfg.Telegram.TokenEnv)}); serr == nil {
+					_, _ = RunSenderOnce(ctx, b.Root, s)
+				}
+				continue
+			}
+		}
+		if screen == ScreenLogin {
 			valid, ok := claudeCredsValid()
 			// A configured long-lived OAuth token is injected into every session at
 			// (re)start, so a restart re-reads valid auth without any human /login.

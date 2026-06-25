@@ -67,15 +67,13 @@ func classifyScreen(pane string) ScreenState {
 		}
 	}
 
-	// Confirm dialog: Claude's own permission/confirm/trust prompt. Require the
-	// question text AND a numbered "❯" option so prose can't trigger it.
-	hasOption := strings.Contains(s, "❯ 1.") || strings.Contains(s, "❯ 2.") || strings.Contains(low, "1. yes") || strings.Contains(low, "2. yes")
-	if hasOption {
-		for _, q := range []string{"do you want to proceed", "do you want to make this edit", "bypass permissions mode", "yes, i accept", "do you trust", "no, exit"} {
-			if strings.Contains(low, q) {
-				return ScreenConfirm
-			}
-		}
+	// Confirm dialog: Claude's own permission/confirm/trust prompt (proceed?,
+	// make this edit?, trust folder?, create SKILL.md?, edit settings?, …). These
+	// are structurally a question plus numbered options with the "❯" selection
+	// cursor; parseConfirmDialog requires that cursor so prose/markdown numbered
+	// lists can't trigger it. Covers every native dialog, not a fixed phrase list.
+	if _, ok := parseConfirmDialog(s); ok {
+		return ScreenConfirm
 	}
 
 	// Working: a spinner / in-flight turn. Recent Claude shows a status line like
