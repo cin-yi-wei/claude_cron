@@ -3,10 +3,13 @@ package channelagent
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestDiscordSourceFetchesChannelMessages(t *testing.T) {
@@ -112,6 +115,58 @@ func TestDiscordSenderPostsMessage(t *testing.T) {
 	}
 	if gotBody["content"] != "reply" {
 		t.Fatalf("content = %q, want reply", gotBody["content"])
+	}
+}
+
+func TestDiscordSenderRetriesOn429(t *testing.T) {
+	var calls int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&calls, 1)
+		if n == 1 {
+			// First POST: rate limited. Tiny retry_after so the test is fast.
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"message":"You are being rate limited.","retry_after":0.01,"global":false}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"sent"}`))
+	}))
+	defer server.Close()
+
+	err := DiscordSender{BaseURL: server.URL + "/api/v10", Token: "tok", ChannelID: "c429"}.Send(context.Background(), OutputJob{Send: true, Text: "hi"})
+	if err != nil {
+		t.Fatalf("Send should succeed after a 429 retry, got %v", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("want 2 POSTs (429 then OK), got %d", got)
+	}
+}
+
+func TestParseRetryAfter(t *testing.T) {
+	mk := func(body, header string) *http.Response {
+		r := &http.Response{Header: http.Header{}, Body: http.NoBody}
+		if header != "" {
+			r.Header.Set("Retry-After", header)
+		}
+		if body != "" {
+			r.Body = io.NopCloser(strings.NewReader(body))
+		}
+		return r
+	}
+	if got := parseRetryAfter(mk(`{"retry_after":0.5}`, "")); got != 500*time.Millisecond {
+		t.Fatalf("body retry_after = %v, want 500ms", got)
+	}
+	if got := parseRetryAfter(mk("", "2")); got != 2*time.Second {
+		t.Fatalf("header Retry-After = %v, want 2s", got)
+	}
+	// Pathological value is clamped to the cap.
+	if got := parseRetryAfter(mk(`{"retry_after":999}`, "")); got != discordRetryCap {
+		t.Fatalf("clamp = %v, want %v", got, discordRetryCap)
+	}
+	// Nothing parseable → default 1s.
+	if got := parseRetryAfter(mk("", "")); got != time.Second {
+		t.Fatalf("default = %v, want 1s", got)
 	}
 }
 
