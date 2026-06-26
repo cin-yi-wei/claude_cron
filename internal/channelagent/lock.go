@@ -17,12 +17,19 @@ type FileLock struct {
 }
 
 // staleLockTimeout bounds how long a lock may be held before a new acquirer
-// treats it as stale and steals it. No legitimate hold lasts this long (the
-// longest is the control assistant's inject-wait + send, ~2min), so a lock older
-// than this means the previous holder hung or died without releasing. Overridable
-// in tests. This is the backstop for the 2026-06-18 incident where a wedged serve
-// held control-dc/locks/claude.lock for 42min and blocked all replies.
-var staleLockTimeout = 5 * time.Minute
+// treats it (by AGE) as stale and steals it. It MUST exceed the longest
+// legitimate hold, which is one worker/control turn: AcquireLock is held across
+// Inject + waitOutput, so the hold can last up to the full claude turn timeout
+// (cfg.Claude.Timeout, 900s/15min in prod). The old value (5min) was SHORTER than
+// that, so any turn running longer than 5min (e.g. a control deploy turn that
+// builds + restarts) had its lock STOLEN mid-flight by the next serve cycle —
+// two goroutines then "held" control-dc/claude.lock, and on release one removed
+// the other's file, producing the "held by live pid" churn / apparent stuck-lock
+// (2026-06-27 incident). 20min leaves margin over the 900s turn cap. A holder
+// whose PROCESS died is still reclaimed instantly by the pid-alive check below —
+// the age path only governs a still-live but genuinely-hung holder. Overridable
+// in tests. Also the backstop for the 2026-06-18 wedged-serve incident.
+var staleLockTimeout = 20 * time.Minute
 
 // AcquireLock creates an exclusive lock file at path. If the file already exists
 // it is stolen when the previous holder is gone — either its PID is no longer

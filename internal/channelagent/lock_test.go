@@ -87,6 +87,17 @@ func TestAcquireLockKeepsLiveRecentHolder(t *testing.T) {
 	}
 }
 
+// TestStaleLockTimeoutExceedsTurnCap guards the 2026-06-27 regression: the lock
+// is held across a whole worker/control turn (Inject + waitOutput, up to
+// cfg.Claude.Timeout = 900s in prod), so the age-based steal threshold MUST be
+// larger or a legit long turn gets its lock stolen mid-flight. Keep margin.
+func TestStaleLockTimeoutExceedsTurnCap(t *testing.T) {
+	const prodTurnCap = 900 * time.Second
+	if staleLockTimeout <= prodTurnCap {
+		t.Fatalf("staleLockTimeout (%s) must exceed the turn cap (%s) or long turns get their lock stolen mid-flight", staleLockTimeout, prodTurnCap)
+	}
+}
+
 func writeFileString(path, s string) error {
 	return AtomicWriteFile(path, []byte(s), 0o644)
 }
