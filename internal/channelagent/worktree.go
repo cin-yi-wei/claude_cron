@@ -2,11 +2,44 @@ package channelagent
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 )
+
+// maxResumeTranscriptBytes caps the size of a transcript we will `--resume`. A
+// session whose .jsonl grows past this (the control session hit ~120MB) fails to
+// boot: `claude --resume` must replay the whole file into context before the
+// session is live, so it never reaches the point where in-session compaction
+// could help — it OOMs/stalls on load and the supervisor loop-kills it. Past the
+// cap we archive the file and start fresh; durable context lives in the memory
+// files (~/.claude/.../memory), not the verbatim transcript, so a fresh session
+// still picks up where the last left off.
+const maxResumeTranscriptBytes = 40 << 20 // 40 MiB
+
+// archiveOversizedTranscript moves an oversized transcript out of the project dir
+// into ~/.claude/projects/_archive/ so the next session boots fresh. The archive
+// name is self-describing — <encoded-project-dir>__<session-id>__<stamp>.jsonl —
+// so each file says which binding and session it came from and when it was
+// retired; _archive is a single dir the user can back up wholesale. Best-effort:
+// on any failure we still report the transcript as gone so we never resume the
+// monster. Returns true if the file was over the cap (archived or not).
+func archiveOversizedTranscript(home, projectDir, id string, size int64) bool {
+	if size <= maxResumeTranscriptBytes {
+		return false
+	}
+	src := filepath.Join(home, ".claude", "projects", projectDir, id+".jsonl")
+	archiveDir := filepath.Join(home, ".claude", "projects", "_archive")
+	if err := os.MkdirAll(archiveDir, 0o755); err != nil {
+		return true
+	}
+	stamp := time.Now().UTC().Format("20060102T150405Z")
+	dst := filepath.Join(archiveDir, fmt.Sprintf("%s__%s__%s.jsonl", projectDir, id, stamp))
+	_ = os.Rename(src, dst)
+	return true
+}
 
 // sessionBootDelay bounds how long waitSessionReady probes a freshly-created
 // tmux Claude session for input readiness. A blind fixed delay was too short on
@@ -257,12 +290,14 @@ func latestTranscript(worktree string) string {
 	if err != nil {
 		return ""
 	}
-	entries, err := os.ReadDir(filepath.Join(home, ".claude", "projects", encodeProjectDir(abs)))
+	projectDir := encodeProjectDir(abs)
+	entries, err := os.ReadDir(filepath.Join(home, ".claude", "projects", projectDir))
 	if err != nil {
 		return ""
 	}
 	var newest string
 	var newestT time.Time
+	var newestSize int64
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
 			continue
@@ -273,8 +308,13 @@ func latestTranscript(worktree string) string {
 		}
 		if newest == "" || info.ModTime().After(newestT) {
 			newestT = info.ModTime()
+			newestSize = info.Size()
 			newest = strings.TrimSuffix(e.Name(), ".jsonl")
 		}
+	}
+	// Don't resume a transcript too big to boot — archive it and start fresh.
+	if newest != "" && archiveOversizedTranscript(home, projectDir, newest, newestSize) {
+		return ""
 	}
 	return newest
 }
