@@ -86,6 +86,13 @@ func RunWorkerOnce(ctx context.Context, root string, injector Injector, timeout 
 
 	outputPath := pathIn(root, "outbox", "pending", job.JobID+".json")
 	if err := injector.Inject(ctx, job, outputPath); err != nil {
+		// Session busy (mid-turn / dialog): not a failure, just "not now". Put the
+		// job back UNCHANGED — don't increment Attempt — so a long legitimate turn
+		// can't exhaust the retry budget and drop the message. Retried next cycle.
+		if errors.Is(err, errSessionBusy) {
+			_ = moveFile(processingPath, pathIn(root, "inbox", "pending", name))
+			return false, nil
+		}
 		// Inject failure usually means the message never landed (e.g. a session
 		// still cold from --resume). Requeue for a retry rather than losing it;
 		// only give up (→ failed) after a few attempts.

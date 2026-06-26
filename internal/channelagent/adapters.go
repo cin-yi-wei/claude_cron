@@ -2,6 +2,7 @@ package channelagent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +12,17 @@ import (
 	"strings"
 	"time"
 )
+
+// errSessionBusy is returned by Inject when the Claude TUI is mid-turn (a spinner
+// is running) or sitting on its own confirm/permission dialog. Typing then would
+// send C-c into the pane — interrupting the in-flight turn (observed as
+// "assistant error: exit status 1") or dismissing the dialog — and the prompt
+// would land in a busy box and fail to submit ("still in input box"). The caller
+// treats this as "not now, retry next cycle" WITHOUT counting a failed attempt,
+// so a long legitimate turn doesn't burn the waiting job's retry budget. This is
+// also what stops the duplicate-prompt storm: serve no longer re-injects (and
+// re-interrupts) every cycle while a turn is running — it waits for idle.
+var errSessionBusy = errors.New("inject deferred: session busy (mid-turn or dialog)")
 
 type StdoutSender struct {
 	Writer io.Writer
@@ -36,6 +48,16 @@ func (i TmuxInjector) Inject(ctx context.Context, job InputJob, outputPath strin
 	}
 	if err := i.ensureSession(ctx); err != nil {
 		return err
+	}
+	// Don't inject into a busy pane. typeAndSubmit leads with C-c, so injecting
+	// mid-turn interrupts the running turn and injecting over a confirm dialog
+	// dismisses it; either way the prompt is also likely to fail to submit. Defer
+	// instead — the caller requeues without burning a retry attempt.
+	if pane, err := runExternalCommandOutput(ctx, "tmux", "capture-pane", "-pt", i.Session); err == nil {
+		switch classifyScreen(pane) {
+		case ScreenWorking, ScreenConfirm:
+			return errSessionBusy
+		}
 	}
 	// Download any image attachments to local files so Claude can actually read
 	// them (vision); the prompt then points at the local paths. Best-effort.

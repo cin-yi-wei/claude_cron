@@ -56,6 +56,63 @@ func TestTmuxInjectorAutoStartsMissingSession(t *testing.T) {
 	}
 }
 
+func TestInjectDefersWhenSessionBusy(t *testing.T) {
+	oldRun, oldOut := runExternalCommand, runExternalCommandOutput
+	defer func() { runExternalCommand, runExternalCommandOutput = oldRun, oldOut }()
+	oldDelay := injectSubmitDelay
+	injectSubmitDelay = 0
+	defer func() { injectSubmitDelay = oldDelay }()
+
+	var sentKeys bool
+	runExternalCommand = func(_ context.Context, name string, args ...string) error {
+		if name == "tmux" && len(args) >= 1 && (args[0] == "send-keys") {
+			sentKeys = true
+		}
+		return nil // has-session ok (session exists)
+	}
+	// Pane shows an in-flight turn → classifyScreen == ScreenWorking.
+	runExternalCommandOutput = func(_ context.Context, _ string, _ ...string) (string, error) {
+		return "● Doing work...\n  (esc to interrupt)\n", nil
+	}
+
+	err := TmuxInjector{Session: "cc-x", Root: ".channel-agent"}.Inject(context.Background(), InputJob{JobID: "j1", RequestID: "r1", InputHash: "h1"}, ".channel-agent/outbox/pending/j1.json")
+	if !errors.Is(err, errSessionBusy) {
+		t.Fatalf("want errSessionBusy, got %v", err)
+	}
+	if sentKeys {
+		t.Fatal("Inject must NOT send any keys into a busy pane")
+	}
+}
+
+func TestInjectProceedsWhenIdle(t *testing.T) {
+	oldRun, oldOut := runExternalCommand, runExternalCommandOutput
+	defer func() { runExternalCommand, runExternalCommandOutput = oldRun, oldOut }()
+	oldDelay := injectSubmitDelay
+	injectSubmitDelay = 0
+	defer func() { injectSubmitDelay = oldDelay }()
+
+	var enterSent bool
+	runExternalCommand = func(_ context.Context, name string, args ...string) error {
+		if name == "tmux" && len(args) >= 1 && args[0] == "send-keys" && args[len(args)-1] == "Enter" {
+			enterSent = true
+		}
+		return nil
+	}
+	// Idle pane (empty input box) on capture; the post-submit verify also reads it
+	// as empty so Inject reports success.
+	runExternalCommandOutput = func(_ context.Context, _ string, _ ...string) (string, error) {
+		return "● done\n\n❯ \n", nil
+	}
+
+	err := TmuxInjector{Session: "cc-x", Root: ".channel-agent"}.Inject(context.Background(), InputJob{JobID: "j1", RequestID: "r1", InputHash: "h1"}, ".channel-agent/outbox/pending/j1.json")
+	if err != nil {
+		t.Fatalf("idle inject should succeed, got %v", err)
+	}
+	if !enterSent {
+		t.Fatal("idle inject should submit with Enter")
+	}
+}
+
 func TestBuildClaudePromptTeachesNotify(t *testing.T) {
 	job := InputJob{
 		Schema:    1,
