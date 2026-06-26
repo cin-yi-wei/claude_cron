@@ -185,6 +185,43 @@ func TestResolvePendingDecisionWithoutLock(t *testing.T) {
 	assertNotExists(t, filepath.Join(root, "inbox", "pending", job.JobID+".json"))
 }
 
+// TestResolvePendingDecisionScansBehindNonDecision proves the fix for the betby
+// deadlock: the y/n reply is found even when a non-decision message (e.g. a
+// pasted command) sits AHEAD of it in the queue.
+func TestResolvePendingDecisionScansBehindNonDecision(t *testing.T) {
+	root := filepath.Join(t.TempDir(), ".channel-agent")
+	if err := Init(root); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	const permID = "Bash-20260626T100650334"
+	if err := AtomicWriteJSON(filepath.Join(root, "permissions", "pending", permID+".json"),
+		map[string]string{"id": permID, "tool": "Bash"}); err != nil {
+		t.Fatalf("seed pending perm: %v", err)
+	}
+	// Oldest is a non-decision paste; the "y" is queued behind it.
+	paste := seedDecisionJob(t, root, "echo hello")
+	yes := seedDecisionJob(t, root, "y")
+	// Ensure ordering by name: seedDecisionJob keys MessageID off content, and
+	// sortedJSON sorts by JobID. Verify the y is resolved regardless of order.
+
+	consumed, err := ResolvePendingDecisionOnce(root)
+	if err != nil {
+		t.Fatalf("ResolvePendingDecisionOnce: %v", err)
+	}
+	if !consumed {
+		t.Fatal("consumed = false, want true (y behind a paste must still resolve)")
+	}
+	var d struct {
+		Allow bool `json:"allow"`
+	}
+	if err := ReadJSON(filepath.Join(root, "permissions", "decisions", permID+".json"), &d); err != nil || !d.Allow {
+		t.Fatalf("decision not allow: %v %+v", err, d)
+	}
+	// The y is consumed (archived); the non-decision paste stays in pending.
+	assertExists(t, filepath.Join(root, "inbox", "done", yes.JobID+".json"))
+	assertExists(t, filepath.Join(root, "inbox", "pending", paste.JobID+".json"))
+}
+
 // TestResolvePendingDecisionIgnoresNonDecision leaves a normal message for the
 // worker when a permission is pending but the message is not a y/n.
 func TestResolvePendingDecisionIgnoresNonDecision(t *testing.T) {

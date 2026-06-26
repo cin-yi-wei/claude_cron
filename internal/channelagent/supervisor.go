@@ -2,6 +2,7 @@ package channelagent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -19,7 +20,63 @@ var (
 
 	confirmPostedMu   sync.Mutex
 	confirmPostedHash = map[string]string{} // binding → hash of last confirm posted
+
+	turnTimeoutAt     = map[string]time.Time{} // binding → last turn-timeout time
+	systemicAlertedAt time.Time
 )
+
+const (
+	systemicTimeoutWindow = 2 * time.Minute  // distinct timeouts within this window → systemic
+	systemicMinBindings   = 3                // this many distinct bindings → upstream outage
+	systemicAlertCooldown = 15 * time.Minute // don't re-alert more often than this
+)
+
+// noteTurnTimeout records a per-binding turn timeout and, when several DISTINCT
+// bindings time out within a short window, posts ONE alert to the control
+// channel that this looks like an upstream Anthropic API outage/overload
+// (503/529) rather than a local fault — so the user doesn't restart each binding
+// in vain. Only reacts to deadline/timeout errors; debounced by cooldown.
+func noteTurnTimeout(ctx context.Context, cfg Config, token, binding string, err error) {
+	if !isTurnTimeout(err) {
+		return
+	}
+	ch := cfg.Discord.ChannelID
+	if ch == "" || token == "" {
+		return
+	}
+	unboundAnnounceMu.Lock()
+	now := time.Now()
+	turnTimeoutAt[binding] = now
+	distinct := 0
+	for _, t := range turnTimeoutAt {
+		if now.Sub(t) <= systemicTimeoutWindow {
+			distinct++
+		}
+	}
+	fire := distinct >= systemicMinBindings && now.Sub(systemicAlertedAt) >= systemicAlertCooldown
+	if fire {
+		systemicAlertedAt = now
+	}
+	unboundAnnounceMu.Unlock()
+	if !fire {
+		return
+	}
+	text := fmt.Sprintf("⚠️ %d 個 session 同時回合逾時，疑似 Anthropic API / 上游中斷或過載(503/529)，通常不是本機故障、也不是某個 binding 壞掉。重啟救不了上游——稍候它恢復就會自動跟上，先別一個個戳。", distinct)
+	_ = DiscordSender{BaseURL: cfg.Discord.BaseURL, Token: token, ChannelID: ch}.Send(ctx, OutputJob{Schema: 1, Send: true, Text: text})
+}
+
+// isTurnTimeout reports whether err is a turn deadline/timeout (vs a lock/inject
+// error). Lock contention ("held by live pid") and similar must NOT count.
+func isTurnTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	s := err.Error()
+	return strings.Contains(s, "context deadline exceeded") || strings.Contains(s, "deadline exceeded")
+}
 
 // postConfirmOnce posts a native confirm dialog to the binding's own channel via
 // its outbox (same path the permission prompt uses), debounced so the same
@@ -474,6 +531,7 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 			res, err := RunServeOnce(ctx, rw.b.Root, rw.ingester, rw.injector, rw.sender, timeout)
 			if err != nil {
 				fmt.Fprintf(stdout, "binding %s error: %v\n", rw.b.Name, err)
+				noteTurnTimeout(ctx, cfg, token, rw.b.Name, err)
 				return
 			}
 			fmt.Fprintf(stdout, "binding=%s created=%d processed=%t sent=%d\n", rw.b.Name, res.Created, res.Processed, res.Sent)
@@ -539,6 +597,7 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 		go func(rc readyControl) {
 			if err := runControlAssistant(ctx, rc.b, rc.inj, rc.snd, timeout); err != nil {
 				fmt.Fprintf(stdout, "control-binding[%s] assistant error: %v\n", rc.b.Name, err)
+				noteTurnTimeout(ctx, cfg, token, "control-"+rc.b.Name, err)
 			}
 		}(rc)
 	}

@@ -141,27 +141,35 @@ func ResolvePendingDecisionOnce(root string) (bool, error) {
 	if id == "" {
 		return false, nil // nothing waiting → let the normal worker handle the inbox
 	}
-	pendingPath, err := oldestJSON(pathIn(root, "inbox", "pending"))
-	if err != nil || pendingPath == "" {
+	// Scan the WHOLE pending inbox (oldest→newest) for the first y/n reply, not
+	// just the oldest message. While a permission is pending the session is blocked
+	// and the worker can't drain the inbox, so the user's "y" can sit BEHIND other
+	// messages they typed (e.g. a pasted command). Only matching the oldest would
+	// leave the decision unreachable forever — the deadlock would persist. Consume
+	// only the matched message; leave the rest in order for normal injection.
+	paths, err := sortedJSON(pathIn(root, "inbox", "pending"))
+	if err != nil {
 		return false, err
 	}
-	var job InputJob
-	if err := ReadJSON(pendingPath, &job); err != nil {
-		return false, nil // malformed → leave it for the worker to fail properly
+	for _, pendingPath := range paths {
+		var job InputJob
+		if err := ReadJSON(pendingPath, &job); err != nil {
+			continue // malformed → skip; the worker will fail it properly later
+		}
+		allow, remember, ok := parseDecision(job.Source.Content)
+		if !ok {
+			continue // not a y/n → leave it for normal injection once the turn ends
+		}
+		// Write the decision first (idempotent), then clear the pending request so
+		// the gate hook unblocks, then archive the reply so it isn't re-injected.
+		if err := resolvePermission(root, id, allow, remember); err != nil {
+			return false, err
+		}
+		_ = os.Remove(pathIn(root, "permissions", "pending", id+".json"))
+		_ = moveFile(pendingPath, pathIn(root, "inbox", "done", filepath.Base(pendingPath)))
+		return true, nil
 	}
-	allow, remember, ok := parseDecision(job.Source.Content)
-	if !ok {
-		return false, nil // not a y/n → leave for normal injection once the turn ends
-	}
-	// Write the decision first (idempotent), then clear the pending request so the
-	// gate hook unblocks, then archive the reply so it isn't re-injected later.
-	if err := resolvePermission(root, id, allow, remember); err != nil {
-		return false, err
-	}
-	_ = os.Remove(pathIn(root, "permissions", "pending", id+".json"))
-	name := filepath.Base(pendingPath)
-	_ = moveFile(pendingPath, pathIn(root, "inbox", "done", name))
-	return true, nil
+	return false, nil // no y/n anywhere in the queue yet
 }
 
 // maxJobAttempts bounds inject retries before a job is moved to failed.
@@ -252,9 +260,19 @@ func requeueProcessing(root string) error {
 }
 
 func oldestJSON(dir string) (string, error) {
+	all, err := sortedJSON(dir)
+	if err != nil || len(all) == 0 {
+		return "", err
+	}
+	return all[0], nil
+}
+
+// sortedJSON returns all *.json file paths in dir sorted by name (the timestamp
+// prefix makes that chronological), oldest first.
+func sortedJSON(dir string) ([]string, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	var names []string
 	for _, entry := range entries {
@@ -264,10 +282,11 @@ func oldestJSON(dir string) (string, error) {
 		names = append(names, entry.Name())
 	}
 	sort.Strings(names)
-	if len(names) == 0 {
-		return "", nil
+	out := make([]string, len(names))
+	for i, n := range names {
+		out[i] = filepath.Join(dir, n)
 	}
-	return filepath.Join(dir, names[0]), nil
+	return out, nil
 }
 
 func moveFile(from, to string) error {
