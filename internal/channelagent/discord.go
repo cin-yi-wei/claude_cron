@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,34 +17,6 @@ import (
 // httpClient15s is a shared bounded client for outbound channel sends, so a hung
 // connection can't stall the (sequential) activity ticker for every binding.
 var httpClient15s = &http.Client{Timeout: 15 * time.Second}
-
-var discordDiffFenceRE = regexp.MustCompile("(?s)```diff\\n(.*?)```")
-
-// discordColorDiff rewrites ```diff blocks to ```ansi blocks with real ANSI
-// colour codes — Discord renders ```ansi reliably (− red, + green), unlike its
-// dim/inconsistent ```diff highlighting. Other platforms keep ```diff.
-func discordColorDiff(text string) string {
-	if !strings.Contains(text, "```diff") {
-		return text
-	}
-	return discordDiffFenceRE.ReplaceAllStringFunc(text, func(m string) string {
-		inner := strings.TrimSuffix(strings.TrimPrefix(m, "```diff\n"), "```")
-		var b strings.Builder
-		b.WriteString("```ansi\n")
-		for _, ln := range strings.Split(strings.TrimRight(inner, "\n"), "\n") {
-			switch {
-			case strings.HasPrefix(ln, "- "):
-				b.WriteString("\x1b[31m" + ln + "\x1b[0m\n")
-			case strings.HasPrefix(ln, "+ "):
-				b.WriteString("\x1b[32m" + ln + "\x1b[0m\n")
-			default:
-				b.WriteString(ln + "\n")
-			}
-		}
-		b.WriteString("```")
-		return b.String()
-	})
-}
 
 const defaultDiscordBaseURL = "https://discord.com/api/v10"
 
@@ -154,10 +125,12 @@ func (s DiscordSender) Send(ctx context.Context, output OutputJob) error {
 	if client == nil {
 		client = httpClient15s // bounded: a hung send must not stall the activity ticker
 	}
-	// discordColorDiff rewrites ```diff→```ansi, injecting colour codes that can
-	// push the content past Discord's 2000-char hard limit. Chunk the FINAL text
-	// so every POST is under the limit (the upstream splitter is colour-blind).
-	for _, content := range chunkDiscord(discordColorDiff(output.Text), 2000) {
+	// Send the text as-is (plain ```diff fences). We used to rewrite ```diff→```ansi
+	// for red/green colour, but the \x1b escape codes leaked as literal "[32m"/"[0m"
+	// text whenever a long diff was chunked (the ansi fence split mid-block) — see
+	// the broken cards 2026-06-27. Discord's native ```diff highlight has no escape
+	// codes to leak, so it survives chunking cleanly. Chunk so every POST is ≤2000.
+	for _, content := range chunkDiscord(output.Text, 2000) {
 		body, err := json.Marshal(map[string]string{"content": content})
 		if err != nil {
 			return err

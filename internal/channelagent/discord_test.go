@@ -118,6 +118,32 @@ func TestDiscordSenderPostsMessage(t *testing.T) {
 	}
 }
 
+func TestDiscordSenderSendsPlainDiffNoAnsi(t *testing.T) {
+	var gotContent string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]string
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		gotContent = body["content"]
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"sent"}`))
+	}))
+	defer server.Close()
+
+	in := "⏳ 🔧 Edit a.go\n```diff\n- old\n+ new\n```"
+	err := DiscordSender{BaseURL: server.URL + "/api/v10", Token: "tok", ChannelID: "c1"}.Send(context.Background(), OutputJob{Send: true, Text: in})
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	// Plain ```diff must pass through untouched — no ansi rewrite, no escape codes
+	// (those leaked as literal "[32m" when chunked; 2026-06-27 regression).
+	if strings.Contains(gotContent, "\x1b") || strings.Contains(gotContent, "```ansi") {
+		t.Fatalf("diff must stay plain, got ansi/escape codes: %q", gotContent)
+	}
+	if !strings.Contains(gotContent, "```diff") {
+		t.Fatalf("diff fence missing: %q", gotContent)
+	}
+}
+
 func TestDiscordSenderRetriesOn429(t *testing.T) {
 	var calls int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
