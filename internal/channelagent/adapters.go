@@ -53,11 +53,8 @@ func (i TmuxInjector) Inject(ctx context.Context, job InputJob, outputPath strin
 	// mid-turn interrupts the running turn and injecting over a confirm dialog
 	// dismisses it; either way the prompt is also likely to fail to submit. Defer
 	// instead — the caller requeues without burning a retry attempt.
-	if pane, err := runExternalCommandOutput(ctx, "tmux", "capture-pane", "-pt", i.Session); err == nil {
-		switch classifyScreen(pane) {
-		case ScreenWorking, ScreenConfirm:
-			return errSessionBusy
-		}
+	if i.paneBusy(ctx) {
+		return errSessionBusy
 	}
 	// Download any image attachments to local files so Claude can actually read
 	// them (vision); the prompt then points at the local paths. Best-effort.
@@ -76,7 +73,19 @@ func (i TmuxInjector) Inject(ctx context.Context, job InputJob, outputPath strin
 	// is empty; if not, re-run the full recipe. Retry a few times.
 	var lastErr error
 	for attempt := 0; attempt < injectMaxAttempts; attempt++ {
+		// defer-don't-burn: if the turn went busy between attempts (a prior
+		// attempt's C-c/paste kicked off work, or a dialog popped), requeue
+		// instead of spending a retry on a submit that can't land.
+		if i.paneBusy(ctx) {
+			return errSessionBusy
+		}
 		if err := i.typeAndSubmit(ctx, prompt); err != nil {
+			// typeAndSubmit defers (no Enter sent) when the pane turned busy
+			// during the paste-settle window — propagate as a defer, don't burn
+			// the remaining attempts on it.
+			if errors.Is(err, errSessionBusy) {
+				return err
+			}
 			lastErr = err
 			continue
 		}
@@ -113,7 +122,32 @@ func (i TmuxInjector) typeAndSubmit(ctx context.Context, prompt string) error {
 		return err
 	}
 	time.Sleep(injectSubmitDelay)
+	// Re-check right before Enter. The pane can turn busy (a turn started, or a
+	// confirm dialog popped) DURING the paste-settle delay — a TOCTOU window the
+	// pre-loop busy check can't cover. Sending Enter then either fails to submit
+	// or confirms the dialog. Defer instead; the leading C-c on the next attempt
+	// clears the text we just pasted.
+	if i.paneBusy(ctx) {
+		return errSessionBusy
+	}
 	return runExternalCommand(ctx, "tmux", "send-keys", "-t", i.Session, "Enter")
+}
+
+// paneBusy reports whether the pane is mid-turn (Working) or showing a confirm
+// dialog — states where injecting or submitting would interrupt the turn,
+// dismiss the dialog, or simply fail to land. Capture failure returns false (we
+// can't tell, so don't block). Used both before injecting and right before the
+// Enter, so a state change at any point defers rather than burns a retry.
+func (i TmuxInjector) paneBusy(ctx context.Context) bool {
+	pane, err := runExternalCommandOutput(ctx, "tmux", "capture-pane", "-pt", i.Session)
+	if err != nil {
+		return false
+	}
+	switch classifyScreen(pane) {
+	case ScreenWorking, ScreenConfirm:
+		return true
+	}
+	return false
 }
 
 // inputBoxHasText reports whether the Claude TUI's input box (the bottom-most
