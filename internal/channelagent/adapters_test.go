@@ -14,6 +14,11 @@ func TestTmuxInjectorAutoStartsMissingSession(t *testing.T) {
 	oldDelay := injectSubmitDelay
 	injectSubmitDelay = 0
 	defer func() { injectSubmitDelay = oldDelay }()
+	// Skip the cold-start readiness probe so this test asserts only the inject
+	// recipe (has-session, new-session, C-c, paste, Enter).
+	oldBoot := sessionBootDelay
+	sessionBootDelay = 0
+	defer func() { sessionBootDelay = oldBoot }()
 
 	var calls [][]string
 	runExternalCommand = func(_ context.Context, name string, args ...string) error {

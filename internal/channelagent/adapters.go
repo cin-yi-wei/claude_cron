@@ -223,7 +223,19 @@ func (i TmuxInjector) ensureSession(ctx context.Context) error {
 	if !i.AutoStart {
 		return err
 	}
-	return runExternalCommand(ctx, "tmux", "new-session", "-d", "-s", i.Session, "claude")
+	if err := runExternalCommand(ctx, "tmux", "new-session", "-d", "-s", i.Session, "claude"); err != nil {
+		return err
+	}
+	// A freshly-created claude takes ~14s to render its prompt (longer on Opus +
+	// slow upstream). The caller injects immediately, and typeAndSubmit leads with
+	// C-c — sent into a still-booting claude that interrupts startup and the
+	// session exits (exit status 1), the message requeues, and the next cycle
+	// recreates + C-c's again: an infinite death-loop. paneBusy() can't catch this
+	// (a boot splash is neither Working nor Confirm). Block until the pane actually
+	// accepts keystrokes before returning, so the leading C-c lands at an idle
+	// prompt (harmless) instead of mid-boot.
+	waitSessionReady(ctx, i.Session)
+	return nil
 }
 
 func BuildClaudePrompt(root string, job InputJob, outputPath string, imagePaths, textPaths []string) string {
