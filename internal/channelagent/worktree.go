@@ -41,40 +41,47 @@ func archiveOversizedTranscript(home, projectDir, id string, size int64) bool {
 	return true
 }
 
-// sessionBootDelay bounds how long waitSessionReady probes a freshly-created
-// tmux Claude session for input readiness. A blind fixed delay was too short on
+// sessionBootDelay bounds how long waitSessionReady waits for a freshly-created
+// tmux Claude session to finish booting. A blind fixed delay was too short on
 // cold start: the first injected prompt raced the Claude TUI boot splash, the
 // keystrokes dropped, and the job stalled until its 120s timeout. waitSessionReady
-// returns as soon as the session echoes a sentinel (usually a few seconds), so
-// this is an upper bound, not a fixed cost. Set to 0 in tests to skip probing.
-var sessionBootDelay = 30 * time.Second
+// returns as soon as the input prompt renders (usually a few seconds), so this is
+// an upper bound, not a fixed cost. Generous because a slow upstream API pushes
+// cold boot to ~24s+ (vs ~14s normal); polling is cheap so over-budgeting is
+// safe. Set to 0 in tests to skip probing.
+var sessionBootDelay = 90 * time.Second
 
-// readyProbeSettle is the pause between typing the readiness sentinel and
-// capturing the pane to look for its echo.
+// readyProbeSettle is the pause between successive readiness pane captures.
 var readyProbeSettle = 500 * time.Millisecond
 
-// waitSessionReady blocks until a freshly-created tmux Claude session is actually
-// accepting keystrokes, by repeatedly typing a sentinel and checking it echoes in
-// the pane, then clearing it. This replaces a blind boot delay that dropped the
-// first inject on cold start. No-op when sessionBootDelay <= 0 (tests).
+// waitSessionReady blocks until a freshly-created tmux Claude session has finished
+// booting and is rendering its input prompt. It detects this PURELY by reading
+// the pane — it NEVER sends a keystroke. Sending any key (a sentinel probe, a
+// C-c) before the boot splash clears interrupts Claude's startup and the session
+// exits (status 1); on the create/probe path that recreates-and-dies every cycle
+// (a death-loop), and it fires even with an empty inbox because it precedes any
+// inject. The earlier sentinel-echo probe WAS that killer. No-op when
+// sessionBootDelay <= 0 (tests).
 func waitSessionReady(ctx context.Context, session string) {
 	if sessionBootDelay <= 0 {
 		return
 	}
-	const sentinel = "__cc_ready_probe__"
 	start := time.Now()
 	for time.Since(start) < sessionBootDelay {
 		time.Sleep(readyProbeSettle)
-		_ = runExternalCommand(ctx, "tmux", "send-keys", "-t", session, "-l", sentinel)
-		time.Sleep(readyProbeSettle)
 		pane, err := runExternalCommandOutput(ctx, "tmux", "capture-pane", "-pt", session)
-		if err == nil && strings.Contains(pane, sentinel) {
-			// Ready: clear the sentinel so it doesn't pollute the first prompt.
-			_ = runExternalCommand(ctx, "tmux", "send-keys", "-t", session, "C-c")
-			time.Sleep(readyProbeSettle)
+		if err == nil && sessionPaneReady(pane) {
 			return
 		}
 	}
+}
+
+// sessionPaneReady reports whether a Claude TUI pane snapshot shows the input
+// prompt has rendered (boot complete). Read-only — used by waitSessionReady to
+// gate injection without ever touching the keyboard.
+func sessionPaneReady(pane string) bool {
+	s := stripANSI(pane)
+	return lastPromptLineSeen(s) || strings.Contains(strings.ToLower(s), "? for shortcuts")
 }
 
 // agentSettings is the Claude Code permission config for a WORKER binding's
