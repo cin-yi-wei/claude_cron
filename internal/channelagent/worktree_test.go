@@ -170,7 +170,7 @@ func TestEnsureProjectRepoAndWipCommitRealGit(t *testing.T) {
 	}
 }
 
-func TestWaitSessionReadyProbesUntilEcho(t *testing.T) {
+func TestWaitSessionReadyWaitsForPromptWithoutSendingKeys(t *testing.T) {
 	oldRun, oldOut := runExternalCommand, runExternalCommandOutput
 	oldDelay, oldSettle := sessionBootDelay, readyProbeSettle
 	defer func() {
@@ -182,32 +182,36 @@ func TestWaitSessionReadyProbesUntilEcho(t *testing.T) {
 	sessionBootDelay = 5 * time.Second
 	readyProbeSettle = time.Millisecond
 
-	var sawClear bool
-	captures := 0
+	// A keystroke (sentinel probe or C-c) into a still-booting Claude kills it —
+	// the create-path death-loop. waitSessionReady must detect readiness by
+	// READING the pane only, never by sending keys.
+	var sentKeys bool
 	runExternalCommand = func(_ context.Context, name string, args ...string) error {
-		// Detect the sentinel-clearing C-c after readiness.
-		for _, a := range args {
-			if a == "C-c" {
-				sawClear = true
+		if name == "tmux" {
+			for _, a := range args {
+				if a == "send-keys" {
+					sentKeys = true
+				}
 			}
 		}
 		return nil
 	}
+	captures := 0
 	runExternalCommandOutput = func(_ context.Context, _ string, _ ...string) (string, error) {
 		captures++
-		// Not ready for the first two probes, then the sentinel echoes.
+		// Boot splash for the first two probes, then the input prompt renders.
 		if captures < 3 {
-			return "booting...", nil
+			return "Welcome to Claude Code\nbooting...", nil
 		}
-		return "some pane __cc_ready_probe__ here", nil
+		return "some output\n❯ \n  ? for shortcuts", nil
 	}
 
 	waitSessionReady(context.Background(), "cc-x")
 	if captures < 3 {
 		t.Fatalf("expected at least 3 capture probes, got %d", captures)
 	}
-	if !sawClear {
-		t.Fatal("expected a C-c to clear the sentinel once ready")
+	if sentKeys {
+		t.Fatal("waitSessionReady must NOT send any keys during boot")
 	}
 }
 
