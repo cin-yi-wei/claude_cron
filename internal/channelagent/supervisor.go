@@ -302,9 +302,68 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 		activePush["__dc_demux__"] = true
 	}
 
-	// Control planes (discord/telegram/web) are no longer hardcoded here: they are
-	// registry control bindings (seeded above from config on first boot) and run
-	// by the unified control-binding loop further down, exactly like web controls.
+	// Control planes (discord/telegram/web) are registry control bindings (seeded
+	// above from config on first boot). They are serviced FIRST — before the worker
+	// setup pass below — so a reboot's mass worker cold-boot (each StartTmuxClaude
+	// waits up to sessionBootDelay in the SEQUENTIAL setup pass) can no longer
+	// head-of-line-block the control channels behind every worker. Command
+	// processing (RunControlOnce) MUST stay sequential — it mutates + reloads the
+	// shared registry; only the slow assistant turn (runControlAssistant) is fanned
+	// out, so a long control turn can't stall the cycle.
+	type readyControl struct {
+		b   Binding
+		inj Injector
+		snd Sender
+	}
+	var readyControls []readyControl
+	for _, b := range reg.Bindings {
+		if !b.Control || b.Paused {
+			continue
+		}
+		var tokenEnv, tokenVal string
+		var src MessageSource
+		var snd Sender
+		switch b.PlatformOf() {
+		case PlatformWeb:
+			// Browser is the transport: sendChat appends to this buffer; replies
+			// stream back via the hub.
+			src = TelegramBufferSource{Path: pathIn(b.Root, "state", "inbound_buffer.json")}
+			snd = WebSender{Hub: DefaultChatHub, Key: b.Name}
+		case PlatformTelegram:
+			tokenEnv, tokenVal = cfg.Telegram.TokenEnv, tgToken
+			src = TelegramBufferSource{Path: pathIn(b.Root, "state", "tg_buffer.json")}
+			snd = TeeSender{Inner: TelegramSender{BaseURL: cfg.Telegram.BaseURL, Token: tgToken, ChatID: b.ChannelID}, Hub: DefaultChatHub, Key: b.Name}
+		case PlatformDiscord:
+			tokenEnv, tokenVal = cfg.Discord.TokenEnv, token
+			src = BufferPollSource{BufferPath: pathIn(b.Root, "state", "inbound_buffer.json"), Poll: DiscordSource{BaseURL: cfg.Discord.BaseURL, Token: token, ChannelID: b.ChannelID, Limit: 50}}
+			snd = TeeSender{Inner: DiscordSender{BaseURL: cfg.Discord.BaseURL, Token: token, ChannelID: b.ChannelID}, Hub: DefaultChatHub, Key: b.Name}
+		default:
+			continue
+		}
+		cplane := ControlPlane{Name: b.Name, Platform: b.PlatformOf(), ChannelID: b.ChannelID}
+		if err := RunControlOnce(ctx, root, b.Root, deps, &reg, src, snd, cplane); err != nil {
+			fmt.Fprintf(stdout, "control-binding[%s] error: %v\n", b.Name, err)
+		}
+		if reg, err = LoadRegistry(root); err != nil {
+			return err
+		}
+		if err := StartControlSession(ctx, b.TmuxSession, b.Worktree, root, tokenEnv, tokenVal, controlSystemPrompt(root, b.Worktree, b.Name)); err != nil {
+			fmt.Fprintf(stdout, "control-binding[%s] session error: %v\n", b.Name, err)
+			continue
+		}
+		inj := TmuxInjector{Session: b.TmuxSession, Root: b.Root, AutoStart: false}
+		readyControls = append(readyControls, readyControl{b: b, inj: inj, snd: snd})
+	}
+	// Detached, same rationale as workers: a long control-assistant turn must not
+	// block the cycle (per-root claude.lock keeps it safe / non-overlapping).
+	for _, rc := range readyControls {
+		go func(rc readyControl) {
+			if err := runControlAssistant(ctx, rc.b, rc.inj, rc.snd, timeout); err != nil {
+				fmt.Fprintf(stdout, "control-binding[%s] assistant error: %v\n", rc.b.Name, err)
+				noteTurnTimeout(ctx, cfg, token, "control-"+rc.b.Name, err)
+			}
+		}(rc)
+	}
 
 	// Worker bindings are processed in two phases: a SEQUENTIAL setup pass (which
 	// owns all shared-state mutation — sleep/wake registry writes, push.Ensure,
@@ -537,70 +596,8 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 			fmt.Fprintf(stdout, "binding=%s created=%d processed=%t sent=%d\n", rw.b.Name, res.Created, res.Processed, res.Sent)
 		}(rw)
 	}
-	// Registry-defined control bindings (unified control model). Each runs the
-	// control pipeline against its own root/session, fed by its platform's source
-	// and replying via the hub (web) or the platform sender teed to the hub
-	// (dc/tg). Additive: a no-op when there are none, so it cannot disturb the
-	// hardcoded dc/tg control planes above.
-	// Control bindings: command processing (RunControlOnce) MUST stay sequential —
-	// it mutates the shared registry (bind/unbind) and reloads it. Only the slow
-	// assistant turn (runControlAssistant, up to `timeout`) is fanned out, so a
-	// long control turn (e.g. this very session) no longer delays other control
-	// planes or the next cycle's workers.
-	type readyControl struct {
-		b   Binding
-		inj Injector
-		snd Sender
-	}
-	var readyControls []readyControl
-	for _, b := range reg.Bindings {
-		if !b.Control || b.Paused {
-			continue
-		}
-		var tokenEnv, tokenVal string
-		var src MessageSource
-		var snd Sender
-		switch b.PlatformOf() {
-		case PlatformWeb:
-			// Browser is the transport: sendChat appends to this buffer; replies
-			// stream back via the hub.
-			src = TelegramBufferSource{Path: pathIn(b.Root, "state", "inbound_buffer.json")}
-			snd = WebSender{Hub: DefaultChatHub, Key: b.Name}
-		case PlatformTelegram:
-			tokenEnv, tokenVal = cfg.Telegram.TokenEnv, tgToken
-			src = TelegramBufferSource{Path: pathIn(b.Root, "state", "tg_buffer.json")}
-			snd = TeeSender{Inner: TelegramSender{BaseURL: cfg.Telegram.BaseURL, Token: tgToken, ChatID: b.ChannelID}, Hub: DefaultChatHub, Key: b.Name}
-		case PlatformDiscord:
-			tokenEnv, tokenVal = cfg.Discord.TokenEnv, token
-			src = BufferPollSource{BufferPath: pathIn(b.Root, "state", "inbound_buffer.json"), Poll: DiscordSource{BaseURL: cfg.Discord.BaseURL, Token: token, ChannelID: b.ChannelID, Limit: 50}}
-			snd = TeeSender{Inner: DiscordSender{BaseURL: cfg.Discord.BaseURL, Token: token, ChannelID: b.ChannelID}, Hub: DefaultChatHub, Key: b.Name}
-		default:
-			continue
-		}
-		cplane := ControlPlane{Name: b.Name, Platform: b.PlatformOf(), ChannelID: b.ChannelID}
-		if err := RunControlOnce(ctx, root, b.Root, deps, &reg, src, snd, cplane); err != nil {
-			fmt.Fprintf(stdout, "control-binding[%s] error: %v\n", b.Name, err)
-		}
-		if reg, err = LoadRegistry(root); err != nil {
-			return err
-		}
-		if err := StartControlSession(ctx, b.TmuxSession, b.Worktree, root, tokenEnv, tokenVal, controlSystemPrompt(root, b.Worktree, b.Name)); err != nil {
-			fmt.Fprintf(stdout, "control-binding[%s] session error: %v\n", b.Name, err)
-			continue
-		}
-		inj := TmuxInjector{Session: b.TmuxSession, Root: b.Root, AutoStart: false}
-		readyControls = append(readyControls, readyControl{b: b, inj: inj, snd: snd})
-	}
-	// Detached, same rationale as workers: a long control-assistant turn must not
-	// block the cycle (per-root claude.lock keeps it safe / non-overlapping).
-	for _, rc := range readyControls {
-		go func(rc readyControl) {
-			if err := runControlAssistant(ctx, rc.b, rc.inj, rc.snd, timeout); err != nil {
-				fmt.Fprintf(stdout, "control-binding[%s] assistant error: %v\n", rc.b.Name, err)
-				noteTurnTimeout(ctx, cfg, token, "control-"+rc.b.Name, err)
-			}
-		}(rc)
-	}
+	// (Control bindings are serviced ABOVE — before the worker setup pass — so a
+	// reboot's mass worker cold-boot can no longer starve the control channels.)
 
 	// Stop push ingesters whose binding was removed or flipped to poll.
 	if push != nil {
