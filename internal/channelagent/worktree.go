@@ -21,6 +21,11 @@ var sessionBootDelay = 90 * time.Second
 // readyProbeSettle is the pause between successive readiness pane captures.
 var readyProbeSettle = 500 * time.Millisecond
 
+// readyStableWindow is how long the pane must stay UNCHANGED (after the prompt
+// renders) before a freshly --resume'd session is declared ready — guards against
+// injecting while a large transcript is still replaying into the pane.
+var readyStableWindow = 2 * time.Second
+
 // waitSessionReady blocks until a freshly-created tmux Claude session has finished
 // booting and is rendering its input prompt. It detects this PURELY by reading
 // the pane — it NEVER sends a keystroke. Sending any key (a sentinel probe, a
@@ -34,10 +39,26 @@ func waitSessionReady(ctx context.Context, session string) {
 		return
 	}
 	start := time.Now()
+	var last string
+	var stableSince time.Time
 	for time.Since(start) < sessionBootDelay {
 		time.Sleep(readyProbeSettle)
 		pane, err := runExternalCommandOutput(ctx, "tmux", "capture-pane", "-pt", session)
-		if err == nil && sessionPaneReady(pane) {
+		if err != nil || !sessionPaneReady(pane) {
+			last, stableSince = "", time.Time{}
+			continue
+		}
+		// Prompt has rendered — but a large `--resume` may still be REPLAYING the
+		// transcript into the pane (the prompt shows while history streams in). If
+		// we return here, the next-cycle inject types into a session still digesting
+		// its resume and the turn glitches. So also require the pane to be STABLE
+		// (unchanged for readyStableWindow) before declaring ready — a replaying
+		// pane keeps changing, so it waits until the resume settles.
+		if pane != last {
+			last, stableSince = pane, time.Now()
+			continue
+		}
+		if !stableSince.IsZero() && time.Since(stableSince) >= readyStableWindow {
 			return
 		}
 	}

@@ -22,6 +22,19 @@ type glitchInspector interface {
 	LooksGlitched(ctx context.Context) bool
 }
 
+// workingInspector is an optional Injector capability: report whether the pane is
+// actively occupied (generating/spinner, or showing a confirm/login prompt) — as
+// opposed to a plain idle prompt. Used by the hung-turn watchdog so a long but
+// working turn is never cut short, while a hung/no-output turn releases the lock
+// after the stall window instead of holding it the full claude timeout.
+type workingInspector interface {
+	SessionWorking(ctx context.Context) bool
+}
+
+// stallWindow is how long the pane may sit not-working with no reply before the
+// turn is treated as hung. Kept well above normal between-tool gaps.
+const stallWindow = 90 * time.Second
+
 func RunWorkerOnce(ctx context.Context, root string, injector Injector, timeout time.Duration) (bool, error) {
 	if err := Init(root); err != nil {
 		return false, err
@@ -93,8 +106,25 @@ func RunWorkerOnce(ctx context.Context, root string, injector Injector, timeout 
 		return true, err
 	}
 
-	output, err := waitOutput(ctx, outputPath, timeout)
+	// Hung-turn watchdog: if the injector can report working-state, let waitOutput
+	// bail after stallWindow when the pane goes idle with no reply (turn hung /
+	// produced nothing) — releasing claude.lock in ~90s instead of the full
+	// timeout. A pending permission keeps the turn "occupied" so a confirm dialog
+	// awaiting the user is never mistaken for a stall.
+	var working func() bool
+	if wi, ok := injector.(workingInspector); ok {
+		working = func() bool {
+			return wi.SessionWorking(ctx) || oldestPendingPermission(root) != ""
+		}
+	}
+	output, err := waitOutput(ctx, outputPath, timeout, working, stallWindow)
 	if err != nil {
+		// A hung turn (no output + pane went idle): requeue for a clean retry and
+		// release the lock now, rather than holding it the whole timeout.
+		if errors.Is(err, errStalled) {
+			requeueOrFail(root, processingPath, name, job)
+			return true, err
+		}
 		// No reply within the window. If the session emitted a broken turn — e.g.
 		// it printed the literal tool-call markup as text instead of executing it,
 		// a known transient model glitch — re-queue for a fresh retry rather than
@@ -200,7 +230,16 @@ func ValidateOutput(job InputJob, output OutputJob) error {
 	return nil
 }
 
-func waitOutput(ctx context.Context, path string, timeout time.Duration) (OutputJob, error) {
+// errStalled means the turn produced no reply AND the pane stopped making
+// progress (idle, not the spinner) for longer than the stall window — i.e. a
+// hung/no-output turn, not a long-but-working one. The caller requeues it and
+// returns, so the binding lock is released in ~stallWindow instead of being held
+// the full `timeout` (which silences the channel; see INJECT_LOCK_FIX_SPEC.md).
+var errStalled = errors.New("turn stalled: no output and pane idle")
+
+// progressFn reports whether the session is actively working (spinner). nil
+// disables stall detection (full-timeout behavior preserved).
+func waitOutput(ctx context.Context, path string, timeout time.Duration, working func() bool, stallWindow time.Duration) (OutputJob, error) {
 	if timeout <= 0 {
 		timeout = time.Minute
 	}
@@ -209,6 +248,17 @@ func waitOutput(ctx context.Context, path string, timeout time.Duration) (Output
 
 	ticker := time.NewTicker(25 * time.Millisecond)
 	defer ticker.Stop()
+
+	// Stall check runs on a slow sub-ticker (pane capture is not free). lastProg
+	// is the last time the pane was observed working; if it stays not-working for
+	// stallWindow with no reply, the turn is hung → errStalled.
+	lastProg := time.Now()
+	var stallC <-chan time.Time
+	if working != nil && stallWindow > 0 {
+		st := time.NewTicker(2 * time.Second)
+		defer st.Stop()
+		stallC = st.C
+	}
 
 	for {
 		var output OutputJob
@@ -222,6 +272,12 @@ func waitOutput(ctx context.Context, path string, timeout time.Duration) (Output
 		select {
 		case <-ctx.Done():
 			return output, ctx.Err()
+		case <-stallC:
+			if working() {
+				lastProg = time.Now()
+			} else if time.Since(lastProg) > stallWindow {
+				return output, errStalled
+			}
 		case <-ticker.C:
 		}
 	}

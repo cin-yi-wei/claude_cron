@@ -80,6 +80,27 @@ func (i TmuxInjector) LooksGlitched(ctx context.Context) bool {
 	return classifyScreen(pane) == ScreenGlitch
 }
 
+// SessionWorking reports whether the pane is occupied — generating/running a
+// tool (spinner), or showing a confirm/login prompt — i.e. NOT a plain idle
+// prompt. The hung-turn watchdog (waitOutput) treats "not working" + no reply as
+// a stall. Capture failure returns true (can't tell → don't declare a stall).
+func (i TmuxInjector) SessionWorking(ctx context.Context) bool {
+	pane, err := runExternalCommandOutput(ctx, "tmux", "capture-pane", "-pt", i.Session)
+	if err != nil {
+		// Cannot read the pane (session dead / tmux unreachable) = not making
+		// progress → let the watchdog release the lock and requeue. A transient
+		// blip self-heals: the stall needs stallWindow of *consecutive*
+		// not-working observations, which one momentary error never accumulates.
+		return false
+	}
+	switch classifyScreen(pane) {
+	case ScreenWorking, ScreenConfirm, ScreenLogin:
+		return true
+	default:
+		return false
+	}
+}
+
 // typeAndSubmit runs the one recipe observed to reliably submit in the Claude
 // TUI: Ctrl-C to clear the box, the prompt as a literal paste, a pause for the
 // long paste to settle, then a SEPARATE Enter.
