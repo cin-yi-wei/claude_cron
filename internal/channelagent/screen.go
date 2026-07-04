@@ -109,8 +109,45 @@ var loginURLRE = regexp.MustCompile(`https://(?:claude\.(?:com|ai)|console\.anth
 // extractLoginURL returns the OAuth login URL from a pane snapshot, or "" if the
 // pane isn't showing one. Used by the re-login flow to relay the URL to the
 // channel so a human can complete auth and paste the code back.
+//
+// The OAuth URL (~277 chars) is far longer than the pane width, and Claude's Ink
+// TUI renders it by absolute cursor positioning — each visual row is a SEPARATE
+// pane line, NOT a soft-wrap. So `capture-pane -J` (which only rejoins
+// soft-wrapped lines) can't stitch it, and a plain regex over the snapshot grabs
+// only the first row → a truncated URL (verified in prod: cut at one 80-col row).
+// Reconstruct instead: find the row that starts the URL, then greedily append the
+// following rows that are pure URL continuation (non-empty, no interior
+// whitespace) until a blank line or a line with spaces (e.g. "Paste code here").
 func extractLoginURL(pane string) string {
-	return loginURLRE.FindString(stripANSI(pane))
+	s := stripANSI(pane)
+	lines := strings.Split(s, "\n")
+	for i, ln := range lines {
+		idx := strings.Index(ln, "https://")
+		if idx < 0 {
+			continue
+		}
+		// Start of the URL on this row. If more (space-separated) text follows on
+		// the same row, the URL ends at that space.
+		first := strings.TrimRight(ln[idx:], " \t\r")
+		if sp := strings.IndexAny(first, " \t"); sp >= 0 {
+			first = first[:sp]
+		}
+		var b strings.Builder
+		b.WriteString(first)
+		// Append hard-wrapped continuation rows.
+		for j := i + 1; j < len(lines); j++ {
+			ct := strings.TrimSpace(lines[j])
+			if ct == "" || strings.ContainsAny(ct, " \t") {
+				break // blank or contains spaces → past the end of the URL
+			}
+			b.WriteString(ct)
+		}
+		if m := loginURLRE.FindString(b.String()); m != "" {
+			return m
+		}
+	}
+	// Fallback: single-line match anywhere in the snapshot.
+	return loginURLRE.FindString(s)
 }
 
 // paneAwaitingLoginMethod reports whether the pane is at Claude's "Select login

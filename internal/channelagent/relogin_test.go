@@ -140,3 +140,27 @@ func TestLoginMethodMenuClassifiesAsLogin(t *testing.T) {
 		t.Fatal("TmuxInjector must implement loginMethodSelector")
 	}
 }
+
+func TestExtractLoginURL_HardWrappedRows(t *testing.T) {
+	full := "https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&scope=org%3Acreate_api_key+user%3Aprofile&code_challenge_method=S256&state=rVBxK9ANCB64"
+	// simulate Ink absolute-positioned rows: URL split across pane rows (each a
+	// separate line, NOT a soft-wrap), preceded by hint, followed by blank + prompt.
+	r1 := full[:79]
+	r2 := full[79:158]
+	r3 := full[158:]
+	cases := map[string]string{
+		"3-row hard wrap, no indent": "Browser didn't open? Use the url below to sign in (c to copy)\n\n" + r1 + "\n" + r2 + "\n" + r3 + "\n\nPaste code here if prompted >",
+		"2-row with leading indent":  "sign in below\n\n   " + full[:79] + "\n   " + full[79:] + "\n\nPaste code here if prompted >",
+		"single wide line":           "Use the url below\n\n" + full + "\n\nPaste code here if prompted >",
+	}
+	for name, pane := range cases {
+		if got := extractLoginURL(pane); got != full {
+			t.Errorf("%s:\n got len %d: %q\nwant len %d: %q", name, len(got), got, len(full), full)
+		}
+	}
+	// must NOT wrongly glue an unrelated no-space token below a complete URL that
+	// is followed by a blank line
+	if got := extractLoginURL("x\n\n" + full + "\n\nSOMETHINGELSE"); got != full {
+		t.Errorf("blank-line stop failed: got %q", got)
+	}
+}
