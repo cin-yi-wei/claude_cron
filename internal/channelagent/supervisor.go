@@ -85,15 +85,22 @@ func capturePaneJoined(ctx context.Context, session string) string {
 func handleLoginScreen(ctx context.Context, b Binding, cfg Config, token string, pane string, stdout io.Writer) bool {
 	valid, ok := claudeCredsValid()
 	if claudeOAuthTokenConfigured() || (ok && valid) {
-		// Token/creds fresh → a restart re-reads valid auth. Rate-limited so a
-		// login screen a restart can't clear doesn't loop-kill the session.
+		// Creds LOOK fresh (env token set, or the creds file exists and isn't
+		// timestamp-expired) → a restart may re-read valid auth. Try that ONCE
+		// (rate-limited). BUT the creds file can be present-yet-rejected
+		// server-side (the account was logged out): the file looks fresh, so the
+		// old code restarted forever and never relayed a re-login URL — the
+		// session was stuck in a "Not logged in" restart loop. So: if we've
+		// ALREADY spent our restart this cooldown and the pane is STILL a login
+		// screen, the restart demonstrably didn't help → treat the token as
+		// actually invalid and FALL THROUGH to the paste-code relay path below.
 		if loginRestartAllowed(b.Name) {
 			_ = StopTmuxSession(ctx, b.TmuxSession)
-			fmt.Fprintf(stdout, "binding %s login screen — restarting to re-read auth (token/creds fresh)\n", b.Name)
+			fmt.Fprintf(stdout, "binding %s login screen — restarting to re-read auth (creds look fresh)\n", b.Name)
 			return true
 		}
-		fmt.Fprintf(stdout, "binding %s login screen but within restart cooldown — leaving session\n", b.Name)
-		return true
+		fmt.Fprintf(stdout, "binding %s still login after fresh-creds restart — token effectively invalid, relaying re-login\n", b.Name)
+		// fall through: pick method menu / extract URL / auto-/login / notify.
 	}
 	// Creds truly expired — a restart can't fix it. Paste-code re-login.
 	// Step 0: if /login popped the "Select login method" menu, pick 1 (Claude
