@@ -62,6 +62,51 @@ func capturePane(ctx context.Context, session string) string {
 	return out
 }
 
+// handleLoginScreen runs the full auth watchdog for a binding whose pane is
+// classified ScreenLogin. Returns true if it acted (the caller should `continue`
+// / skip normal processing this cycle). Shared by BOTH the worker loop and the
+// control-binding loop so control planes (dc/tg/web) get the same auto re-login
+// as workers — previously the login watchdog lived only in the worker loop,
+// which skips control bindings, so control planes had NO login handling at all.
+func handleLoginScreen(ctx context.Context, b Binding, cfg Config, token string, pane string, stdout io.Writer) bool {
+	valid, ok := claudeCredsValid()
+	if claudeOAuthTokenConfigured() || (ok && valid) {
+		// Token/creds fresh → a restart re-reads valid auth. Rate-limited so a
+		// login screen a restart can't clear doesn't loop-kill the session.
+		if loginRestartAllowed(b.Name) {
+			_ = StopTmuxSession(ctx, b.TmuxSession)
+			fmt.Fprintf(stdout, "binding %s login screen — restarting to re-read auth (token/creds fresh)\n", b.Name)
+			return true
+		}
+		fmt.Fprintf(stdout, "binding %s login screen but within restart cooldown — leaving session\n", b.Name)
+		return true
+	}
+	// Creds truly expired — a restart can't fix it. Paste-code re-login:
+	if url := extractLoginURL(pane); url != "" {
+		if reloginRequestStale(b.Root) {
+			clearReloginRequest(b.Root, b.Name)
+		}
+		if recordReloginRequest(b.Root, b.Name, url) {
+			fmt.Fprintf(stdout, "binding %s login expired — relayed paste-code re-login URL to channel\n", b.Name)
+			if s, serr := SelectSender(b, cfg, bindingTokens{discord: token, telegram: os.Getenv(cfg.Telegram.TokenEnv)}); serr == nil {
+				_, _ = RunSenderOnce(ctx, b.Root, s)
+			}
+		}
+		return true
+	}
+	// No URL yet: a bare "Please run /login" screen shows no URL until /login is
+	// run. Auto-type /login (rate-limited) so next cycle the URL appears + relays.
+	li := TmuxInjector{Session: b.TmuxSession, Root: b.Root, AutoStart: true}
+	if lt, ok := interface{}(li).(loginTyper); ok && autoLoginAllowed(b.Name) {
+		if err := lt.SendLogin(ctx); err == nil {
+			fmt.Fprintf(stdout, "binding %s login expired, no URL yet — auto-typed /login to summon OAuth URL\n", b.Name)
+			return true
+		}
+	}
+	notifyLoginNeeded(ctx, cfg, token, b.Name)
+	return true
+}
+
 const loginNotifyCooldown = 20 * time.Minute
 
 // notifyLoginNeeded posts to the Discord control channel that a session's OAuth
@@ -346,55 +391,7 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 			}
 		}
 		if screen == ScreenLogin {
-			valid, ok := claudeCredsValid()
-			// A configured long-lived OAuth token is injected into every session at
-			// (re)start, so a restart re-reads valid auth without any human /login.
-			// Same when the shared creds file is itself fresh. Only nag for /login
-			// when there is NO token AND the creds are also expired — the one case a
-			// restart genuinely can't fix.
-			if claudeOAuthTokenConfigured() || (ok && valid) {
-				// Restart so the session re-reads fresh auth — but rate-limited, so a
-				// login screen that a restart does NOT clear can't loop-kill it.
-				if loginRestartAllowed(b.Name) {
-					_ = StopTmuxSession(ctx, b.TmuxSession)
-					fmt.Fprintf(stdout, "binding %s login screen — restarting to re-read auth (token/creds fresh)\n", b.Name)
-					continue
-				}
-				fmt.Fprintf(stdout, "binding %s login screen but within restart cooldown — leaving session\n", b.Name)
-			} else {
-				// Creds truly expired — a restart can't fix it. Prefer the paste-code
-				// re-login: if the pane is showing the OAuth login URL (headless
-				// fallback), relay it to the binding's channel and let the user paste
-				// the code back (ResolvePendingReloginOnce types it in). Fall back to
-				// the old "please /login" nag only when no URL can be extracted.
-				if url := extractLoginURL(pane); url != "" {
-					if reloginRequestStale(b.Root) {
-						clearReloginRequest(b.Root, b.Name)
-					}
-					if recordReloginRequest(b.Root, b.Name, url) {
-						fmt.Fprintf(stdout, "binding %s login expired — relayed paste-code re-login URL to channel\n", b.Name)
-						// Flush the sender now so the URL prompt actually leaves the outbox
-						// this cycle (same reasoning as the confirm-dialog branch above).
-						if s, serr := SelectSender(b, cfg, bindingTokens{discord: token, telegram: os.Getenv(cfg.Telegram.TokenEnv)}); serr == nil {
-							_, _ = RunSenderOnce(ctx, b.Root, s)
-						}
-					}
-					continue
-				}
-				// No URL on the pane yet: a bare "Please run /login" screen doesn't
-				// show the OAuth URL until /login is actually run. Auto-type /login so
-				// next cycle the URL appears and the branch above relays it — this is
-				// what makes it truly unattended (no human needs to type /login).
-				// Rate-limited per binding so a login that /login can't clear can't
-				// make us spam it. Only fall back to the human nag if we can't type.
-				li := TmuxInjector{Session: b.TmuxSession, Root: b.Root, AutoStart: true}
-				if lt, ok := interface{}(li).(loginTyper); ok && autoLoginAllowed(b.Name) {
-					if err := lt.SendLogin(ctx); err == nil {
-						fmt.Fprintf(stdout, "binding %s login expired, no URL yet — auto-typed /login to summon OAuth URL\n", b.Name)
-						continue // next cycle: URL should be on the pane → relayed above
-					}
-				}
-				notifyLoginNeeded(ctx, cfg, token, b.Name)
+			if handleLoginScreen(ctx, b, cfg, token, pane, stdout) {
 				continue
 			}
 		}
@@ -561,6 +558,15 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 		if err := StartControlSession(ctx, b.TmuxSession, b.Worktree, root, tokenEnv, tokenVal, controlSystemPrompt(root, b.Worktree, b.Name)); err != nil {
 			fmt.Fprintf(stdout, "control-binding[%s] session error: %v\n", b.Name, err)
 			continue
+		}
+		// Auth watchdog for CONTROL planes (dc/tg/web) — same shared handler the
+		// worker loop uses. Without this, control planes had zero login handling:
+		// on creds expiry they'd sit at a login screen forever. Now they auto-/login
+		// + relay the paste-code URL to their own channel like any binding.
+		if lpane := capturePane(ctx, b.TmuxSession); classifyScreen(lpane) == ScreenLogin {
+			if handleLoginScreen(ctx, b, cfg, token, lpane, stdout) {
+				continue
+			}
 		}
 		inj := TmuxInjector{Session: b.TmuxSession, Root: b.Root, AutoStart: false}
 		readyControls = append(readyControls, readyControl{b: b, inj: inj, snd: snd})
