@@ -123,3 +123,20 @@ func TestResolvePendingReloginOnce_NonCodeLeftAlone(t *testing.T) {
 		t.Error("pending must remain (still waiting for the code)")
 	}
 }
+
+func TestLoginMethodMenuClassifiesAsLogin(t *testing.T) {
+	menu := "  Login\n  Claude Code can be used with your Claude subscription or billed based on API\n  Select login method:\n  ❯ 1. Claude account with subscription · Pro, Max, Team, or Enterprise\n    2. Anthropic Console account · API usage billing\n    3. 3rd-party platform\n  Esc to cancel"
+	if got := classifyScreen(menu); got != ScreenLogin {
+		t.Fatalf("login-method menu should classify as login, got %q", got)
+	}
+	if !paneAwaitingLoginMethod(menu) {
+		t.Fatal("paneAwaitingLoginMethod should detect the menu")
+	}
+	if paneAwaitingLoginMethod("❯ just a normal 1. list\n2. here") {
+		t.Error("must not trip on an ordinary numbered list")
+	}
+	var i interface{} = TmuxInjector{}
+	if _, ok := i.(loginMethodSelector); !ok {
+		t.Fatal("TmuxInjector must implement loginMethodSelector")
+	}
+}

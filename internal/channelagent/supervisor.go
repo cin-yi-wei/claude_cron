@@ -81,7 +81,18 @@ func handleLoginScreen(ctx context.Context, b Binding, cfg Config, token string,
 		fmt.Fprintf(stdout, "binding %s login screen but within restart cooldown — leaving session\n", b.Name)
 		return true
 	}
-	// Creds truly expired — a restart can't fix it. Paste-code re-login:
+	// Creds truly expired — a restart can't fix it. Paste-code re-login.
+	// Step 0: if /login popped the "Select login method" menu, pick 1 (Claude
+	// subscription) to advance to the OAuth URL. Next cycle the URL is on the pane.
+	if paneAwaitingLoginMethod(pane) {
+		lm := TmuxInjector{Session: b.TmuxSession, Root: b.Root, AutoStart: true}
+		if sel, ok := interface{}(lm).(loginMethodSelector); ok {
+			if err := sel.SelectLoginSubscription(ctx); err == nil {
+				fmt.Fprintf(stdout, "binding %s login: picked subscription on method menu\n", b.Name)
+				return true
+			}
+		}
+	}
 	if url := extractLoginURL(pane); url != "" {
 		if reloginRequestStale(b.Root) {
 			clearReloginRequest(b.Root, b.Name)

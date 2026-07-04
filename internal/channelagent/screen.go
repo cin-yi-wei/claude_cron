@@ -40,6 +40,14 @@ func classifyScreen(pane string) ScreenState {
 			return ScreenLogin
 		}
 	}
+	// The "Select login method" menu (/login step before the OAuth URL) is part of
+	// the login flow — classify it as login so the auth watchdog drives it (picks
+	// the subscription option). Require the subscription line too so a random
+	// numbered list can't match. Checked BEFORE the confirm-dialog detector, which
+	// would otherwise capture this numbered menu as a generic confirm prompt.
+	if strings.Contains(low, "select login method") && strings.Contains(low, "subscription") {
+		return ScreenLogin
+	}
 	// "Please run /login" is trickier: Claude ALSO prefixes it onto transient
 	// network errors, e.g. "● Please run /login · API Error: 401 The socket
 	// connection was closed unexpectedly". Auth is fine there — only the socket
@@ -103,6 +111,16 @@ var loginURLRE = regexp.MustCompile(`https://(?:claude\.(?:com|ai)|console\.anth
 // channel so a human can complete auth and paste the code back.
 func extractLoginURL(pane string) string {
 	return loginURLRE.FindString(stripANSI(pane))
+}
+
+// paneAwaitingLoginMethod reports whether the pane is at Claude's "Select login
+// method" menu (shown right after /login, before the OAuth URL). We must pick
+// option 1 (Claude subscription) to advance to the URL. Require both the header
+// and the subscription option so ordinary text can't trip it.
+func paneAwaitingLoginMethod(pane string) bool {
+	low := strings.ToLower(stripANSI(pane))
+	return strings.Contains(low, "select login method") &&
+		strings.Contains(low, "subscription")
 }
 
 // paneAwaitingPasteCode reports whether the pane is at Claude's "Paste code here"

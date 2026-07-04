@@ -139,6 +139,17 @@ func (i TmuxInjector) SendLogin(ctx context.Context) error {
 	return runExternalCommand(ctx, "tmux", "send-keys", "-t", i.Session, "Enter")
 }
 
+// SelectLoginSubscription picks option 1 (Claude subscription) on the "Select
+// login method" menu that appears after /login, advancing to the OAuth URL.
+// (loginMethodSelector capability.)
+func (i TmuxInjector) SelectLoginSubscription(ctx context.Context) error {
+	if err := runExternalCommand(ctx, "tmux", "send-keys", "-t", i.Session, "-l", "1"); err != nil {
+		return err
+	}
+	time.Sleep(injectSubmitDelay)
+	return runExternalCommand(ctx, "tmux", "send-keys", "-t", i.Session, "Enter")
+}
+
 // inputBoxHasText reports whether the Claude TUI's input box (the bottom-most
 // "❯" line) still holds unsent text. The echoed sent message also starts with
 // "❯" but appears above; only the LAST such line is the live input box.

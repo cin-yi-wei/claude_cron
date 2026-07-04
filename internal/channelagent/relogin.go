@@ -95,6 +95,12 @@ type loginTyper interface {
 	SendLogin(ctx context.Context) error
 }
 
+// loginMethodSelector is an optional Injector capability: pick option 1 (Claude
+// subscription) on the "Select login method" menu that /login shows before the URL.
+type loginMethodSelector interface {
+	SelectLoginSubscription(ctx context.Context) error
+}
+
 // loginTypeCooldown rate-limits auto-typing /login per binding, so a login screen
 // that /login does NOT immediately clear can't make us spam it every cycle.
 const loginTypeCooldown = 90 * time.Second
