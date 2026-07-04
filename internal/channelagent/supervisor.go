@@ -362,6 +362,25 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 				}
 				fmt.Fprintf(stdout, "binding %s login screen but within restart cooldown — leaving session\n", b.Name)
 			} else {
+				// Creds truly expired — a restart can't fix it. Prefer the paste-code
+				// re-login: if the pane is showing the OAuth login URL (headless
+				// fallback), relay it to the binding's channel and let the user paste
+				// the code back (ResolvePendingReloginOnce types it in). Fall back to
+				// the old "please /login" nag only when no URL can be extracted.
+				if url := extractLoginURL(pane); url != "" {
+					if reloginRequestStale(b.Root) {
+						clearReloginRequest(b.Root, b.Name)
+					}
+					if recordReloginRequest(b.Root, b.Name, url) {
+						fmt.Fprintf(stdout, "binding %s login expired — relayed paste-code re-login URL to channel\n", b.Name)
+						// Flush the sender now so the URL prompt actually leaves the outbox
+						// this cycle (same reasoning as the confirm-dialog branch above).
+						if s, serr := SelectSender(b, cfg, bindingTokens{discord: token, telegram: os.Getenv(cfg.Telegram.TokenEnv)}); serr == nil {
+							_, _ = RunSenderOnce(ctx, b.Root, s)
+						}
+					}
+					continue
+				}
 				notifyLoginNeeded(ctx, cfg, token, b.Name)
 				continue
 			}

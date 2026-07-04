@@ -89,6 +89,28 @@ func classifyScreen(pane string) ScreenState {
 	return ScreenUnknown
 }
 
+// loginURLRE matches the OAuth authorize URL Claude prints when the browser
+// callback can't be reached (headless/SSH/container) and it falls back to the
+// "paste the code" flow. Both the claude.ai and console.anthropic.com hosts are
+// covered. Anchored on the authorize path so an arbitrary logged URL in chat
+// scrollback can't be mistaken for the login URL.
+var loginURLRE = regexp.MustCompile(`https://(?:claude\.ai|console\.anthropic\.com)/[^\s"'<>]*(?:oauth|authorize)[^\s"'<>]*`)
+
+// extractLoginURL returns the OAuth login URL from a pane snapshot, or "" if the
+// pane isn't showing one. Used by the re-login flow to relay the URL to the
+// channel so a human can complete auth and paste the code back.
+func extractLoginURL(pane string) string {
+	return loginURLRE.FindString(stripANSI(pane))
+}
+
+// paneAwaitingPasteCode reports whether the pane is at Claude's "Paste code here"
+// prompt — the state where sending the OAuth code (send-keys) completes login.
+func paneAwaitingPasteCode(pane string) bool {
+	low := strings.ToLower(stripANSI(pane))
+	return strings.Contains(low, "paste code here") || strings.Contains(low, "paste the code") ||
+		(strings.Contains(low, "paste") && strings.Contains(low, "code") && strings.Contains(low, "prompted"))
+}
+
 // lastPromptLineSeen reports whether a "❯" input line exists in the snapshot.
 func lastPromptLineSeen(s string) bool {
 	for _, ln := range strings.Split(s, "\n") {

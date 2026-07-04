@@ -115,6 +115,18 @@ func (i TmuxInjector) typeAndSubmit(ctx context.Context, prompt string) error {
 	return runExternalCommand(ctx, "tmux", "send-keys", "-t", i.Session, "Enter")
 }
 
+// PasteLoginCode types an OAuth code into the session's "Paste code here" prompt
+// and submits it. Unlike typeAndSubmit it does NOT send C-c first: the login
+// paste field is not the chat input box, and a C-c there could cancel the login
+// flow. Just insert the code literally and press Enter. (loginPaster capability.)
+func (i TmuxInjector) PasteLoginCode(ctx context.Context, code string) error {
+	if err := runExternalCommand(ctx, "tmux", "send-keys", "-t", i.Session, "-l", code); err != nil {
+		return err
+	}
+	time.Sleep(injectSubmitDelay)
+	return runExternalCommand(ctx, "tmux", "send-keys", "-t", i.Session, "Enter")
+}
+
 // inputBoxHasText reports whether the Claude TUI's input box (the bottom-most
 // "❯" line) still holds unsent text. The echoed sent message also starts with
 // "❯" but appears above; only the LAST such line is the live input box.
