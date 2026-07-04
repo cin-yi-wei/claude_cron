@@ -83,14 +83,24 @@ func capturePaneJoined(ctx context.Context, session string) string {
 // as workers — previously the login watchdog lived only in the worker loop,
 // which skips control bindings, so control planes had NO login handling at all.
 func handleLoginScreen(ctx context.Context, b Binding, cfg Config, token string, pane string, stdout io.Writer) bool {
-	// If a paste-code re-login is already in flight (URL relayed, not yet stale),
-	// DO NOT restart or re-summon /login: a restart kills the session's PKCE
-	// verifier, which invalidates the exact URL/code the user is completing right
-	// now (the "I pasted code but it kept retrying" failure). Hold the session at
-	// its paste-code prompt so the user's code can land; ResolvePendingReloginOnce
-	// types it out-of-band. Falls through only once the request goes stale (15min).
+	// A paste-code re-login in flight (URL relayed, not yet stale).
 	if hasPendingRelogin(b.Root) && !reloginRequestStale(b.Root) {
-		fmt.Fprintf(stdout, "binding %s re-login pending — holding session for your code (no restart)\n", b.Name)
+		// CRITICAL: apply the user's `code: <value>` reply HERE. The worker loop
+		// `continue`s on a login screen and never reaches RunServeOnce — the only
+		// other place ResolvePendingReloginOnce runs — so without this call a pasted
+		// code is NEVER parsed or typed into the session: the pane sits at the
+		// "Paste code here" prompt forever while the user swears they replied. Run
+		// the resolver directly with this binding's own tmux injector.
+		injector := TmuxInjector{Session: b.TmuxSession, Root: b.Root, AutoStart: true}
+		if consumed, err := ResolvePendingReloginOnce(b.Root, injector); consumed {
+			fmt.Fprintf(stdout, "binding %s: typed your pasted login code into the session\n", b.Name)
+			return true
+		} else if err != nil {
+			fmt.Fprintf(stdout, "binding %s: error applying pasted code: %v\n", b.Name, err)
+		}
+		// No code reply yet → HOLD (do not restart / re-/login): a restart kills the
+		// PKCE verifier and invalidates the URL/code the user is completing now.
+		fmt.Fprintf(stdout, "binding %s re-login pending — waiting for your code (no restart)\n", b.Name)
 		return true
 	}
 

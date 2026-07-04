@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -137,27 +138,42 @@ func ResolvePendingReloginOnce(root string, injector Injector) (bool, error) {
 	if !ok {
 		return false, nil // injector can't paste (e.g. tests with a stub) → leave it
 	}
-	pendingPath, err := oldestJSON(pathIn(root, "inbox", "pending"))
-	if err != nil || pendingPath == "" {
-		return false, err
+	// Scan ALL pending inbox messages for the first `code: <value>` reply — NOT
+	// just the oldest. If an unrelated message is queued ahead of the code (the
+	// user chatted before pasting), checking only the oldest would never reach the
+	// code and the re-login would hang forever.
+	pendingDir := pathIn(root, "inbox", "pending")
+	entries, err := os.ReadDir(pendingDir)
+	if err != nil {
+		return false, nil
 	}
-	var job InputJob
-	if err := ReadJSON(pendingPath, &job); err != nil {
-		return false, nil // malformed → leave for the worker to fail properly
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".json") {
+			names = append(names, e.Name())
+		}
 	}
-	code, ok := parseLoginCode(job.Source.Content)
-	if !ok {
-		return false, nil // not a code reply → leave for normal handling
+	sort.Strings(names) // job ids are timestamp-prefixed → chronological
+	for _, n := range names {
+		p := filepath.Join(pendingDir, n)
+		var job InputJob
+		if err := ReadJSON(p, &job); err != nil {
+			continue
+		}
+		code, ok := parseLoginCode(job.Source.Content)
+		if !ok {
+			continue // not a code reply → leave it for normal handling
+		}
+		if err := paster.PasteLoginCode(context.Background(), code); err != nil {
+			return false, err
+		}
+		// Clear pending + archive the reply so the code isn't re-typed later. The
+		// supervisor re-checks the pane next cycle; if still login it re-posts.
+		clearReloginRequest(root, bindingNameForRoot(root))
+		_ = moveFile(p, pathIn(root, "inbox", "done", n))
+		return true, nil
 	}
-	if err := paster.PasteLoginCode(context.Background(), code); err != nil {
-		return false, err
-	}
-	// Clear pending + archive the reply so the code isn't re-typed later. The
-	// supervisor re-checks the pane next cycle; if still login it re-posts.
-	clearReloginRequest(root, bindingNameForRoot(root))
-	name := filepath.Base(pendingPath)
-	_ = moveFile(pendingPath, pathIn(root, "inbox", "done", name))
-	return true, nil
+	return false, nil
 }
 
 // bindingNameForRoot derives the binding name from its root path (…/bindings/<name>
