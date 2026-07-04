@@ -16,6 +16,7 @@ var (
 	unboundAnnouncedAt = map[string]time.Time{}
 	loginNotifiedAt    = map[string]time.Time{}
 	loginRestartedAt   = map[string]time.Time{}
+	loginCodeAppliedAt = map[string]time.Time{} // binding → when we last typed a pasted code
 
 	confirmPostedMu   sync.Mutex
 	confirmPostedHash = map[string]string{} // binding → hash of last confirm posted
@@ -53,6 +54,27 @@ func loginRestartAllowed(binding string) bool {
 	return true
 }
 
+// loginCodeGrace is how long after typing a pasted code we refuse to restart the
+// session — the OAuth exchange + reaching the post-login screen takes several
+// seconds, and a restart in that window throws away the just-completed login (the
+// "code went in, then it bounced back to login" failure).
+const loginCodeGrace = 90 * time.Second
+
+func markLoginCodeApplied(binding string) {
+	unboundAnnounceMu.Lock()
+	loginCodeAppliedAt[binding] = time.Now()
+	unboundAnnounceMu.Unlock()
+}
+
+// withinLoginCodeGrace reports whether we typed a code for this binding recently
+// enough that we should let the login settle instead of restarting.
+func withinLoginCodeGrace(binding string) bool {
+	unboundAnnounceMu.Lock()
+	defer unboundAnnounceMu.Unlock()
+	t, ok := loginCodeAppliedAt[binding]
+	return ok && time.Since(t) < loginCodeGrace
+}
+
 // capturePane returns the tmux pane snapshot for a session (empty on error).
 func capturePane(ctx context.Context, session string) string {
 	out, err := runExternalCommandOutput(ctx, "tmux", "capture-pane", "-pt", session)
@@ -83,6 +105,14 @@ func capturePaneJoined(ctx context.Context, session string) string {
 // as workers — previously the login watchdog lived only in the worker loop,
 // which skips control bindings, so control planes had NO login handling at all.
 func handleLoginScreen(ctx context.Context, b Binding, cfg Config, token string, pane string, stdout io.Writer) bool {
+	// Just typed a code — let the OAuth exchange finish + the post-login screen
+	// appear. Restarting now (which the "creds look fresh" branch would do once the
+	// pending is cleared) throws away the just-completed login. Hold during grace.
+	if withinLoginCodeGrace(b.Name) {
+		fmt.Fprintf(stdout, "binding %s: login settling after your code (no restart)\n", b.Name)
+		return true
+	}
+
 	// A paste-code re-login in flight (URL relayed, not yet stale).
 	if hasPendingRelogin(b.Root) && !reloginRequestStale(b.Root) {
 		// CRITICAL: apply the user's `code: <value>` reply HERE. The worker loop
@@ -93,6 +123,7 @@ func handleLoginScreen(ctx context.Context, b Binding, cfg Config, token string,
 		// the resolver directly with this binding's own tmux injector.
 		injector := TmuxInjector{Session: b.TmuxSession, Root: b.Root, AutoStart: true}
 		if consumed, err := ResolvePendingReloginOnce(b.Root, injector); consumed {
+			markLoginCodeApplied(b.Name) // grace window: don't restart while login settles
 			fmt.Fprintf(stdout, "binding %s: typed your pasted login code into the session\n", b.Name)
 			return true
 		} else if err != nil {
