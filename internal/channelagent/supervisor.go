@@ -83,6 +83,17 @@ func capturePaneJoined(ctx context.Context, session string) string {
 // as workers — previously the login watchdog lived only in the worker loop,
 // which skips control bindings, so control planes had NO login handling at all.
 func handleLoginScreen(ctx context.Context, b Binding, cfg Config, token string, pane string, stdout io.Writer) bool {
+	// If a paste-code re-login is already in flight (URL relayed, not yet stale),
+	// DO NOT restart or re-summon /login: a restart kills the session's PKCE
+	// verifier, which invalidates the exact URL/code the user is completing right
+	// now (the "I pasted code but it kept retrying" failure). Hold the session at
+	// its paste-code prompt so the user's code can land; ResolvePendingReloginOnce
+	// types it out-of-band. Falls through only once the request goes stale (15min).
+	if hasPendingRelogin(b.Root) && !reloginRequestStale(b.Root) {
+		fmt.Fprintf(stdout, "binding %s re-login pending — holding session for your code (no restart)\n", b.Name)
+		return true
+	}
+
 	valid, ok := claudeCredsValid()
 	if claudeOAuthTokenConfigured() || (ok && valid) {
 		// Creds LOOK fresh (env token set, or the creds file exists and isn't
