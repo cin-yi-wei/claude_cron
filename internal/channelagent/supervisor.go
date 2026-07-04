@@ -381,6 +381,19 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 					}
 					continue
 				}
+				// No URL on the pane yet: a bare "Please run /login" screen doesn't
+				// show the OAuth URL until /login is actually run. Auto-type /login so
+				// next cycle the URL appears and the branch above relays it — this is
+				// what makes it truly unattended (no human needs to type /login).
+				// Rate-limited per binding so a login that /login can't clear can't
+				// make us spam it. Only fall back to the human nag if we can't type.
+				li := TmuxInjector{Session: b.TmuxSession, Root: b.Root, AutoStart: true}
+				if lt, ok := interface{}(li).(loginTyper); ok && autoLoginAllowed(b.Name) {
+					if err := lt.SendLogin(ctx); err == nil {
+						fmt.Fprintf(stdout, "binding %s login expired, no URL yet — auto-typed /login to summon OAuth URL\n", b.Name)
+						continue // next cycle: URL should be on the pane → relayed above
+					}
+				}
 				notifyLoginNeeded(ctx, cfg, token, b.Name)
 				continue
 			}

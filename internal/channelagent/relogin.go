@@ -89,6 +89,32 @@ type loginPaster interface {
 	PasteLoginCode(ctx context.Context, code string) error
 }
 
+// loginTyper is an optional Injector capability: type `/login` to summon the
+// OAuth flow (so the login URL appears on a bare "Please run /login" screen).
+type loginTyper interface {
+	SendLogin(ctx context.Context) error
+}
+
+// loginTypeCooldown rate-limits auto-typing /login per binding, so a login screen
+// that /login does NOT immediately clear can't make us spam it every cycle.
+const loginTypeCooldown = 90 * time.Second
+
+var (
+	loginTypedMu sync.Mutex
+	loginTypedAt = map[string]time.Time{}
+)
+
+// autoLoginAllowed returns true at most once per loginTypeCooldown per binding.
+func autoLoginAllowed(binding string) bool {
+	loginTypedMu.Lock()
+	defer loginTypedMu.Unlock()
+	if last, seen := loginTypedAt[binding]; seen && time.Since(last) < loginTypeCooldown {
+		return false
+	}
+	loginTypedAt[binding] = time.Now()
+	return true
+}
+
 // ResolvePendingReloginOnce consumes a `code: <value>` reply when a re-login is
 // pending and types the code into the session. Mirrors ResolvePendingDecisionOnce
 // (out-of-band, before the worker takes claude.lock). No-op unless a re-login is

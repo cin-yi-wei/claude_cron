@@ -127,6 +127,18 @@ func (i TmuxInjector) PasteLoginCode(ctx context.Context, code string) error {
 	return runExternalCommand(ctx, "tmux", "send-keys", "-t", i.Session, "Enter")
 }
 
+// SendLogin types the `/login` slash command into the session to summon the
+// OAuth flow. On a "Please run /login" screen the login URL does NOT appear until
+// /login is actually run; the supervisor calls this first, then next cycle the
+// URL is on the pane for extractLoginURL to relay. (loginTyper capability.)
+func (i TmuxInjector) SendLogin(ctx context.Context) error {
+	if err := runExternalCommand(ctx, "tmux", "send-keys", "-t", i.Session, "-l", "/login"); err != nil {
+		return err
+	}
+	time.Sleep(injectSubmitDelay)
+	return runExternalCommand(ctx, "tmux", "send-keys", "-t", i.Session, "Enter")
+}
+
 // inputBoxHasText reports whether the Claude TUI's input box (the bottom-most
 // "❯" line) still holds unsent text. The echoed sent message also starts with
 // "❯" but appears above; only the LAST such line is the live input box.
