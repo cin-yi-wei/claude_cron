@@ -62,6 +62,20 @@ func capturePane(ctx context.Context, session string) string {
 	return out
 }
 
+// capturePaneJoined captures the pane with -J so wrapped lines are rejoined into
+// one logical line. The OAuth login URL is far longer than the pane width, so a
+// plain capture splits it across rows and extractLoginURL (which stops at
+// whitespace/newline) grabs only the first row → a truncated URL. -J glues the
+// wrapped rows back together so the whole URL is on one line. Falls back to the
+// plain snapshot if the join capture fails.
+func capturePaneJoined(ctx context.Context, session string) string {
+	out, err := runExternalCommandOutput(ctx, "tmux", "capture-pane", "-pJt", session)
+	if err != nil || strings.TrimSpace(out) == "" {
+		return capturePane(ctx, session)
+	}
+	return out
+}
+
 // handleLoginScreen runs the full auth watchdog for a binding whose pane is
 // classified ScreenLogin. Returns true if it acted (the caller should `continue`
 // / skip normal processing this cycle). Shared by BOTH the worker loop and the
@@ -93,7 +107,10 @@ func handleLoginScreen(ctx context.Context, b Binding, cfg Config, token string,
 			}
 		}
 	}
-	if url := extractLoginURL(pane); url != "" {
+	// Extract the URL from a JOINED capture: the OAuth URL is longer than the pane
+	// width, so the plain `pane` snapshot has it wrapped across rows and would yield
+	// a truncated URL. Re-capture with -J to rejoin it; fall back to `pane`.
+	if url := extractLoginURL(capturePaneJoined(ctx, b.TmuxSession)); url != "" {
 		if reloginRequestStale(b.Root) {
 			clearReloginRequest(b.Root, b.Name)
 		}
