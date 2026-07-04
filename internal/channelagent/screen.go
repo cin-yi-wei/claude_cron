@@ -91,10 +91,12 @@ func classifyScreen(pane string) ScreenState {
 
 // loginURLRE matches the OAuth authorize URL Claude prints when the browser
 // callback can't be reached (headless/SSH/container) and it falls back to the
-// "paste the code" flow. Both the claude.ai and console.anthropic.com hosts are
-// covered. Anchored on the authorize path so an arbitrary logged URL in chat
-// scrollback can't be mistaken for the login URL.
-var loginURLRE = regexp.MustCompile(`https://(?:claude\.ai|console\.anthropic\.com)/[^\s"'<>]*(?:oauth|authorize)[^\s"'<>]*`)
+// "paste the code" flow. The REAL URL host observed on Claude Code v2.1.201 is
+// claude.com/cai/oauth/authorize (verified from a live login pane screenshot);
+// older/alt hosts claude.ai and console.anthropic.com are covered too. Anchored
+// on the oauth/authorize path so an arbitrary logged URL in scrollback isn't
+// mistaken for the login URL.
+var loginURLRE = regexp.MustCompile(`https://(?:claude\.(?:com|ai)|console\.anthropic\.com)/[^\s"'<>]*(?:oauth|authorize)[^\s"'<>]*`)
 
 // extractLoginURL returns the OAuth login URL from a pane snapshot, or "" if the
 // pane isn't showing one. Used by the re-login flow to relay the URL to the

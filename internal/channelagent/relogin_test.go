@@ -14,6 +14,7 @@ func TestExtractLoginURL(t *testing.T) {
 		want string
 	}{
 		{"claude.ai oauth", "Browser didn't open? Visit:\n  https://claude.ai/oauth/authorize?code=1&client_id=x\nPaste code here:", "https://claude.ai/oauth/authorize?code=1&client_id=x"},
+		{"real v2.1.201 claude.com/cai host", "Browser didn't open? Use the url below to sign in (c to copy)\n\nhttps://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&scope=org%3Acreate_api_key+user%3Aprofile&code_challenge_method=S256&state=rVBxK9ANCB64\n\nPaste code here if prompted >", "https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&scope=org%3Acreate_api_key+user%3Aprofile&code_challenge_method=S256&state=rVBxK9ANCB64"},
 		{"console host", "open https://console.anthropic.com/oauth/authorize?foo=bar to continue", "https://console.anthropic.com/oauth/authorize?foo=bar"},
 		{"none in normal pane", "❯ hello world\n  just chatting about https://example.com/oauth-guide", ""},
 		{"idle no url", "❯ \n? for shortcuts", ""},
