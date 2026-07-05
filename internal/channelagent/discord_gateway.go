@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -52,7 +53,11 @@ func (w coderWSConn) Read(ctx context.Context) ([]byte, error) {
 func (w coderWSConn) Write(ctx context.Context, data []byte) error {
 	return w.c.Write(ctx, websocket.MessageText, data)
 }
-func (w coderWSConn) Close() { _ = w.c.Close(websocket.StatusNormalClosure, "") }
+// Close drops the connection WITHOUT a normal-closure (1000) handshake. A 1000
+// close tells Discord to INVALIDATE the session, which makes RESUME impossible
+// (op-9 on the next connect) — verified live. CloseNow just tears down the
+// socket, so Discord keeps the session resumable for ~a few minutes.
+func (w coderWSConn) Close() { _ = w.c.CloseNow() }
 
 // DiscordGatewayIngester is the active/push ingester for Discord: it holds a
 // websocket to the Gateway, receives MESSAGE_CREATE events for its channel, and
@@ -160,6 +165,16 @@ func (g DiscordGatewayIngester) Run(ctx context.Context) error {
 			return ctx.Err()
 		}
 	}
+}
+
+// withGatewayQuery ensures a gateway URL carries ?v=10&encoding=json. The
+// resume_gateway_url from READY is bare; RESUME needs the version/encoding query
+// (same as defaultGatewayURL) or Discord invalidates the session (op 9).
+func withGatewayQuery(u string) string {
+	if strings.Contains(u, "?") {
+		return u
+	}
+	return strings.TrimRight(u, "/") + "/?v=10&encoding=json"
 }
 
 // sleepCtx sleeps d or until ctx is done; returns false if ctx ended.
@@ -304,13 +319,15 @@ func (g DiscordGatewayIngester) runLoop(ctx context.Context, conn gwConn, prev *
 			switch ev.T {
 			case "READY":
 				var rd struct {
-					SessionID       string `json:"session_id"`
+					SessionID        string `json:"session_id"`
 					ResumeGatewayURL string `json:"resume_gateway_url"`
 				}
 				if json.Unmarshal(ev.D, &rd) == nil {
 					sess.id = rd.SessionID
 					if rd.ResumeGatewayURL != "" {
-						sess.resumeURL = rd.ResumeGatewayURL
+						// resume_gateway_url comes bare (no query); RESUME needs the
+						// same ?v=10&encoding=json or Discord rejects the session.
+						sess.resumeURL = withGatewayQuery(rd.ResumeGatewayURL)
 					}
 				}
 				atomic.StoreInt32(&gotReady, 1)
