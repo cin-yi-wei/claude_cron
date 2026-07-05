@@ -52,7 +52,7 @@ func TestGatewayLoopIdentifiesAndIngests(t *testing.T) {
 	g := DiscordGatewayIngester{Root: root, Token: "tok", ChannelID: "c1"}
 
 	done := make(chan error, 1)
-	go func() { done <- g.runLoop(ctx, conn) }()
+	go func() { _, e := g.runLoop(ctx, conn, nil); done <- e }()
 
 	// Once the message is ingested, the inbox has a job; then cancel to end loop.
 	waitFor(t, func() bool { return countJSONFilesSafe(filepath.Join(root, "inbox", "pending")) == 1 })
@@ -124,7 +124,7 @@ func TestGatewayDemuxRoutesByChannel(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- g.runLoop(ctx, conn) }()
+	go func() { _, e := g.runLoop(ctx, conn, nil); done <- e }()
 	waitFor(t, func() bool { mu.Lock(); defer mu.Unlock(); return len(got) == 2 })
 	cancel()
 	<-done
@@ -151,5 +151,82 @@ func TestGatewayExtractCapturesAttachments(t *testing.T) {
 	a := msg.Attachments[0]
 	if a.URL != "https://cdn/x.png" || a.Type != "image/png" || a.ID != "a1" {
 		t.Fatalf("attachment = %#v", a)
+	}
+}
+
+// helper: run runLoop with prev, return its (session,err) after ctx cancel.
+type gwResult struct {
+	sess *gwSession
+	err  error
+}
+
+func TestGatewayResumesWithPrevSession(t *testing.T) {
+	hello := `{"op":10,"d":{"heartbeat_interval":45000}}`
+	conn := &fakeGwConn{frames: [][]byte{[]byte(hello)}}
+	g := DiscordGatewayIngester{Token: "tok", Route: func(context.Context, SourceMessage) error { return nil }}
+	seq := 7
+	prev := &gwSession{id: "sess-123", resumeURL: "wss://resume.example/?v=10", lastSeq: &seq}
+	ctx, cancel := context.WithCancel(context.Background())
+	res := make(chan gwResult, 1)
+	go func() { s, e := g.runLoop(ctx, conn, prev); res <- gwResult{s, e} }()
+	waitFor(t, func() bool { conn.mu.Lock(); defer conn.mu.Unlock(); return len(conn.written) >= 1 })
+	cancel()
+	<-res
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	var env gwEnvelope
+	if err := json.Unmarshal(conn.written[0], &env); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if env.Op != gwResume {
+		t.Fatalf("first write op = %d, want %d (RESUME)", env.Op, gwResume)
+	}
+	var d struct {
+		SessionID string `json:"session_id"`
+		Seq       *int   `json:"seq"`
+	}
+	_ = json.Unmarshal(env.D, &d)
+	if d.SessionID != "sess-123" || d.Seq == nil || *d.Seq != 7 {
+		t.Fatalf("resume payload wrong: session=%q seq=%v", d.SessionID, d.Seq)
+	}
+}
+
+func TestGatewayReadyCapturesSession(t *testing.T) {
+	hello := `{"op":10,"d":{"heartbeat_interval":45000}}`
+	ready := `{"op":0,"t":"READY","s":1,"d":{"session_id":"S9","resume_gateway_url":"wss://gw2/"}}`
+	conn := &fakeGwConn{frames: [][]byte{[]byte(hello), []byte(ready)}}
+	g := DiscordGatewayIngester{Token: "tok", Route: func(context.Context, SourceMessage) error { return nil }}
+	ctx, cancel := context.WithCancel(context.Background())
+	res := make(chan gwResult, 1)
+	go func() { s, e := g.runLoop(ctx, conn, nil); res <- gwResult{s, e} }()
+	// give it a moment to process READY, then end
+	waitFor(t, func() bool { conn.mu.Lock(); defer conn.mu.Unlock(); return conn.idx >= 2 })
+	cancel()
+	r := <-res
+	if r.sess == nil || r.sess.id != "S9" || r.sess.resumeURL != "wss://gw2/" {
+		t.Fatalf("READY not captured: %+v", r.sess)
+	}
+	// first write must be IDENTIFY (no prev session)
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	var env gwEnvelope
+	_ = json.Unmarshal(conn.written[0], &env)
+	if env.Op != gwIdentify {
+		t.Fatalf("first write op=%d want IDENTIFY", env.Op)
+	}
+}
+
+func TestGatewayInvalidSessionDropsState(t *testing.T) {
+	hello := `{"op":10,"d":{"heartbeat_interval":45000}}`
+	invalid := `{"op":9,"d":false}`
+	conn := &fakeGwConn{frames: [][]byte{[]byte(hello), []byte(invalid)}}
+	g := DiscordGatewayIngester{Token: "tok", Route: func(context.Context, SourceMessage) error { return nil }}
+	prev := &gwSession{id: "old", resumeURL: "wss://old/"}
+	s, err := g.runLoop(context.Background(), conn, prev)
+	if err == nil {
+		t.Fatal("expected error on op9")
+	}
+	if s != nil {
+		t.Fatalf("invalid session must drop state, got %+v", s)
 	}
 }
