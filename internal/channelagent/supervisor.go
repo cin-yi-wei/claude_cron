@@ -160,6 +160,36 @@ func handleLoginScreen(ctx context.Context, b Binding, cfg Config, token string,
 		return true
 	}
 
+	// An ACTIVE login screen is in progress on the pane — the method menu, or the
+	// OAuth URL / "Paste code here" prompt. Drive it (pick subscription / relay the
+	// URL) BEFORE the creds-valid restart branch below. Restarting here would throw
+	// away the user's in-flight /login (kills the PKCE verifier, invalidates the
+	// URL/code) even though creds "look" valid — which is exactly what happens when a
+	// still-authed session is re-/login'd for a controlled test. When the pane is a
+	// bare "Not logged in" with no URL, both checks are no-ops and we fall through to
+	// the restart/auto-/login logic unchanged.
+	if paneAwaitingLoginMethod(pane) {
+		lm := TmuxInjector{Session: b.TmuxSession, Root: b.Root, AutoStart: true}
+		if sel, ok := interface{}(lm).(loginMethodSelector); ok {
+			if err := sel.SelectLoginSubscription(ctx); err == nil {
+				fmt.Fprintf(stdout, "binding %s login: picked subscription on method menu\n", b.Name)
+				return true
+			}
+		}
+	}
+	if url := extractLoginURL(capturePaneJoined(ctx, b.TmuxSession)); url != "" {
+		if reloginRequestStale(b.Root) {
+			clearReloginRequest(b.Root, b.Name)
+		}
+		if recordReloginRequest(b.Root, b.Name, url) {
+			fmt.Fprintf(stdout, "binding %s login expired — relayed paste-code re-login URL to channel\n", b.Name)
+			if s, serr := SelectSender(b, cfg, bindingTokens{discord: token, telegram: os.Getenv(cfg.Telegram.TokenEnv)}); serr == nil {
+				_, _ = RunSenderOnce(ctx, b.Root, s)
+			}
+		}
+		return true
+	}
+
 	valid, ok := claudeCredsValid()
 	if claudeOAuthTokenConfigured() || (ok && valid) {
 		// Creds LOOK fresh (env token set, or the creds file exists and isn't
@@ -178,33 +208,6 @@ func handleLoginScreen(ctx context.Context, b Binding, cfg Config, token string,
 		}
 		fmt.Fprintf(stdout, "binding %s still login after fresh-creds restart — token effectively invalid, relaying re-login\n", b.Name)
 		// fall through: pick method menu / extract URL / auto-/login / notify.
-	}
-	// Creds truly expired — a restart can't fix it. Paste-code re-login.
-	// Step 0: if /login popped the "Select login method" menu, pick 1 (Claude
-	// subscription) to advance to the OAuth URL. Next cycle the URL is on the pane.
-	if paneAwaitingLoginMethod(pane) {
-		lm := TmuxInjector{Session: b.TmuxSession, Root: b.Root, AutoStart: true}
-		if sel, ok := interface{}(lm).(loginMethodSelector); ok {
-			if err := sel.SelectLoginSubscription(ctx); err == nil {
-				fmt.Fprintf(stdout, "binding %s login: picked subscription on method menu\n", b.Name)
-				return true
-			}
-		}
-	}
-	// Extract the URL from a JOINED capture: the OAuth URL is longer than the pane
-	// width, so the plain `pane` snapshot has it wrapped across rows and would yield
-	// a truncated URL. Re-capture with -J to rejoin it; fall back to `pane`.
-	if url := extractLoginURL(capturePaneJoined(ctx, b.TmuxSession)); url != "" {
-		if reloginRequestStale(b.Root) {
-			clearReloginRequest(b.Root, b.Name)
-		}
-		if recordReloginRequest(b.Root, b.Name, url) {
-			fmt.Fprintf(stdout, "binding %s login expired — relayed paste-code re-login URL to channel\n", b.Name)
-			if s, serr := SelectSender(b, cfg, bindingTokens{discord: token, telegram: os.Getenv(cfg.Telegram.TokenEnv)}); serr == nil {
-				_, _ = RunSenderOnce(ctx, b.Root, s)
-			}
-		}
-		return true
 	}
 	// No URL yet: a bare "Please run /login" screen shows no URL until /login is
 	// run. Auto-type /login (rate-limited) so next cycle the URL appears + relays.

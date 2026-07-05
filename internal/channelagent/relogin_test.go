@@ -195,3 +195,16 @@ func TestPostLoginScreensClassifyAsLogin(t *testing.T) {
 		t.Error("TmuxInjector must implement managedSettingsTruster")
 	}
 }
+
+func TestPasteCodeScreenClassifiesAsLogin(t *testing.T) {
+	pane := "  Login\n  Browser didn't open? Use the url below to sign in (c to copy)\nhttps://claude.com/cai/oauth/authorize?code=true&client_id=abc&state=xyz\n  Paste code here if prompted >\n  Esc to cancel"
+	if classifyScreen(pane) != ScreenLogin {
+		t.Fatalf("paste-code/URL screen must classify as login, got %v", classifyScreen(pane))
+	}
+	if classifyScreen("random\nhttps://claude.com/cai/oauth/authorize?code=true&x=1\nmore") != ScreenLogin {
+		t.Error("live OAuth URL on pane must classify as login")
+	}
+	if classifyScreen("❯ \n? for shortcuts") == ScreenLogin {
+		t.Error("idle pane wrongly classified as login")
+	}
+}

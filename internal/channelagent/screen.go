@@ -55,6 +55,16 @@ func classifyScreen(pane string) ScreenState {
 	if paneAwaitingLoginContinue(low) || paneAwaitingManagedSettings(low) {
 		return ScreenLogin
 	}
+	// The OAuth-URL / "Paste code here" screen (shown after the method menu when the
+	// browser callback can't be reached — our headless/SSH case). This is where the
+	// login URL must be relayed to the channel and the pasted code typed back. It
+	// carries none of the phrases above, so without this branch classifyScreen falls
+	// through to Idle/Unknown, handleLoginScreen never runs, and the URL is never
+	// relayed — the session sits on the paste prompt forever. Match on the paste
+	// prompt OR a live OAuth URL in the pane.
+	if paneAwaitingPasteCode(s) || extractLoginURL(s) != "" {
+		return ScreenLogin
+	}
 	// "Please run /login" is trickier: Claude ALSO prefixes it onto transient
 	// network errors, e.g. "● Please run /login · API Error: 401 The socket
 	// connection was closed unexpectedly". Auth is fine there — only the socket
