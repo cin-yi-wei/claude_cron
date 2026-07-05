@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -162,5 +163,35 @@ func TestExtractLoginURL_HardWrappedRows(t *testing.T) {
 	// is followed by a blank line
 	if got := extractLoginURL("x\n\n" + full + "\n\nSOMETHINGELSE"); got != full {
 		t.Errorf("blank-line stop failed: got %q", got)
+	}
+}
+
+func TestPostLoginScreensClassifyAsLogin(t *testing.T) {
+	cont := "  Login\n\n  Logged in as conray@jvd.tw\n  Login successful. Press Enter to continue…"
+	if classifyScreen(cont) != ScreenLogin {
+		t.Error("'Press Enter to continue' should classify as login")
+	}
+	mg := "  Managed settings require approval\n  Settings requiring approval:\n   · hooks\n  ❯ 1. Yes, I trust these settings\n    2. No, exit Claude Code"
+	if classifyScreen(mg) != ScreenLogin {
+		t.Error("managed-settings gate should classify as login")
+	}
+	// detectors on lowercased ANSI-stripped text
+	if !paneAwaitingLoginContinue(strings.ToLower(cont)) {
+		t.Error("paneAwaitingLoginContinue miss")
+	}
+	if !paneAwaitingManagedSettings(strings.ToLower(mg)) {
+		t.Error("paneAwaitingManagedSettings miss")
+	}
+	// no false positives on a normal idle pane
+	if paneAwaitingLoginContinue("❯ \n? for shortcuts") || paneAwaitingManagedSettings("❯ hello") {
+		t.Error("false positive on idle pane")
+	}
+	// injector implements both new capabilities
+	var i interface{} = TmuxInjector{}
+	if _, ok := i.(loginContinuer); !ok {
+		t.Error("TmuxInjector must implement loginContinuer")
+	}
+	if _, ok := i.(managedSettingsTruster); !ok {
+		t.Error("TmuxInjector must implement managedSettingsTruster")
 	}
 }

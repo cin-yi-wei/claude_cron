@@ -48,6 +48,13 @@ func classifyScreen(pane string) ScreenState {
 	if strings.Contains(low, "select login method") && strings.Contains(low, "subscription") {
 		return ScreenLogin
 	}
+	// Two POST-login screens that gate a freshly-authed session before it's usable.
+	// Both are part of the login flow → classify as login so handleLoginScreen
+	// auto-advances them (Enter / trust). Without this, a pasted code completes auth
+	// but the session sits on these forever and never processes messages.
+	if paneAwaitingLoginContinue(low) || paneAwaitingManagedSettings(low) {
+		return ScreenLogin
+	}
 	// "Please run /login" is trickier: Claude ALSO prefixes it onto transient
 	// network errors, e.g. "● Please run /login · API Error: 401 The socket
 	// connection was closed unexpectedly". Auth is fine there — only the socket
@@ -148,6 +155,21 @@ func extractLoginURL(pane string) string {
 	}
 	// Fallback: single-line match anywhere in the snapshot.
 	return loginURLRE.FindString(s)
+}
+
+// paneAwaitingLoginContinue reports whether the pane is at the post-login
+// "Login successful. Press Enter to continue…" screen (arg is ANSI-stripped
+// lowercase). Advancing = send Enter.
+func paneAwaitingLoginContinue(low string) bool {
+	return strings.Contains(low, "login successful") && strings.Contains(low, "press enter to continue")
+}
+
+// paneAwaitingManagedSettings reports whether the pane is at Claude's
+// "Managed settings require approval" gate (hooks trust) shown on boot after
+// login (arg is ANSI-stripped lowercase). Advancing = pick "1. Yes, I trust".
+func paneAwaitingManagedSettings(low string) bool {
+	return strings.Contains(low, "managed settings require approval") &&
+		strings.Contains(low, "trust these settings")
 }
 
 // paneAwaitingLoginMethod reports whether the pane is at Claude's "Select login

@@ -150,6 +150,24 @@ func (i TmuxInjector) SelectLoginSubscription(ctx context.Context) error {
 	return runExternalCommand(ctx, "tmux", "send-keys", "-t", i.Session, "Enter")
 }
 
+// PressEnter sends a bare Enter — advances the post-login "Press Enter to
+// continue" screen. (loginContinuer capability.)
+func (i TmuxInjector) PressEnter(ctx context.Context) error {
+	return runExternalCommand(ctx, "tmux", "send-keys", "-t", i.Session, "Enter")
+}
+
+// SelectTrustSettings picks "1. Yes, I trust these settings" on the managed-
+// settings/hooks approval gate that Claude shows on boot after login.
+// (managedSettingsTruster capability.) The ❯ cursor already defaults to option
+// 1, so send 1 then Enter to be explicit.
+func (i TmuxInjector) SelectTrustSettings(ctx context.Context) error {
+	if err := runExternalCommand(ctx, "tmux", "send-keys", "-t", i.Session, "-l", "1"); err != nil {
+		return err
+	}
+	time.Sleep(injectSubmitDelay)
+	return runExternalCommand(ctx, "tmux", "send-keys", "-t", i.Session, "Enter")
+}
+
 // inputBoxHasText reports whether the Claude TUI's input box (the bottom-most
 // "❯" line) still holds unsent text. The echoed sent message also starts with
 // "❯" but appears above; only the LAST such line is the live input box.

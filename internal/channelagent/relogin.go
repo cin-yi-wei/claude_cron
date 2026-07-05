@@ -102,6 +102,18 @@ type loginMethodSelector interface {
 	SelectLoginSubscription(ctx context.Context) error
 }
 
+// loginContinuer is an optional Injector capability: press Enter on the post-login
+// "Login successful. Press Enter to continue" screen.
+type loginContinuer interface {
+	PressEnter(ctx context.Context) error
+}
+
+// managedSettingsTruster is an optional Injector capability: pick "1. Yes, I trust"
+// on the managed-settings/hooks approval gate shown after login.
+type managedSettingsTruster interface {
+	SelectTrustSettings(ctx context.Context) error
+}
+
 // loginTypeCooldown rate-limits auto-typing /login per binding, so a login screen
 // that /login does NOT immediately clear can't make us spam it every cycle.
 const loginTypeCooldown = 90 * time.Second

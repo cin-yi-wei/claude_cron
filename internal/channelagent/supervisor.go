@@ -105,6 +105,31 @@ func capturePaneJoined(ctx context.Context, session string) string {
 // as workers — previously the login watchdog lived only in the worker loop,
 // which skips control bindings, so control planes had NO login handling at all.
 func handleLoginScreen(ctx context.Context, b Binding, cfg Config, token string, pane string, stdout io.Writer) bool {
+	low := strings.ToLower(stripANSI(pane))
+	inj := TmuxInjector{Session: b.TmuxSession, Root: b.Root, AutoStart: true}
+	// POST-login gates — these appear AFTER auth succeeds and block an otherwise
+	// logged-in session from becoming usable. Handle them FIRST (before any creds
+	// check / restart / grace), because auth is already fine here; the session just
+	// needs a keypress to proceed. Without this the whole re-login flow "succeeds"
+	// but the session sits on these screens and never processes messages.
+	if paneAwaitingManagedSettings(low) {
+		if t, ok := interface{}(inj).(managedSettingsTruster); ok {
+			if err := t.SelectTrustSettings(ctx); err == nil {
+				markLoginCodeApplied(b.Name) // keep the no-restart grace so it can settle
+				fmt.Fprintf(stdout, "binding %s: approved managed-settings (hooks) trust gate\n", b.Name)
+				return true
+			}
+		}
+	}
+	if paneAwaitingLoginContinue(low) {
+		if c, ok := interface{}(inj).(loginContinuer); ok {
+			if err := c.PressEnter(ctx); err == nil {
+				markLoginCodeApplied(b.Name)
+				fmt.Fprintf(stdout, "binding %s: pressed Enter on post-login continue screen\n", b.Name)
+				return true
+			}
+		}
+	}
 	// Just typed a code — let the OAuth exchange finish + the post-login screen
 	// appear. Restarting now (which the "creds look fresh" branch would do once the
 	// pending is cleared) throws away the just-completed login. Hold during grace.
