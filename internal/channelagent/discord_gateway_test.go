@@ -203,7 +203,7 @@ func TestGatewayReadyCapturesSession(t *testing.T) {
 	waitFor(t, func() bool { conn.mu.Lock(); defer conn.mu.Unlock(); return conn.idx >= 2 })
 	cancel()
 	r := <-res
-	if r.sess == nil || r.sess.id != "S9" || r.sess.resumeURL != "wss://gw2/" {
+	if r.sess == nil || r.sess.id != "S9" || r.sess.resumeURL != "wss://gw2/?v=10&encoding=json" {
 		t.Fatalf("READY not captured: %+v", r.sess)
 	}
 	// first write must be IDENTIFY (no prev session)
