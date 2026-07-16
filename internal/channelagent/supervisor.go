@@ -397,7 +397,28 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 			}
 			return nil // unknown channel → dropped
 		}
-		push.Ensure("__dc_demux__", DiscordGatewayIngester{Token: token, Route: dcRoute}, func(e error) {
+		// Permission-button clicks arrive as INTERACTION_CREATE on the same demux.
+		// Resolve the request id from the button custom_id, write the decision to
+		// the matching binding, and ACK within 3s (edits the prompt to the result,
+		// drops the buttons). Without this wiring g.Interact is nil and the click
+		// shows "此交互失敗".
+		dcInteract := func(ctx context.Context, it gatewayInteraction) error {
+			reg2, err := LoadRegistry(root)
+			if err != nil {
+				return nil
+			}
+			line, name, id, ok := applyPermissionInteraction(reg2, it.ChannelID, it.Data.CustomID)
+			if !ok {
+				return nil // not a permission button / unknown channel → ignore
+			}
+			if err := ackInteraction(ctx, defaultDiscordBaseURL, token, it.ID, it.Token, line, httpClient15s); err != nil {
+				fmt.Fprintf(stdout, "permission button ack failed for %s (binding %s): %v\n", id, name, err)
+				return nil
+			}
+			fmt.Fprintf(stdout, "permission button: %s -> %s (binding %s)\n", it.Data.CustomID, id, name)
+			return nil
+		}
+		push.Ensure("__dc_demux__", DiscordGatewayIngester{Token: token, Route: dcRoute, Interact: dcInteract}, func(e error) {
 			if e != nil {
 				fmt.Fprintf(stdout, "discord gateway demux exited (restarts next cycle): %v\n", e)
 			}
