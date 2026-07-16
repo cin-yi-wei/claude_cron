@@ -232,6 +232,20 @@ func (r *Registry) Get(name string) (Binding, bool) {
 	return Binding{}, false
 }
 
+// BindingByChannel 依 channel_id 找 binding（用於路由 Discord 元件互動回它的
+// 工作區）。回傳第一個相符者。
+func (r Registry) BindingByChannel(channelID string) (Binding, bool) {
+	if channelID == "" {
+		return Binding{}, false
+	}
+	for _, b := range r.Bindings {
+		if b.ChannelID == channelID {
+			return b, true
+		}
+	}
+	return Binding{}, false
+}
+
 func (r *Registry) Add(b Binding) error {
 	if _, ok := r.Get(b.Name); ok {
 		return fmt.Errorf("binding %q already exists", b.Name)

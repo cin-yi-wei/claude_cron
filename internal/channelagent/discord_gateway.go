@@ -81,6 +81,14 @@ type DiscordGatewayIngester struct {
 	// the single-connection counterpart to per-binding ingesters.
 	Route func(ctx context.Context, msg SourceMessage) error
 
+	// Interact, when set, receives each INTERACTION_CREATE dispatch (Discord
+	// message-component clicks, e.g. the permission gate's 允許/拒絕 按鈕). The
+	// closure resolves the binding by channel id, writes the decision and ACKs
+	// the interaction. A returned error should NOT tear down the connection
+	// (unlike Route) — the closure logs and returns nil so a failed ACK can't
+	// kill the shared demux; the decision write is what matters and happens first.
+	Interact func(ctx context.Context, it gatewayInteraction) error
+
 	// dial is injectable for tests; nil uses the real coder/websocket dialer.
 	dial func(ctx context.Context, url string) (gwConn, error)
 }
@@ -345,6 +353,16 @@ func (g DiscordGatewayIngester) runLoop(ctx context.Context, conn gwConn, prev *
 						return sess, err
 					}
 				}
+			case "INTERACTION_CREATE":
+				// 元件互動（按鈕）：交給 Interact 處理。它自己吞錯不回傳，避免
+				// 一次 ACK 失敗就扯斷整條共用 demux 連線。
+				if g.Interact != nil {
+					if it, ok := gatewayInteractionExtract(ev.D); ok {
+						if err := g.Interact(ctx, it); err != nil {
+							return sess, err
+						}
+					}
+				}
 			}
 		}
 	}
@@ -372,6 +390,35 @@ type gatewayMessage struct {
 		URL         string `json:"url"`
 		ContentType string `json:"content_type"`
 	} `json:"attachments"`
+}
+
+// gatewayInteraction is the subset of an INTERACTION_CREATE payload we use for
+// message-component (button) interactions. Token is the interaction token used
+// to ACK; Message.Content is the original prompt text (so the ACK can keep it).
+type gatewayInteraction struct {
+	ID        string `json:"id"`
+	Token     string `json:"token"`
+	ChannelID string `json:"channel_id"`
+	Data      struct {
+		CustomID string `json:"custom_id"`
+	} `json:"data"`
+	Message struct {
+		ID      string `json:"id"`
+		Content string `json:"content"`
+	} `json:"message"`
+}
+
+// gatewayInteractionExtract parses an INTERACTION_CREATE payload. ok=false when
+// it can't be parsed or carries no custom_id (nothing actionable).
+func gatewayInteractionExtract(raw json.RawMessage) (gatewayInteraction, bool) {
+	var it gatewayInteraction
+	if err := json.Unmarshal(raw, &it); err != nil {
+		return gatewayInteraction{}, false
+	}
+	if it.Data.CustomID == "" {
+		return gatewayInteraction{}, false
+	}
+	return it, true
 }
 
 // gatewayExtract maps a MESSAGE_CREATE payload to a SourceMessage tagged with its
