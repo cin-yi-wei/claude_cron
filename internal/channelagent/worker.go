@@ -175,28 +175,34 @@ func ResolvePendingDecisionOnce(root string) (bool, error) {
 	if id == "" {
 		return false, nil // nothing waiting → let the normal worker handle the inbox
 	}
-	pendingPath, err := oldestJSON(pathIn(root, "inbox", "pending"))
-	if err != nil || pendingPath == "" {
-		return false, err
+	// Scan ALL pending inbox messages for the FIRST y/n — not just the oldest. If
+	// the user chatted (a non-decision message) before replying y, checking only
+	// the oldest would see that chatter, bail, and never reach the y → the gate
+	// starves to a timeout-deny even though the user answered. (Mirrors
+	// ResolvePendingReloginOnce's all-scan for the same reason.) Non-decision
+	// messages are left in place for normal injection once the turn ends.
+	pendingDir := pathIn(root, "inbox", "pending")
+	for _, n := range jsonNames(pendingDir) {
+		p := filepath.Join(pendingDir, n)
+		var job InputJob
+		if err := ReadJSON(p, &job); err != nil {
+			continue
+		}
+		allow, remember, ok := parseDecision(job.Source.Content)
+		if !ok {
+			continue // chatter → skip; keep scanning for a real y/n
+		}
+		// Write the decision (idempotent), clear the live pending request so the
+		// gate hook unblocks, GC stale orphans, then archive the reply.
+		if err := resolvePermission(root, id, allow, remember); err != nil {
+			return false, err
+		}
+		_ = os.Remove(pathIn(root, "permissions", "pending", id+".json"))
+		gcOrphanPermissions(root, "")
+		_ = moveFile(p, pathIn(root, "inbox", "done", n))
+		return true, nil
 	}
-	var job InputJob
-	if err := ReadJSON(pendingPath, &job); err != nil {
-		return false, nil // malformed → leave it for the worker to fail properly
-	}
-	allow, remember, ok := parseDecision(job.Source.Content)
-	if !ok {
-		return false, nil // not a y/n → leave for normal injection once the turn ends
-	}
-	// Write the decision first (idempotent), then clear the pending request so the
-	// gate hook unblocks, then archive the reply so it isn't re-injected later.
-	if err := resolvePermission(root, id, allow, remember); err != nil {
-		return false, err
-	}
-	_ = os.Remove(pathIn(root, "permissions", "pending", id+".json"))
-	gcOrphanPermissions(root, "") // live gate's marker already removed; sweep stale orphans
-	name := filepath.Base(pendingPath)
-	_ = moveFile(pendingPath, pathIn(root, "inbox", "done", name))
-	return true, nil
+	return false, nil // no y/n anywhere in the queue yet → keep waiting
 }
 
 // maxJobAttempts bounds inject retries before a job is moved to failed.
