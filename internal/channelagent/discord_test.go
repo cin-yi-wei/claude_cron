@@ -169,6 +169,38 @@ func TestDiscordSenderRetriesOn429(t *testing.T) {
 	}
 }
 
+func TestDiscordSenderBudgetBoundsPersistent429(t *testing.T) {
+	// A channel stuck in a persistent 429 must not block longer than the send
+	// budget: the activity ticker sweeps bindings sequentially in one goroutine,
+	// so an unbounded retry loop here would stall live activity for every other
+	// binding. The budget cuts the retries short and drops the message.
+	old := discordSendBudget
+	discordSendBudget = 150 * time.Millisecond
+	defer func() { discordSendBudget = old }()
+
+	var calls int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"message":"rate limited","retry_after":0.05,"global":false}`))
+	}))
+	defer server.Close()
+
+	start := time.Now()
+	err := DiscordSender{BaseURL: server.URL + "/api/v10", Token: "tok", ChannelID: "cbudget"}.Send(context.Background(), OutputJob{Send: true, Text: "hi"})
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("Send should fail when the channel is persistently rate limited")
+	}
+	if elapsed > discordSendBudget+time.Second {
+		t.Fatalf("Send blocked %v, want within budget (%v) + margin", elapsed, discordSendBudget)
+	}
+	if got := atomic.LoadInt32(&calls); got >= discordMaxSendAttempts {
+		t.Fatalf("budget should cut retries short, but ran %d attempts (max %d)", got, discordMaxSendAttempts)
+	}
+}
+
 func TestParseRetryAfter(t *testing.T) {
 	mk := func(body, header string) *http.Response {
 		r := &http.Response{Header: http.Header{}, Body: http.NoBody}

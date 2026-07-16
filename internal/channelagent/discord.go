@@ -157,6 +157,17 @@ const (
 	discordRetryCap        = 5 * time.Second
 )
 
+// discordSendBudget bounds the TOTAL wall-clock one postMessage may spend across
+// all its retries. The activity ticker sweeps every binding sequentially in a
+// single goroutine (RunActivityStreamOnce, main.go), so without a cap a
+// persistent 429 (~6×5s=30s) or a hung TCP connection (~6×15s=90s+) on ONE
+// channel would block live-activity streaming for ALL bindings — violating
+// Send's "a hung send must not stall the activity ticker" invariant (see the
+// note at s.Client above). The budget clamps that worst case; on expiry the
+// message is dropped, the same outcome as the pre-retry single-POST path but
+// after a bounded wait. Overridable in tests.
+var discordSendBudget = 12 * time.Second
+
 // postMessage POSTs one ≤2000-char message, pacing via the per-channel throttle
 // and honouring Discord 429 rate limits: on 429 it reads retry_after and waits
 // that long before retrying, instead of dropping the message. Before this, the
@@ -164,6 +175,10 @@ const (
 // messages were lost (diff cards vanished, replies delayed). Non-429 HTTP errors
 // return immediately (retrying won't help).
 func (s DiscordSender) postMessage(ctx context.Context, client *http.Client, baseURL string, body []byte) error {
+	// Cap the total time all retries may block, so one rate-limited/hung channel
+	// can't stall the sequential activity ticker for every other binding.
+	ctx, cancel := context.WithTimeout(ctx, discordSendBudget)
+	defer cancel()
 	var lastErr error
 	for attempt := 0; attempt < discordMaxSendAttempts; attempt++ {
 		discordThrottle(ctx, s.ChannelID)
