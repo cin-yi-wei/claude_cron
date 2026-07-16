@@ -40,6 +40,31 @@ func classifyScreen(pane string) ScreenState {
 			return ScreenLogin
 		}
 	}
+	// The "Select login method" menu (/login step before the OAuth URL) is part of
+	// the login flow — classify it as login so the auth watchdog drives it (picks
+	// the subscription option). Require the subscription line too so a random
+	// numbered list can't match. Checked BEFORE the confirm-dialog detector, which
+	// would otherwise capture this numbered menu as a generic confirm prompt.
+	if strings.Contains(low, "select login method") && strings.Contains(low, "subscription") {
+		return ScreenLogin
+	}
+	// Two POST-login screens that gate a freshly-authed session before it's usable.
+	// Both are part of the login flow → classify as login so handleLoginScreen
+	// auto-advances them (Enter / trust). Without this, a pasted code completes auth
+	// but the session sits on these forever and never processes messages.
+	if paneAwaitingLoginContinue(low) || paneAwaitingManagedSettings(low) {
+		return ScreenLogin
+	}
+	// The OAuth-URL / "Paste code here" screen (shown after the method menu when the
+	// browser callback can't be reached — our headless/SSH case). This is where the
+	// login URL must be relayed to the channel and the pasted code typed back. It
+	// carries none of the phrases above, so without this branch classifyScreen falls
+	// through to Idle/Unknown, handleLoginScreen never runs, and the URL is never
+	// relayed — the session sits on the paste prompt forever. Match on the paste
+	// prompt OR a live OAuth URL in the pane.
+	if paneAwaitingPasteCode(s) || extractLoginURL(s) != "" {
+		return ScreenLogin
+	}
 	// "Please run /login" is trickier: Claude ALSO prefixes it onto transient
 	// network errors, e.g. "● Please run /login · API Error: 401 The socket
 	// connection was closed unexpectedly". Auth is fine there — only the socket
@@ -87,6 +112,92 @@ func classifyScreen(pane string) ScreenState {
 		return ScreenIdle
 	}
 	return ScreenUnknown
+}
+
+// loginURLRE matches the OAuth authorize URL Claude prints when the browser
+// callback can't be reached (headless/SSH/container) and it falls back to the
+// "paste the code" flow. The REAL URL host observed on Claude Code v2.1.201 is
+// claude.com/cai/oauth/authorize (verified from a live login pane screenshot);
+// older/alt hosts claude.ai and console.anthropic.com are covered too. Anchored
+// on the oauth/authorize path so an arbitrary logged URL in scrollback isn't
+// mistaken for the login URL.
+var loginURLRE = regexp.MustCompile(`https://(?:claude\.(?:com|ai)|console\.anthropic\.com)/[^\s"'<>]*(?:oauth|authorize)[^\s"'<>]*`)
+
+// extractLoginURL returns the OAuth login URL from a pane snapshot, or "" if the
+// pane isn't showing one. Used by the re-login flow to relay the URL to the
+// channel so a human can complete auth and paste the code back.
+//
+// The OAuth URL (~277 chars) is far longer than the pane width, and Claude's Ink
+// TUI renders it by absolute cursor positioning — each visual row is a SEPARATE
+// pane line, NOT a soft-wrap. So `capture-pane -J` (which only rejoins
+// soft-wrapped lines) can't stitch it, and a plain regex over the snapshot grabs
+// only the first row → a truncated URL (verified in prod: cut at one 80-col row).
+// Reconstruct instead: find the row that starts the URL, then greedily append the
+// following rows that are pure URL continuation (non-empty, no interior
+// whitespace) until a blank line or a line with spaces (e.g. "Paste code here").
+func extractLoginURL(pane string) string {
+	s := stripANSI(pane)
+	lines := strings.Split(s, "\n")
+	for i, ln := range lines {
+		idx := strings.Index(ln, "https://")
+		if idx < 0 {
+			continue
+		}
+		// Start of the URL on this row. If more (space-separated) text follows on
+		// the same row, the URL ends at that space.
+		first := strings.TrimRight(ln[idx:], " \t\r")
+		if sp := strings.IndexAny(first, " \t"); sp >= 0 {
+			first = first[:sp]
+		}
+		var b strings.Builder
+		b.WriteString(first)
+		// Append hard-wrapped continuation rows.
+		for j := i + 1; j < len(lines); j++ {
+			ct := strings.TrimSpace(lines[j])
+			if ct == "" || strings.ContainsAny(ct, " \t") {
+				break // blank or contains spaces → past the end of the URL
+			}
+			b.WriteString(ct)
+		}
+		if m := loginURLRE.FindString(b.String()); m != "" {
+			return m
+		}
+	}
+	// Fallback: single-line match anywhere in the snapshot.
+	return loginURLRE.FindString(s)
+}
+
+// paneAwaitingLoginContinue reports whether the pane is at the post-login
+// "Login successful. Press Enter to continue…" screen (arg is ANSI-stripped
+// lowercase). Advancing = send Enter.
+func paneAwaitingLoginContinue(low string) bool {
+	return strings.Contains(low, "login successful") && strings.Contains(low, "press enter to continue")
+}
+
+// paneAwaitingManagedSettings reports whether the pane is at Claude's
+// "Managed settings require approval" gate (hooks trust) shown on boot after
+// login (arg is ANSI-stripped lowercase). Advancing = pick "1. Yes, I trust".
+func paneAwaitingManagedSettings(low string) bool {
+	return strings.Contains(low, "managed settings require approval") &&
+		strings.Contains(low, "trust these settings")
+}
+
+// paneAwaitingLoginMethod reports whether the pane is at Claude's "Select login
+// method" menu (shown right after /login, before the OAuth URL). We must pick
+// option 1 (Claude subscription) to advance to the URL. Require both the header
+// and the subscription option so ordinary text can't trip it.
+func paneAwaitingLoginMethod(pane string) bool {
+	low := strings.ToLower(stripANSI(pane))
+	return strings.Contains(low, "select login method") &&
+		strings.Contains(low, "subscription")
+}
+
+// paneAwaitingPasteCode reports whether the pane is at Claude's "Paste code here"
+// prompt — the state where sending the OAuth code (send-keys) completes login.
+func paneAwaitingPasteCode(pane string) bool {
+	low := strings.ToLower(stripANSI(pane))
+	return strings.Contains(low, "paste code here") || strings.Contains(low, "paste the code") ||
+		(strings.Contains(low, "paste") && strings.Contains(low, "code") && strings.Contains(low, "prompted"))
 }
 
 // lastPromptLineSeen reports whether a "❯" input line exists in the snapshot.

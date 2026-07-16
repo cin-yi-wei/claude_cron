@@ -111,6 +111,27 @@ func (i TmuxInjector) LooksGlitched(ctx context.Context) bool {
 	return classifyScreen(pane) == ScreenGlitch
 }
 
+// SessionWorking reports whether the pane is occupied — generating/running a
+// tool (spinner), or showing a confirm/login prompt — i.e. NOT a plain idle
+// prompt. The hung-turn watchdog (waitOutput) treats "not working" + no reply as
+// a stall. Capture failure returns true (can't tell → don't declare a stall).
+func (i TmuxInjector) SessionWorking(ctx context.Context) bool {
+	pane, err := runExternalCommandOutput(ctx, "tmux", "capture-pane", "-pt", i.Session)
+	if err != nil {
+		// Cannot read the pane (session dead / tmux unreachable) = not making
+		// progress → let the watchdog release the lock and requeue. A transient
+		// blip self-heals: the stall needs stallWindow of *consecutive*
+		// not-working observations, which one momentary error never accumulates.
+		return false
+	}
+	switch classifyScreen(pane) {
+	case ScreenWorking, ScreenConfirm, ScreenLogin:
+		return true
+	default:
+		return false
+	}
+}
+
 // typeAndSubmit runs the one recipe observed to reliably submit in the Claude
 // TUI: Ctrl-C to clear the box, the prompt as a literal paste, a pause for the
 // long paste to settle, then a SEPARATE Enter.
@@ -148,6 +169,59 @@ func (i TmuxInjector) paneBusy(ctx context.Context) bool {
 		return true
 	}
 	return false
+}
+
+// PasteLoginCode types an OAuth code into the session's "Paste code here" prompt
+// and submits it. Unlike typeAndSubmit it does NOT send C-c first: the login
+// paste field is not the chat input box, and a C-c there could cancel the login
+// flow. Just insert the code literally and press Enter. (loginPaster capability.)
+func (i TmuxInjector) PasteLoginCode(ctx context.Context, code string) error {
+	if err := runExternalCommand(ctx, "tmux", "send-keys", "-t", i.Session, "-l", code); err != nil {
+		return err
+	}
+	time.Sleep(injectSubmitDelay)
+	return runExternalCommand(ctx, "tmux", "send-keys", "-t", i.Session, "Enter")
+}
+
+// SendLogin types the `/login` slash command into the session to summon the
+// OAuth flow. On a "Please run /login" screen the login URL does NOT appear until
+// /login is actually run; the supervisor calls this first, then next cycle the
+// URL is on the pane for extractLoginURL to relay. (loginTyper capability.)
+func (i TmuxInjector) SendLogin(ctx context.Context) error {
+	if err := runExternalCommand(ctx, "tmux", "send-keys", "-t", i.Session, "-l", "/login"); err != nil {
+		return err
+	}
+	time.Sleep(injectSubmitDelay)
+	return runExternalCommand(ctx, "tmux", "send-keys", "-t", i.Session, "Enter")
+}
+
+// SelectLoginSubscription picks option 1 (Claude subscription) on the "Select
+// login method" menu that appears after /login, advancing to the OAuth URL.
+// (loginMethodSelector capability.)
+func (i TmuxInjector) SelectLoginSubscription(ctx context.Context) error {
+	if err := runExternalCommand(ctx, "tmux", "send-keys", "-t", i.Session, "-l", "1"); err != nil {
+		return err
+	}
+	time.Sleep(injectSubmitDelay)
+	return runExternalCommand(ctx, "tmux", "send-keys", "-t", i.Session, "Enter")
+}
+
+// PressEnter sends a bare Enter — advances the post-login "Press Enter to
+// continue" screen. (loginContinuer capability.)
+func (i TmuxInjector) PressEnter(ctx context.Context) error {
+	return runExternalCommand(ctx, "tmux", "send-keys", "-t", i.Session, "Enter")
+}
+
+// SelectTrustSettings picks "1. Yes, I trust these settings" on the managed-
+// settings/hooks approval gate that Claude shows on boot after login.
+// (managedSettingsTruster capability.) The ❯ cursor already defaults to option
+// 1, so send 1 then Enter to be explicit.
+func (i TmuxInjector) SelectTrustSettings(ctx context.Context) error {
+	if err := runExternalCommand(ctx, "tmux", "send-keys", "-t", i.Session, "-l", "1"); err != nil {
+		return err
+	}
+	time.Sleep(injectSubmitDelay)
+	return runExternalCommand(ctx, "tmux", "send-keys", "-t", i.Session, "Enter")
 }
 
 // inputBoxHasText reports whether the Claude TUI's input box (the bottom-most

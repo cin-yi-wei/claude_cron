@@ -22,6 +22,10 @@ func RunServeOnce(ctx context.Context, root string, ingester Ingester, injector 
 	// in a gate timeout/deny ("I replied y but it died"). This out-of-band step is
 	// a no-op unless a permission is actually pending. Best-effort.
 	_, _ = ResolvePendingDecisionOnce(root)
+	// Same out-of-band pattern for a pending paste-code re-login: if the user
+	// replied `code: <value>` and a re-login is pending, type it into the session's
+	// "Paste code here" prompt before the worker runs. No-op otherwise.
+	_, _ = ResolvePendingReloginOnce(root, injector)
 	processed, werr := RunWorkerOnce(ctx, root, injector, timeout)
 	// ALWAYS flush the outbox, even if the worker errored or its claude.lock was
 	// held by a still-running (long) worker from a prior cycle. A session blocked

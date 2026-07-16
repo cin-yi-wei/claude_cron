@@ -126,12 +126,19 @@ func (s DiscordSender) Send(ctx context.Context, output OutputJob) error {
 		client = httpClient15s // bounded: a hung send must not stall the activity ticker
 	}
 	// Send the text as-is (plain ```diff fences). We used to rewrite ```diff→```ansi
-	// for red/green colour, but the \x1b escape codes leaked as literal "[32m"/"[0m"
-	// text whenever a long diff was chunked (the ansi fence split mid-block) — see
-	// the broken cards 2026-06-27. Discord's native ```diff highlight has no escape
-	// codes to leak, so it survives chunking cleanly. Chunk so every POST is ≤2000.
-	for _, content := range chunkDiscord(output.Text, 2000) {
-		body, err := json.Marshal(map[string]string{"content": content})
+	// for red/green colour (discordColorDiff), but the \x1b escape codes leaked as
+	// literal "[32m"/"[0m" whenever a long diff was chunked (the ansi fence split
+	// mid-block) — see the broken cards 2026-06-27. Discord's native ```diff has no
+	// escape codes to leak, so it survives chunking cleanly. Chunk so every POST is
+	// ≤2000; button components ride the LAST chunk so they render under the full
+	// message.
+	chunks := chunkDiscord(output.Text, 2000)
+	for i, content := range chunks {
+		var comps []any
+		if i == len(chunks)-1 {
+			comps = output.Components
+		}
+		body, err := buildDiscordSendBody(content, comps)
 		if err != nil {
 			return err
 		}
@@ -263,6 +270,49 @@ func discordThrottle(ctx context.Context, channelID string) {
 	discordNextSend[channelID] = next.Add(discordMinInterval)
 	discordSendMu.Unlock()
 	sleepCtx(ctx, wait)
+}
+
+// buildDiscordSendBody builds the JSON body for POST /channels/{ch}/messages.
+// Components 為空時只帶 content（行為與舊版相同）；非空時夾帶 "components"（按鈕）。
+func buildDiscordSendBody(content string, components []any) ([]byte, error) {
+	m := map[string]any{"content": content}
+	if len(components) > 0 {
+		m["components"] = components
+	}
+	return json.Marshal(m)
+}
+
+// ackInteraction 回覆一個 Discord 元件互動（3 秒內必回，否則 Discord 顯示「互動
+// 失敗」）。用 type 7（UPDATE_MESSAGE）就地改寫原本的權限請求訊息、移除按鈕並
+// 貼上結果，避免使用者重複點按。用 bot token + DiscordBot User-Agent。
+func ackInteraction(ctx context.Context, baseURL, token, interactionID, interactionToken, content string, client *http.Client) error {
+	if baseURL == "" {
+		baseURL = defaultDiscordBaseURL
+	}
+	if client == nil {
+		client = httpClient15s
+	}
+	body, err := json.Marshal(map[string]any{
+		"type": 7, // UPDATE_MESSAGE：編輯觸發互動的那則訊息
+		"data": map[string]any{"content": content, "components": []any{}},
+	})
+	if err != nil {
+		return err
+	}
+	endpoint := baseURL + "/interactions/" + url.PathEscape(interactionID) + "/" + url.PathEscape(interactionToken) + "/callback"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bot "+token)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "DiscordBot (https://github.com/claude_cron, 1.0)")
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	return checkHTTPResponse(resp)
 }
 
 // chunkDiscord splits content into pieces ≤ max runes, breaking on line

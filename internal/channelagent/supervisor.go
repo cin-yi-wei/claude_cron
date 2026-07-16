@@ -17,6 +17,7 @@ var (
 	unboundAnnouncedAt = map[string]time.Time{}
 	loginNotifiedAt    = map[string]time.Time{}
 	loginRestartedAt   = map[string]time.Time{}
+	loginCodeAppliedAt = map[string]time.Time{} // binding → when we last typed a pasted code
 
 	confirmPostedMu   sync.Mutex
 	confirmPostedHash = map[string]string{} // binding → hash of last confirm posted
@@ -110,6 +111,27 @@ func loginRestartAllowed(binding string) bool {
 	return true
 }
 
+// loginCodeGrace is how long after typing a pasted code we refuse to restart the
+// session — the OAuth exchange + reaching the post-login screen takes several
+// seconds, and a restart in that window throws away the just-completed login (the
+// "code went in, then it bounced back to login" failure).
+const loginCodeGrace = 90 * time.Second
+
+func markLoginCodeApplied(binding string) {
+	unboundAnnounceMu.Lock()
+	loginCodeAppliedAt[binding] = time.Now()
+	unboundAnnounceMu.Unlock()
+}
+
+// withinLoginCodeGrace reports whether we typed a code for this binding recently
+// enough that we should let the login settle instead of restarting.
+func withinLoginCodeGrace(binding string) bool {
+	unboundAnnounceMu.Lock()
+	defer unboundAnnounceMu.Unlock()
+	t, ok := loginCodeAppliedAt[binding]
+	return ok && time.Since(t) < loginCodeGrace
+}
+
 // capturePane returns the tmux pane snapshot for a session (empty on error).
 func capturePane(ctx context.Context, session string) string {
 	out, err := runExternalCommandOutput(ctx, "tmux", "capture-pane", "-pt", session)
@@ -117,6 +139,144 @@ func capturePane(ctx context.Context, session string) string {
 		return ""
 	}
 	return out
+}
+
+// capturePaneJoined captures the pane with -J so wrapped lines are rejoined into
+// one logical line. The OAuth login URL is far longer than the pane width, so a
+// plain capture splits it across rows and extractLoginURL (which stops at
+// whitespace/newline) grabs only the first row → a truncated URL. -J glues the
+// wrapped rows back together so the whole URL is on one line. Falls back to the
+// plain snapshot if the join capture fails.
+func capturePaneJoined(ctx context.Context, session string) string {
+	out, err := runExternalCommandOutput(ctx, "tmux", "capture-pane", "-pJt", session)
+	if err != nil || strings.TrimSpace(out) == "" {
+		return capturePane(ctx, session)
+	}
+	return out
+}
+
+// handleLoginScreen runs the full auth watchdog for a binding whose pane is
+// classified ScreenLogin. Returns true if it acted (the caller should `continue`
+// / skip normal processing this cycle). Shared by BOTH the worker loop and the
+// control-binding loop so control planes (dc/tg/web) get the same auto re-login
+// as workers — previously the login watchdog lived only in the worker loop,
+// which skips control bindings, so control planes had NO login handling at all.
+func handleLoginScreen(ctx context.Context, b Binding, cfg Config, token string, pane string, stdout io.Writer) bool {
+	low := strings.ToLower(stripANSI(pane))
+	inj := TmuxInjector{Session: b.TmuxSession, Root: b.Root, AutoStart: true}
+	// POST-login gates — these appear AFTER auth succeeds and block an otherwise
+	// logged-in session from becoming usable. Handle them FIRST (before any creds
+	// check / restart / grace), because auth is already fine here; the session just
+	// needs a keypress to proceed. Without this the whole re-login flow "succeeds"
+	// but the session sits on these screens and never processes messages.
+	if paneAwaitingManagedSettings(low) {
+		if t, ok := interface{}(inj).(managedSettingsTruster); ok {
+			if err := t.SelectTrustSettings(ctx); err == nil {
+				markLoginCodeApplied(b.Name) // keep the no-restart grace so it can settle
+				fmt.Fprintf(stdout, "binding %s: approved managed-settings (hooks) trust gate\n", b.Name)
+				return true
+			}
+		}
+	}
+	if paneAwaitingLoginContinue(low) {
+		if c, ok := interface{}(inj).(loginContinuer); ok {
+			if err := c.PressEnter(ctx); err == nil {
+				markLoginCodeApplied(b.Name)
+				fmt.Fprintf(stdout, "binding %s: pressed Enter on post-login continue screen\n", b.Name)
+				return true
+			}
+		}
+	}
+	// Just typed a code — let the OAuth exchange finish + the post-login screen
+	// appear. Restarting now (which the "creds look fresh" branch would do once the
+	// pending is cleared) throws away the just-completed login. Hold during grace.
+	if withinLoginCodeGrace(b.Name) {
+		fmt.Fprintf(stdout, "binding %s: login settling after your code (no restart)\n", b.Name)
+		return true
+	}
+
+	// A paste-code re-login in flight (URL relayed, not yet stale).
+	if hasPendingRelogin(b.Root) && !reloginRequestStale(b.Root) {
+		// CRITICAL: apply the user's `code: <value>` reply HERE. The worker loop
+		// `continue`s on a login screen and never reaches RunServeOnce — the only
+		// other place ResolvePendingReloginOnce runs — so without this call a pasted
+		// code is NEVER parsed or typed into the session: the pane sits at the
+		// "Paste code here" prompt forever while the user swears they replied. Run
+		// the resolver directly with this binding's own tmux injector.
+		injector := TmuxInjector{Session: b.TmuxSession, Root: b.Root, AutoStart: true}
+		if consumed, err := ResolvePendingReloginOnce(b.Root, injector); consumed {
+			markLoginCodeApplied(b.Name) // grace window: don't restart while login settles
+			fmt.Fprintf(stdout, "binding %s: typed your pasted login code into the session\n", b.Name)
+			return true
+		} else if err != nil {
+			fmt.Fprintf(stdout, "binding %s: error applying pasted code: %v\n", b.Name, err)
+		}
+		// No code reply yet → HOLD (do not restart / re-/login): a restart kills the
+		// PKCE verifier and invalidates the URL/code the user is completing now.
+		fmt.Fprintf(stdout, "binding %s re-login pending — waiting for your code (no restart)\n", b.Name)
+		return true
+	}
+
+	// An ACTIVE login screen is in progress on the pane — the method menu, or the
+	// OAuth URL / "Paste code here" prompt. Drive it (pick subscription / relay the
+	// URL) BEFORE the creds-valid restart branch below. Restarting here would throw
+	// away the user's in-flight /login (kills the PKCE verifier, invalidates the
+	// URL/code) even though creds "look" valid — which is exactly what happens when a
+	// still-authed session is re-/login'd for a controlled test. When the pane is a
+	// bare "Not logged in" with no URL, both checks are no-ops and we fall through to
+	// the restart/auto-/login logic unchanged.
+	if paneAwaitingLoginMethod(pane) {
+		lm := TmuxInjector{Session: b.TmuxSession, Root: b.Root, AutoStart: true}
+		if sel, ok := interface{}(lm).(loginMethodSelector); ok {
+			if err := sel.SelectLoginSubscription(ctx); err == nil {
+				fmt.Fprintf(stdout, "binding %s login: picked subscription on method menu\n", b.Name)
+				return true
+			}
+		}
+	}
+	if url := extractLoginURL(capturePaneJoined(ctx, b.TmuxSession)); url != "" {
+		if reloginRequestStale(b.Root) {
+			clearReloginRequest(b.Root, b.Name)
+		}
+		if recordReloginRequest(b.Root, b.Name, url) {
+			fmt.Fprintf(stdout, "binding %s login expired — relayed paste-code re-login URL to channel\n", b.Name)
+			if s, serr := SelectSender(b, cfg, bindingTokens{discord: token, telegram: os.Getenv(cfg.Telegram.TokenEnv)}); serr == nil {
+				_, _ = RunSenderOnce(ctx, b.Root, s)
+			}
+		}
+		return true
+	}
+
+	valid, ok := claudeCredsValid()
+	if claudeOAuthTokenConfigured() || (ok && valid) {
+		// Creds LOOK fresh (env token set, or the creds file exists and isn't
+		// timestamp-expired) → a restart may re-read valid auth. Try that ONCE
+		// (rate-limited). BUT the creds file can be present-yet-rejected
+		// server-side (the account was logged out): the file looks fresh, so the
+		// old code restarted forever and never relayed a re-login URL — the
+		// session was stuck in a "Not logged in" restart loop. So: if we've
+		// ALREADY spent our restart this cooldown and the pane is STILL a login
+		// screen, the restart demonstrably didn't help → treat the token as
+		// actually invalid and FALL THROUGH to the paste-code relay path below.
+		if loginRestartAllowed(b.Name) {
+			_ = StopTmuxSession(ctx, b.TmuxSession)
+			fmt.Fprintf(stdout, "binding %s login screen — restarting to re-read auth (creds look fresh)\n", b.Name)
+			return true
+		}
+		fmt.Fprintf(stdout, "binding %s still login after fresh-creds restart — token effectively invalid, relaying re-login\n", b.Name)
+		// fall through: pick method menu / extract URL / auto-/login / notify.
+	}
+	// No URL yet: a bare "Please run /login" screen shows no URL until /login is
+	// run. Auto-type /login (rate-limited) so next cycle the URL appears + relays.
+	li := TmuxInjector{Session: b.TmuxSession, Root: b.Root, AutoStart: true}
+	if lt, ok := interface{}(li).(loginTyper); ok && autoLoginAllowed(b.Name) {
+		if err := lt.SendLogin(ctx); err == nil {
+			fmt.Fprintf(stdout, "binding %s login expired, no URL yet — auto-typed /login to summon OAuth URL\n", b.Name)
+			return true
+		}
+	}
+	notifyLoginNeeded(ctx, cfg, token, b.Name)
+	return true
 }
 
 const loginNotifyCooldown = 20 * time.Minute
@@ -294,7 +454,28 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 			}
 			return nil // unknown channel → dropped
 		}
-		push.Ensure("__dc_demux__", DiscordGatewayIngester{Token: token, Route: dcRoute}, func(e error) {
+		// Permission-button clicks arrive as INTERACTION_CREATE on the same demux.
+		// Resolve the request id from the button custom_id, write the decision to
+		// the matching binding, and ACK within 3s (edits the prompt to the result,
+		// drops the buttons). Without this wiring g.Interact is nil and the click
+		// shows "此交互失敗".
+		dcInteract := func(ctx context.Context, it gatewayInteraction) error {
+			reg2, err := LoadRegistry(root)
+			if err != nil {
+				return nil
+			}
+			line, name, id, ok := applyPermissionInteraction(reg2, it.ChannelID, it.Data.CustomID)
+			if !ok {
+				return nil // not a permission button / unknown channel → ignore
+			}
+			if err := ackInteraction(ctx, defaultDiscordBaseURL, token, it.ID, it.Token, line, httpClient15s); err != nil {
+				fmt.Fprintf(stdout, "permission button ack failed for %s (binding %s): %v\n", id, name, err)
+				return nil
+			}
+			fmt.Fprintf(stdout, "permission button: %s -> %s (binding %s)\n", it.Data.CustomID, id, name)
+			return nil
+		}
+		push.Ensure("__dc_demux__", DiscordGatewayIngester{Token: token, Route: dcRoute, Interact: dcInteract}, func(e error) {
 			if e != nil {
 				fmt.Fprintf(stdout, "discord gateway demux exited (restarts next cycle): %v\n", e)
 			}
@@ -350,6 +531,15 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 		if err := StartControlSession(ctx, b.TmuxSession, b.Worktree, root, tokenEnv, tokenVal, controlSystemPrompt(root, b.Worktree, b.Name)); err != nil {
 			fmt.Fprintf(stdout, "control-binding[%s] session error: %v\n", b.Name, err)
 			continue
+		}
+		// Auth watchdog for CONTROL planes (dc/tg/web) — same shared handler the
+		// worker loop uses. Without this, control planes had zero login handling:
+		// on creds expiry they'd sit at a login screen forever. Now they auto-/login
+		// + relay the paste-code URL to their own channel like any binding.
+		if lpane := capturePane(ctx, b.TmuxSession); classifyScreen(lpane) == ScreenLogin {
+			if handleLoginScreen(ctx, b, cfg, token, lpane, stdout) {
+				continue
+			}
 		}
 		inj := TmuxInjector{Session: b.TmuxSession, Root: b.Root, AutoStart: false}
 		readyControls = append(readyControls, readyControl{b: b, inj: inj, snd: snd})
@@ -462,23 +652,7 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 			}
 		}
 		if screen == ScreenLogin {
-			valid, ok := claudeCredsValid()
-			// A configured long-lived OAuth token is injected into every session at
-			// (re)start, so a restart re-reads valid auth without any human /login.
-			// Same when the shared creds file is itself fresh. Only nag for /login
-			// when there is NO token AND the creds are also expired — the one case a
-			// restart genuinely can't fix.
-			if claudeOAuthTokenConfigured() || (ok && valid) {
-				// Restart so the session re-reads fresh auth — but rate-limited, so a
-				// login screen that a restart does NOT clear can't loop-kill it.
-				if loginRestartAllowed(b.Name) {
-					_ = StopTmuxSession(ctx, b.TmuxSession)
-					fmt.Fprintf(stdout, "binding %s login screen — restarting to re-read auth (token/creds fresh)\n", b.Name)
-					continue
-				}
-				fmt.Fprintf(stdout, "binding %s login screen but within restart cooldown — leaving session\n", b.Name)
-			} else {
-				notifyLoginNeeded(ctx, cfg, token, b.Name)
+			if handleLoginScreen(ctx, b, cfg, token, pane, stdout) {
 				continue
 			}
 		}

@@ -224,9 +224,9 @@ func RunPermissionGate(ctx context.Context, registryRoot string, in io.Reader, o
 		fmt.Fprint(out, hookDecisionJSON(false, "permission gate: cannot record request"))
 		return nil
 	}
-	msg := fmt.Sprintf("🔐 權限請求：session 想執行 %s\n```\n%s\n```\n回 y 允許一次 / ya 允許並記住這類 / n 拒絕（逾時自動拒絕）", hi.ToolName, detail)
+	msg := fmt.Sprintf("🔐 權限請求：session 想執行 %s\n```\n%s\n```\n點下方按鈕，或回 y 允許一次 / ya 允許並記住這類 / n 拒絕（逾時自動拒絕）", hi.ToolName, detail)
 	_ = AtomicWriteJSON(pathIn(b.Root, "outbox", "pending", "perm-"+id+".json"),
-		OutputJob{Schema: 1, JobID: "perm-" + id, Send: true, Text: msg})
+		OutputJob{Schema: 1, JobID: "perm-" + id, Send: true, Text: msg, Components: permissionButtons(id)})
 
 	// Block for the decision (written by the worker when the user replies).
 	allow, remember, decided := waitDecision(ctx, b.Root, id, timeout)
@@ -278,9 +278,116 @@ func oldestPendingPermission(root string) string {
 	return strings.TrimSuffix(filepath.Base(p), ".json")
 }
 
+// newestPendingPermission returns the id of the NEWEST pending permission
+// request, or "" if none. The Claude session is single-threaded, so at most one
+// gate hook is ever actually blocked/waiting — and it is the most recent one.
+// Any older pending files are orphans left by gate hooks that were killed
+// (Claude Code's exec-timeout, a session restart, a cancelled tool) before they
+// could remove their own pending marker. Resolving the OLDEST (as the code used
+// to) sent the user's y/n to a dead orphan while the live gate starved to a
+// timeout-deny — the "I replied y but it kept getting blocked" race. Resolve the
+// newest instead so the decision always reaches the gate that is actually waiting.
+func newestPendingPermission(root string) string {
+	names := jsonNames(permPendingDir(root))
+	if len(names) == 0 {
+		return ""
+	}
+	return strings.TrimSuffix(names[len(names)-1], ".json")
+}
+
+// gcOrphanPermissions removes every pending permission marker except keepID.
+// Called when a decision is applied to the live (newest) request: all older
+// markers are provably dead orphans (single-threaded session), so clearing them
+// stops the pile-up that keeps poisoning future y/n resolution.
+func gcOrphanPermissions(root, keepID string) {
+	for _, n := range jsonNames(permPendingDir(root)) {
+		if strings.TrimSuffix(n, ".json") == keepID {
+			continue
+		}
+		_ = os.Remove(pathIn(permPendingDir(root), n))
+	}
+}
+
 // resolvePermission records the user's decision for a pending request id.
 func resolvePermission(root, id string, allow, remember bool) error {
 	return AtomicWriteJSON(pathIn(permDecisionDir(root), id+".json"), map[string]bool{"allow": allow, "remember": remember})
+}
+
+// permCustomIDPrefix 標記一個 Discord 元件互動屬於權限閘門。custom_id 格式為
+// `ccperm|<action>|<id>`（action ∈ allow/remember/deny，id 即 pending 標記的 id）。
+const permCustomIDPrefix = "ccperm"
+
+// permissionButtons 建立權限閘門的 action row（3 顆按鈕）。custom_id 直接綁定
+// 該次請求的 id，因此使用者按哪一顆就決定哪一個 gate，沒有 y/n 自由文字必須
+// 猜「最新 pending」的競態。id 長度遠小於 Discord custom_id 100 字上限。
+func permissionButtons(id string) []any {
+	btn := func(style int, label, action string) map[string]any {
+		return map[string]any{
+			"type":      2, // 2 = Button
+			"style":     style,
+			"label":     label,
+			"custom_id": permCustomIDPrefix + "|" + action + "|" + id,
+		}
+	}
+	return []any{
+		map[string]any{
+			"type": 1, // 1 = Action Row
+			"components": []any{
+				btn(3, "允許一次", "allow"),    // 3 = success（綠）
+				btn(1, "允許並記住", "remember"), // 1 = primary（藍紫）
+				btn(4, "拒絕", "deny"),        // 4 = danger（紅）
+			},
+		},
+	}
+}
+
+// parsePermissionCustomID 解析按鈕 custom_id。ok=false 表示不是權限閘門按鈕或格
+// 式不合法（呼叫端應忽略）。
+func parsePermissionCustomID(customID string) (action, id string, ok bool) {
+	parts := strings.SplitN(customID, "|", 3)
+	if len(parts) != 3 || parts[0] != permCustomIDPrefix {
+		return "", "", false
+	}
+	switch parts[1] {
+	case "allow", "remember", "deny":
+	default:
+		return "", "", false
+	}
+	if parts[2] == "" {
+		return "", "", false
+	}
+	return parts[1], parts[2], true
+}
+
+// applyPermissionInteraction 依按鈕 custom_id 把決定寫入對應 binding 的 decision
+// 檔（等待中的 gate hook 會讀到並放行/拒絕），並移除該 id 的 pending 標記。這是
+// 可單元測試的純函式：只吃 (registry, channelID, customID)，不碰 HTTP ACK。
+// 回傳 resultLine（給 ACK 顯示的結果文字）、binding 名稱、id、是否成功處理。
+func applyPermissionInteraction(reg Registry, channelID, customID string) (resultLine, name, id string, ok bool) {
+	action, pid, pok := parsePermissionCustomID(customID)
+	if !pok {
+		return "", "", "", false
+	}
+	b, bok := reg.BindingByChannel(channelID)
+	if !bok {
+		return "", "", "", false
+	}
+	var allow, remember bool
+	var line string
+	switch action {
+	case "allow":
+		allow, remember, line = true, false, "✅ 已允許"
+	case "remember":
+		allow, remember, line = true, true, "🧠 已允許並記住"
+	case "deny":
+		allow, remember, line = false, false, "❌ 已拒絕"
+	}
+	if err := resolvePermission(b.Root, pid, allow, remember); err != nil {
+		return "", "", "", false
+	}
+	// 移除這個 id 的 pending 標記（決定已寫入 decision 檔，等待中的 gate 會讀到）。
+	_ = os.Remove(pathIn(permPendingDir(b.Root), pid+".json"))
+	return line, b.Name, pid, true
 }
 
 func bindingByWorktree(reg Registry, cwd string) (Binding, bool) {
