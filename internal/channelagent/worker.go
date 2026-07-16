@@ -76,8 +76,9 @@ func RunWorkerOnce(ctx context.Context, root string, injector Injector, timeout 
 	// Permission-gate side-route: if a tool is waiting on the channel for
 	// approval and this message is a y/n decision, resolve it instead of
 	// injecting it into the session (the session is blocked in the hook).
-	if id := oldestPendingPermission(root); id != "" {
+	if id := newestPendingPermission(root); id != "" {
 		if allow, remember, ok := parseDecision(job.Source.Content); ok {
+			gcOrphanPermissions(root, id)
 			if err := resolvePermission(root, id, allow, remember); err != nil {
 				_ = moveFile(processingPath, pathIn(root, "inbox", "failed", name))
 				return true, err
@@ -167,7 +168,10 @@ func ResolvePendingDecisionOnce(root string) (bool, error) {
 	if err := Init(root); err != nil {
 		return false, err
 	}
-	id := oldestPendingPermission(root)
+	// Resolve the NEWEST pending request — the single live gate — not the oldest.
+	// Older markers are dead orphans; sending the decision there starves the live
+	// gate into a timeout-deny (the y/n race). See newestPendingPermission.
+	id := newestPendingPermission(root)
 	if id == "" {
 		return false, nil // nothing waiting → let the normal worker handle the inbox
 	}
@@ -189,6 +193,7 @@ func ResolvePendingDecisionOnce(root string) (bool, error) {
 		return false, err
 	}
 	_ = os.Remove(pathIn(root, "permissions", "pending", id+".json"))
+	gcOrphanPermissions(root, "") // live gate's marker already removed; sweep stale orphans
 	name := filepath.Base(pendingPath)
 	_ = moveFile(pendingPath, pathIn(root, "inbox", "done", name))
 	return true, nil
@@ -324,6 +329,24 @@ func oldestJSON(dir string) (string, error) {
 		return "", nil
 	}
 	return filepath.Join(dir, names[0]), nil
+}
+
+// jsonNames returns the .json basenames in dir, sorted ascending (ids are
+// timestamp-prefixed, so lexical order == chronological).
+func jsonNames(dir string) []string {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	var names []string
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		names = append(names, entry.Name())
+	}
+	sort.Strings(names)
+	return names
 }
 
 func moveFile(from, to string) error {

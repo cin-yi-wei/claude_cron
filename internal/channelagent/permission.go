@@ -278,6 +278,36 @@ func oldestPendingPermission(root string) string {
 	return strings.TrimSuffix(filepath.Base(p), ".json")
 }
 
+// newestPendingPermission returns the id of the NEWEST pending permission
+// request, or "" if none. The Claude session is single-threaded, so at most one
+// gate hook is ever actually blocked/waiting — and it is the most recent one.
+// Any older pending files are orphans left by gate hooks that were killed
+// (Claude Code's exec-timeout, a session restart, a cancelled tool) before they
+// could remove their own pending marker. Resolving the OLDEST (as the code used
+// to) sent the user's y/n to a dead orphan while the live gate starved to a
+// timeout-deny — the "I replied y but it kept getting blocked" race. Resolve the
+// newest instead so the decision always reaches the gate that is actually waiting.
+func newestPendingPermission(root string) string {
+	names := jsonNames(permPendingDir(root))
+	if len(names) == 0 {
+		return ""
+	}
+	return strings.TrimSuffix(names[len(names)-1], ".json")
+}
+
+// gcOrphanPermissions removes every pending permission marker except keepID.
+// Called when a decision is applied to the live (newest) request: all older
+// markers are provably dead orphans (single-threaded session), so clearing them
+// stops the pile-up that keeps poisoning future y/n resolution.
+func gcOrphanPermissions(root, keepID string) {
+	for _, n := range jsonNames(permPendingDir(root)) {
+		if strings.TrimSuffix(n, ".json") == keepID {
+			continue
+		}
+		_ = os.Remove(pathIn(permPendingDir(root), n))
+	}
+}
+
 // resolvePermission records the user's decision for a pending request id.
 func resolvePermission(root, id string, allow, remember bool) error {
 	return AtomicWriteJSON(pathIn(permDecisionDir(root), id+".json"), map[string]bool{"allow": allow, "remember": remember})
