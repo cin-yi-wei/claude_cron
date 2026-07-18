@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -13,7 +14,7 @@ import (
 func TestWaitOutputStallsWhenIdleNoReply(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "out.json")
 	start := time.Now()
-	_, err := waitOutput(context.Background(), p, 30*time.Second, func() bool { return false }, time.Second)
+	_, err := waitOutput(context.Background(), p, 30*time.Second, func() bool { return false }, time.Second, nil)
 	if !errors.Is(err, errStalled) {
 		t.Fatalf("want errStalled, got %v", err)
 	}
@@ -27,7 +28,7 @@ func TestWaitOutputStallsWhenIdleNoReply(t *testing.T) {
 // never errStalled.
 func TestWaitOutputWorkingNeverStalls(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "out.json")
-	_, err := waitOutput(context.Background(), p, 3*time.Second, func() bool { return true }, time.Second)
+	_, err := waitOutput(context.Background(), p, 3*time.Second, func() bool { return true }, time.Second, nil)
 	if errors.Is(err, errStalled) {
 		t.Fatal("a working turn must not be treated as stalled")
 	}
@@ -43,7 +44,7 @@ func TestWaitOutputReplyBeatsStall(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 		_ = AtomicWriteJSON(p, OutputJob{Schema: 1, Send: true, Text: "hi"})
 	}()
-	out, err := waitOutput(context.Background(), p, 10*time.Second, func() bool { return false }, time.Second)
+	out, err := waitOutput(context.Background(), p, 10*time.Second, func() bool { return false }, time.Second, nil)
 	if err != nil {
 		t.Fatalf("reply should win, got %v", err)
 	}
@@ -55,8 +56,21 @@ func TestWaitOutputReplyBeatsStall(t *testing.T) {
 // nil working fn = stall detection disabled → old full-timeout behavior preserved.
 func TestWaitOutputNilWorkingDisablesStall(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "out.json")
-	_, err := waitOutput(context.Background(), p, 2*time.Second, nil, time.Second)
+	_, err := waitOutput(context.Background(), p, 2*time.Second, nil, time.Second, nil)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("nil working should fall through to timeout, got %v", err)
+	}
+}
+
+// onProgress fires while the pane is working — the lock heartbeat. A working turn
+// must get at least one heartbeat before the ctx timeout so its lock stays fresh.
+func TestWaitOutputHeartbeatsWhileWorking(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "out.json")
+	var beats int32
+	_, _ = waitOutput(context.Background(), p, 3*time.Second, func() bool { return true }, time.Second, func() {
+		atomic.AddInt32(&beats, 1)
+	})
+	if atomic.LoadInt32(&beats) == 0 {
+		t.Fatal("expected the lock heartbeat to fire while working, got 0")
 	}
 }

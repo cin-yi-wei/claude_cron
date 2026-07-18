@@ -188,7 +188,7 @@ func RunWorkerOnce(ctx context.Context, root string, injector Injector, timeout 
 			return wi.SessionWorking(ctx) || oldestPendingPermission(root) != ""
 		}
 	}
-	output, err := waitOutput(ctx, outputPath, timeout, working, stallWindow)
+	output, err := waitOutput(ctx, outputPath, timeout, working, stallWindow, func() { _ = lock.Touch() })
 	if err != nil {
 		// A hung turn (no output + pane went idle): requeue for a clean retry and
 		// release the lock now, rather than holding it the whole timeout.
@@ -318,9 +318,12 @@ func ValidateOutput(job InputJob, output OutputJob) error {
 // the full `timeout` (which silences the channel; see INJECT_LOCK_FIX_SPEC.md).
 var errStalled = errors.New("turn stalled: no output and pane idle")
 
-// progressFn reports whether the session is actively working (spinner). nil
-// disables stall detection (full-timeout behavior preserved).
-func waitOutput(ctx context.Context, path string, timeout time.Duration, working func() bool, stallWindow time.Duration) (OutputJob, error) {
+// working reports whether the session is actively working (spinner); nil
+// disables stall detection (full-timeout behavior preserved). onProgress, if
+// non-nil, is called each time the session is observed working — used to
+// heartbeat the binding lock so a genuinely-progressing turn is never age-stolen
+// (see staleLockTimeout / FileLock.Touch).
+func waitOutput(ctx context.Context, path string, timeout time.Duration, working func() bool, stallWindow time.Duration, onProgress func()) (OutputJob, error) {
 	if timeout <= 0 {
 		timeout = time.Minute
 	}
@@ -356,6 +359,9 @@ func waitOutput(ctx context.Context, path string, timeout time.Duration, working
 		case <-stallC:
 			if working() {
 				lastProg = time.Now()
+				if onProgress != nil {
+					onProgress() // heartbeat the lock: this turn is alive + working
+				}
 			} else if time.Since(lastProg) > stallWindow {
 				return output, errStalled
 			}

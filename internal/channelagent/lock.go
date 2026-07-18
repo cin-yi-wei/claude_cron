@@ -16,20 +16,32 @@ type FileLock struct {
 	file *os.File
 }
 
-// staleLockTimeout bounds how long a lock may be held before a new acquirer
-// treats it (by AGE) as stale and steals it. It MUST exceed the longest
-// legitimate hold, which is one worker/control turn: AcquireLock is held across
-// Inject + waitOutput, so the hold can last up to the full claude turn timeout
-// (cfg.Claude.Timeout, 900s/15min in prod). The old value (5min) was SHORTER than
-// that, so any turn running longer than 5min (e.g. a control deploy turn that
-// builds + restarts) had its lock STOLEN mid-flight by the next serve cycle —
-// two goroutines then "held" control-dc/claude.lock, and on release one removed
-// the other's file, producing the "held by live pid" churn / apparent stuck-lock
-// (2026-06-27 incident). 20min leaves margin over the 900s turn cap. A holder
-// whose PROCESS died is still reclaimed instantly by the pid-alive check below —
-// the age path only governs a still-live but genuinely-hung holder. Overridable
-// in tests. Also the backstop for the 2026-06-18 wedged-serve incident.
-var staleLockTimeout = 20 * time.Minute
+// staleLockTimeout bounds how long a lock may be held (by AGE, since its last
+// heartbeat) before a new acquirer treats it as stale and steals it.
+//
+// The holder pid is always serve itself (always alive), so the pid-alive check
+// below never reclaims a hung turn — only this age path does. Historically the
+// lock mtime was written once at acquire and never refreshed, so a genuinely
+// long-but-working turn and a hung turn were indistinguishable; the timeout had
+// to exceed the whole turn cap (cfg.Claude.Timeout, 900s/15min) or a working turn
+// got its lock STOLEN mid-flight — two goroutines then "held" the lock and on
+// release one removed the other's file, the "held by live pid" churn (2026-06-27
+// incident with a 5min timeout). That forced 20min, so a hung turn cost 20min.
+//
+// Now the holder HEARTBEATS the lock (FileLock.Touch) from waitOutput's stall
+// ticker whenever the session is observed working — the exact signal waitOutput
+// already uses to decide a stall. So a working turn refreshes its mtime every
+// ~2s and its age stays near zero no matter how long it runs (never wrongly
+// stolen), while a holder that stops making progress lets the mtime age out.
+// This decouples "long" from "hung", so the timeout can be well under the turn
+// cap. It is safe against the 2026-06-27 regression: any turn that survives today
+// is working() during its whole run (waitOutput already errStalls a non-working
+// turn in ~90s and releases the lock), so it heartbeats; this age path therefore
+// only reclaims a holder wedged OUTSIDE waitOutput's coverage (e.g. stuck in a
+// cold-session Inject), where 8min comfortably clears the worst-case ~4.5min
+// cold-boot-retry Inject while still being far tighter than the old 20min. A dead
+// holder pid is still reclaimed instantly below. Overridable in tests.
+var staleLockTimeout = 8 * time.Minute
 
 // AcquireLock creates an exclusive lock file at path. If the file already exists
 // it is stolen when the previous holder is gone — either its PID is no longer
@@ -106,6 +118,19 @@ func processAlive(pid int) bool {
 	}
 	err = p.Signal(syscall.Signal(0))
 	return err == nil || errors.Is(err, os.ErrPermission)
+}
+
+// Touch refreshes the lock file's mtime to now — the heartbeat that keeps a
+// working turn's lock from being age-stolen (see staleLockTimeout). No-op on a
+// nil lock. A failure is returned but callers treat it as best-effort: a missed
+// heartbeat only risks an early steal, which the caller's own ctx/turn handling
+// already tolerates.
+func (l *FileLock) Touch() error {
+	if l == nil || l.path == "" {
+		return nil
+	}
+	now := time.Now()
+	return os.Chtimes(l.path, now, now)
 }
 
 func (l *FileLock) Release() error {

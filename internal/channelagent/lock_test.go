@@ -87,14 +87,42 @@ func TestAcquireLockKeepsLiveRecentHolder(t *testing.T) {
 	}
 }
 
-// TestStaleLockTimeoutExceedsTurnCap guards the 2026-06-27 regression: the lock
-// is held across a whole worker/control turn (Inject + waitOutput, up to
-// cfg.Claude.Timeout = 900s in prod), so the age-based steal threshold MUST be
-// larger or a legit long turn gets its lock stolen mid-flight. Keep margin.
-func TestStaleLockTimeoutExceedsTurnCap(t *testing.T) {
-	const prodTurnCap = 900 * time.Second
-	if staleLockTimeout <= prodTurnCap {
-		t.Fatalf("staleLockTimeout (%s) must exceed the turn cap (%s) or long turns get their lock stolen mid-flight", staleLockTimeout, prodTurnCap)
+// TestStaleLockTimeoutFitsHeartbeatDesign: with the lock heartbeat (FileLock.Touch
+// from waitOutput while the session is working), a working turn keeps its mtime
+// fresh no matter how long it runs, so the age threshold no longer has to exceed
+// the whole turn cap. It MUST still clear the worst-case NON-heartbeated hold — a
+// cold-session Inject (waitSessionReady up to sessionBootDelay, retried a few
+// times, ~4.5min worst case) — or such a boot would be stolen mid-flight
+// (guards a re-run of the 2026-06-27 regression for the pre-waitOutput window).
+func TestStaleLockTimeoutFitsHeartbeatDesign(t *testing.T) {
+	const worstNonHeartbeatedHold = 5 * time.Minute
+	if staleLockTimeout < worstNonHeartbeatedHold {
+		t.Fatalf("staleLockTimeout (%s) must clear the worst-case non-heartbeated hold (%s)", staleLockTimeout, worstNonHeartbeatedHold)
+	}
+}
+
+// TestFileLockTouchResetsAge proves the heartbeat: a lock aged past the timeout
+// becomes non-stealable again after Touch, so a working turn that heartbeats is
+// never age-stolen.
+func TestFileLockTouchResetsAge(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agent.lock")
+	old := staleLockTimeout
+	staleLockTimeout = 60 * time.Millisecond
+	defer func() { staleLockTimeout = old }()
+
+	first, err := AcquireLock(path)
+	if err != nil {
+		t.Fatalf("first: %v", err)
+	}
+	defer first.Release()
+	time.Sleep(90 * time.Millisecond) // age past the (tiny) timeout
+	if err := first.Touch(); err != nil {
+		t.Fatalf("Touch: %v", err)
+	}
+	// Freshly heartbeated → a second acquirer must NOT steal it.
+	if l, err := AcquireLock(path); err == nil {
+		l.Release()
+		t.Fatal("stole a freshly-touched (heartbeated) lock")
 	}
 }
 
