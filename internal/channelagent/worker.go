@@ -32,12 +32,20 @@ type workingInspector interface {
 }
 
 // rawInjector is an optional Injector capability: inject a verbatim string into
-// the session, bypassing the current_job/outbox prompt wrapper. Backs "direct
-// mode" (see parseDirectCommand) — a message the user prefixes with 執行： is sent
-// into the pane as-is (e.g. a leading "!" then runs as bash via the Claude TUI),
-// with no LLM turn and no channel reply.
+// the session, bypassing the current_job/outbox prompt wrapper. Backs the
+// fire-and-forget direct sub-mode (執行：!cmd) — the text is sent into the pane
+// as-is (the leading "!" runs as bash via the Claude TUI), with no LLM turn and
+// no channel reply.
 type rawInjector interface {
 	InjectRaw(ctx context.Context, text string) error
+}
+
+// captureInjector is an optional Injector capability: run a command in the
+// session shell, capture its combined output, and return it. Backs the
+// output-returning direct sub-mode (執行：cmd, no leading "!") so the result is
+// posted back to the channel. id is a per-job unique string for temp-file names.
+type captureInjector interface {
+	RunAndCapture(ctx context.Context, cmd, id string) (string, error)
 }
 
 // directCommandPrefixes trigger direct mode. Both the full-width and half-width
@@ -55,6 +63,37 @@ func parseDirectCommand(content string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// directOutputMax bounds how much captured output is posted back to the channel
+// (Discord chunks anything longer anyway; this keeps the tail, where errors and
+// final results usually are).
+const directOutputMax = 1800
+
+// formatDirectOutput renders a captured direct-mode command result for the
+// channel: the command echoed, then its output in a code fence. Empty output is
+// shown as (無輸出); over-long output keeps the tail and flags the truncation.
+func formatDirectOutput(cmd, out string) string {
+	out = strings.TrimRight(out, "\n")
+	truncated := false
+	if len(out) > directOutputMax {
+		out = out[len(out)-directOutputMax:]
+		truncated = true
+	}
+	var b strings.Builder
+	b.WriteString("執行：")
+	b.WriteString(cmd)
+	b.WriteString("\n```\n")
+	if strings.TrimSpace(out) == "" {
+		b.WriteString("(無輸出)")
+	} else {
+		if truncated {
+			b.WriteString("…(前段略)\n")
+		}
+		b.WriteString(out)
+	}
+	b.WriteString("\n```")
+	return b.String()
 }
 
 // stallWindow is how long the pane may sit not-working with no reply before the
@@ -119,20 +158,41 @@ func RunWorkerOnce(ctx context.Context, root string, injector Injector, timeout 
 		}
 	}
 
-	// Direct mode: a message prefixed with 執行： is injected into the session
-	// verbatim, bypassing the current_job/outbox prompt wrapper — no LLM turn, no
-	// channel reply (output shows in the pane / activity mirror). Placed after the
-	// permission-gate check because a 執行： message is never a y/n decision.
+	outputPath := pathIn(root, "outbox", "pending", job.JobID+".json")
+
+	// Direct mode: a message prefixed with 執行： bypasses the current_job/outbox
+	// prompt wrapper (no LLM turn). Placed after the permission-gate check because
+	// a 執行： message is never a y/n decision. Two sub-modes by whether the command
+	// starts with "!":
+	//   執行：!cmd  → injected verbatim into the pane, fire-and-forget (the "!" runs
+	//                as bash via the Claude TUI). For persistent/interactive things
+	//                (e.g. a dev server) that must NOT block on capturing output.
+	//   執行：cmd   → run once in the session shell, capture combined output, post it
+	//                back to the channel so the user sees the result.
 	if cmd, isDirect := parseDirectCommand(job.Source.Content); isDirect {
-		if ri, ok := injector.(rawInjector); ok {
-			if cmd == "" {
-				// 執行： with nothing after it: nothing to run, just consume it.
+		if cmd == "" {
+			// 執行： with nothing after it: nothing to run, just consume it.
+			_ = moveFile(processingPath, pathIn(root, "inbox", "done", name))
+			return true, nil
+		}
+		if strings.HasPrefix(cmd, "!") {
+			if ri, ok := injector.(rawInjector); ok {
+				if err := ri.InjectRaw(ctx, cmd); err != nil {
+					// Pane busy (mid-turn/dialog): retry next cycle without burning an
+					// attempt, exactly like the normal inject path.
+					if errors.Is(err, errSessionBusy) {
+						_ = moveFile(processingPath, pathIn(root, "inbox", "pending", name))
+						return false, nil
+					}
+					requeueOrFail(root, processingPath, name, job)
+					return true, err
+				}
 				_ = moveFile(processingPath, pathIn(root, "inbox", "done", name))
 				return true, nil
 			}
-			if err := ri.InjectRaw(ctx, cmd); err != nil {
-				// Pane busy (mid-turn/dialog): retry next cycle without burning an
-				// attempt, exactly like the normal inject path.
+		} else if ci, ok := injector.(captureInjector); ok {
+			out, err := ci.RunAndCapture(ctx, cmd, job.JobID)
+			if err != nil {
 				if errors.Is(err, errSessionBusy) {
 					_ = moveFile(processingPath, pathIn(root, "inbox", "pending", name))
 					return false, nil
@@ -140,11 +200,23 @@ func RunWorkerOnce(ctx context.Context, root string, injector Injector, timeout 
 				requeueOrFail(root, processingPath, name, job)
 				return true, err
 			}
+			reply := OutputJob{
+				Schema:    1,
+				JobID:     job.JobID,
+				RequestID: job.RequestID,
+				InputHash: job.InputHash,
+				Send:      true,
+				Text:      formatDirectOutput(cmd, out),
+			}
+			if err := AtomicWriteJSON(outputPath, reply); err != nil {
+				_ = moveFile(processingPath, pathIn(root, "inbox", "failed", name))
+				return true, err
+			}
 			_ = moveFile(processingPath, pathIn(root, "inbox", "done", name))
 			return true, nil
 		}
-		// Injector can't do raw injection (e.g. stdout test harness): fall through
-		// to the normal wrapped path rather than dropping the message.
+		// Injector lacks the needed capability (e.g. stdout test harness): fall
+		// through to the normal wrapped path rather than dropping the message.
 	}
 
 	if err := AtomicWriteJSON(pathIn(root, "current_job.json"), job); err != nil {
@@ -152,7 +224,6 @@ func RunWorkerOnce(ctx context.Context, root string, injector Injector, timeout 
 		return true, err
 	}
 
-	outputPath := pathIn(root, "outbox", "pending", job.JobID+".json")
 	if err := injector.Inject(ctx, job, outputPath); err != nil {
 		// Session busy (mid-turn / dialog): not a failure, just "not now". Put the
 		// job back UNCHANGED — don't increment Attempt — so a long legitimate turn

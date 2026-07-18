@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -19,11 +20,14 @@ func (f fakeInjector) Inject(_ context.Context, job InputJob, outputPath string)
 	return f.write(job, outputPath)
 }
 
-// rawFakeInjector records the verbatim text passed to direct mode and can
-// simulate the pane being busy.
+// rawFakeInjector records direct-mode calls (verbatim raw injects and captured
+// commands) and can simulate the pane being busy. out is what RunAndCapture
+// returns.
 type rawFakeInjector struct {
-	raw  []string
-	busy bool
+	raw      []string
+	captured []string
+	out      string
+	busy     bool
 }
 
 func (r *rawFakeInjector) Inject(context.Context, InputJob, string) error { return nil }
@@ -33,6 +37,13 @@ func (r *rawFakeInjector) InjectRaw(_ context.Context, text string) error {
 	}
 	r.raw = append(r.raw, text)
 	return nil
+}
+func (r *rawFakeInjector) RunAndCapture(_ context.Context, cmd, _ string) (string, error) {
+	if r.busy {
+		return "", errSessionBusy
+	}
+	r.captured = append(r.captured, cmd)
+	return r.out, nil
 }
 
 // glitchInjector writes no reply (simulating a glitched turn) and reports
@@ -384,6 +395,52 @@ func TestWorkerDirectModeBusyRequeuesWithoutBurningAttempt(t *testing.T) {
 	assertNotExists(t, filepath.Join(root, "inbox", "failed", job.JobID+".json"))
 	if job.Attempt != 0 {
 		t.Fatalf("seed Attempt = %d, want 0", job.Attempt)
+	}
+}
+
+func TestWorkerDirectModeCaptureReturnsOutput(t *testing.T) {
+	root := filepath.Join(t.TempDir(), ".channel-agent")
+	job := seedPendingJobContent(t, root, "m1", "執行：echo hi") // no "!" → capture sub-mode
+
+	inj := &rawFakeInjector{out: "hi\n"}
+	processed, err := RunWorkerOnce(context.Background(), root, inj, time.Second)
+	if err != nil {
+		t.Fatalf("RunWorkerOnce: %v", err)
+	}
+	if !processed {
+		t.Fatal("processed = false, want true")
+	}
+	// Went through capture (not raw inject).
+	if len(inj.captured) != 1 || inj.captured[0] != "echo hi" {
+		t.Fatalf("RunAndCapture got %v, want [\"echo hi\"]", inj.captured)
+	}
+	if len(inj.raw) != 0 {
+		t.Fatalf("raw inject should not be used for the no-! sub-mode, got %v", inj.raw)
+	}
+	// Output posted back to the channel as an outbox reply containing the result.
+	outPath := filepath.Join(root, "outbox", "pending", job.JobID+".json")
+	assertExists(t, outPath)
+	var reply OutputJob
+	if err := ReadJSON(outPath, &reply); err != nil {
+		t.Fatalf("read outbox reply: %v", err)
+	}
+	if !reply.Send || !strings.Contains(reply.Text, "hi") || !strings.Contains(reply.Text, "echo hi") {
+		t.Fatalf("reply text = %q, want it to echo the command and its output", reply.Text)
+	}
+	assertExists(t, filepath.Join(root, "inbox", "done", job.JobID+".json"))
+}
+
+func TestFormatDirectOutput(t *testing.T) {
+	if got := formatDirectOutput("echo hi", "hi\n"); !strings.Contains(got, "echo hi") || !strings.Contains(got, "hi") {
+		t.Fatalf("formatDirectOutput = %q", got)
+	}
+	if got := formatDirectOutput("true", ""); !strings.Contains(got, "(無輸出)") {
+		t.Fatalf("empty output should show (無輸出), got %q", got)
+	}
+	long := strings.Repeat("x", directOutputMax+500)
+	got := formatDirectOutput("big", long)
+	if !strings.Contains(got, "…(前段略)") {
+		t.Fatalf("over-long output should be flagged truncated, got len %d", len(got))
 	}
 }
 

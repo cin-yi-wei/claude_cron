@@ -115,7 +115,13 @@ func (i TmuxInjector) InjectRaw(ctx context.Context, text string) error {
 	if i.paneBusy(ctx) {
 		return errSessionBusy
 	}
-	line := collapseWhitespace(text)
+	return i.submitLine(ctx, collapseWhitespace(text))
+}
+
+// submitLine runs the C-c → type → verify-Enter recipe for an already-prepared
+// single line, retrying if the Enter drops. Shared by InjectRaw and
+// RunAndCapture; assumes the session exists and was idle at call time.
+func (i TmuxInjector) submitLine(ctx context.Context, line string) error {
 	var lastErr error
 	for attempt := 0; attempt < injectMaxAttempts; attempt++ {
 		if i.paneBusy(ctx) {
@@ -133,9 +139,73 @@ func (i TmuxInjector) InjectRaw(ctx context.Context, text string) error {
 		if err != nil || !inputBoxHasText(pane) {
 			return nil // can't verify, or input box is empty → submitted
 		}
-		lastErr = fmt.Errorf("inject raw: still in input box after attempt %d", attempt+1)
+		lastErr = fmt.Errorf("inject: line still in input box after attempt %d", attempt+1)
 	}
 	return lastErr
+}
+
+// directCaptureTimeout bounds how long RunAndCapture waits for a direct-mode
+// command to finish before giving up (it holds claude.lock while waiting, so a
+// hung/long command mustn't block forever — use 執行：!cmd for long-runners).
+const directCaptureTimeout = 45 * time.Second
+
+// RunAndCapture runs cmd in the session's own shell via the Claude TUI "!"
+// passthrough, redirecting combined stdout+stderr to a file and touching a
+// sentinel when done, then returns the file's contents. File-based capture reads
+// the exact output instead of scraping TUI chrome. id (the job id) names the temp
+// files. On timeout it returns whatever landed plus a note. Defers with
+// errSessionBusy when the pane is busy.
+func (i TmuxInjector) RunAndCapture(ctx context.Context, cmd, id string) (string, error) {
+	if strings.TrimSpace(i.Session) == "" {
+		return "", fmt.Errorf("tmux session is required")
+	}
+	if err := i.ensureSession(ctx); err != nil {
+		return "", err
+	}
+	if i.paneBusy(ctx) {
+		return "", errSessionBusy
+	}
+	dir := pathIn(i.Root, "tmp")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	base := filepath.Join(dir, "direct-"+sanitize(id))
+	outFile, doneFile := base+".out", base+".done"
+	_ = os.Remove(outFile)
+	_ = os.Remove(doneFile)
+	defer func() {
+		_ = os.Remove(outFile)
+		_ = os.Remove(doneFile)
+	}()
+	line := fmt.Sprintf("!{ %s ; } > %s 2>&1; touch %s", cmd, shSingleQuote(outFile), shSingleQuote(doneFile))
+	if err := i.submitLine(ctx, collapseWhitespace(line)); err != nil {
+		return "", err
+	}
+	deadline := time.Now().Add(directCaptureTimeout)
+	for {
+		if _, err := os.Stat(doneFile); err == nil {
+			data, err := os.ReadFile(outFile)
+			if err != nil {
+				return "", err
+			}
+			return string(data), nil
+		}
+		if time.Now().After(deadline) {
+			data, _ := os.ReadFile(outFile)
+			return string(data) + "\n…(逾時 " + directCaptureTimeout.String() + "，指令可能仍在 pane 執行)", nil
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(300 * time.Millisecond):
+		}
+	}
+}
+
+// shSingleQuote wraps s in single quotes for safe embedding in a shell command,
+// escaping any embedded single quotes.
+func shSingleQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // LooksGlitched reports whether the session printed raw tool-call markup as text
