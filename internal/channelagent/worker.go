@@ -31,30 +31,28 @@ type workingInspector interface {
 	SessionWorking(ctx context.Context) bool
 }
 
-// rawInjector is an optional Injector capability: inject a verbatim string into
-// the session, bypassing the current_job/outbox prompt wrapper. Backs the
-// fire-and-forget direct sub-mode (執行：!cmd) — the text is sent into the pane
-// as-is (the leading "!" runs as bash via the Claude TUI), with no LLM turn and
-// no channel reply.
+// rawInjector is an optional Injector capability: inject a string into the
+// session VERBATIM, bypassing the current_job/outbox prompt wrapper. Backs direct
+// mode (！執行：payload) — the payload is sent to the pane exactly as typed (a
+// "!"-prefixed shell command, a /login slash command, or plain text), with no LLM
+// turn and no channel reply. Output is visible via the pane / activity mirror.
 type rawInjector interface {
 	InjectRaw(ctx context.Context, text string) error
 }
 
-// captureInjector is an optional Injector capability: run a command in the
-// session shell, capture its combined output, and return it. Backs the
-// output-returning direct sub-mode (執行：cmd, no leading "!") so the result is
-// posted back to the channel. id is a per-job unique string for temp-file names.
-type captureInjector interface {
-	RunAndCapture(ctx context.Context, cmd, id string) (string, error)
-}
-
-// directCommandPrefixes trigger direct mode. Both the full-width and half-width
-// colon are accepted so the user doesn't have to fight IME colon variants.
-var directCommandPrefixes = []string{"執行：", "執行:"}
+// directCommandPrefixes trigger direct mode. The leading "!" (full or half
+// width) is REQUIRED — a plain 執行： is intentionally NOT a trigger, so a normal
+// message that happens to start with 執行 can't be mistaken for a command to run
+// (避免誤觸). The colon may also be full or half width. All 4 bang×colon combos
+// are accepted so the user doesn't fight IME variants.
+var directCommandPrefixes = []string{"！執行：", "！執行:", "!執行：", "!執行:"}
 
 // parseDirectCommand reports whether content is a direct-mode message (starts
-// with a 執行： prefix) and returns the command text after the prefix, trimmed.
-// A prefix with nothing after it returns ("", true) — recognised but empty.
+// with a ！執行： prefix) and returns the payload after the prefix, VERBATIM (only
+// outer whitespace trimmed). The payload is handed to the session untouched — it
+// may be a "!"-prefixed shell command (!ls), a Claude slash command (/login), or
+// plain text — so we must not strip, wrap, or reinterpret it. A prefix with
+// nothing after returns ("", true).
 func parseDirectCommand(content string) (string, bool) {
 	s := strings.TrimSpace(content)
 	for _, p := range directCommandPrefixes {
@@ -63,37 +61,6 @@ func parseDirectCommand(content string) (string, bool) {
 		}
 	}
 	return "", false
-}
-
-// directOutputMax bounds how much captured output is posted back to the channel
-// (Discord chunks anything longer anyway; this keeps the tail, where errors and
-// final results usually are).
-const directOutputMax = 1800
-
-// formatDirectOutput renders a captured direct-mode command result for the
-// channel: the command echoed, then its output in a code fence. Empty output is
-// shown as (無輸出); over-long output keeps the tail and flags the truncation.
-func formatDirectOutput(cmd, out string) string {
-	out = strings.TrimRight(out, "\n")
-	truncated := false
-	if len(out) > directOutputMax {
-		out = out[len(out)-directOutputMax:]
-		truncated = true
-	}
-	var b strings.Builder
-	b.WriteString("執行：")
-	b.WriteString(cmd)
-	b.WriteString("\n```\n")
-	if strings.TrimSpace(out) == "" {
-		b.WriteString("(無輸出)")
-	} else {
-		if truncated {
-			b.WriteString("…(前段略)\n")
-		}
-		b.WriteString(out)
-	}
-	b.WriteString("\n```")
-	return b.String()
 }
 
 // stallWindow is how long the pane may sit not-working with no reply before the
@@ -160,39 +127,22 @@ func RunWorkerOnce(ctx context.Context, root string, injector Injector, timeout 
 
 	outputPath := pathIn(root, "outbox", "pending", job.JobID+".json")
 
-	// Direct mode: a message prefixed with 執行： bypasses the current_job/outbox
-	// prompt wrapper (no LLM turn). Placed after the permission-gate check because
-	// a 執行： message is never a y/n decision. Two sub-modes by whether the command
-	// starts with "!":
-	//   執行：!cmd  → injected verbatim into the pane, fire-and-forget (the "!" runs
-	//                as bash via the Claude TUI). For persistent/interactive things
-	//                (e.g. a dev server) that must NOT block on capturing output.
-	//   執行：cmd   → run once in the session shell, capture combined output, post it
-	//                back to the channel so the user sees the result.
-	if cmd, isDirect := parseDirectCommand(job.Source.Content); isDirect {
-		if cmd == "" {
-			// 執行： with nothing after it: nothing to run, just consume it.
+	// Direct mode: a message prefixed with ！執行： is injected into the session
+	// VERBATIM (bypassing the current_job/outbox prompt wrapper — no LLM turn) and
+	// left for the session to handle; no channel reply (output is visible via the
+	// pane / activity mirror). Placed after the permission-gate check because a
+	// ！執行： message is never a y/n decision. The leading "!" is required so a
+	// normal message can't accidentally run a command.
+	if payload, isDirect := parseDirectCommand(job.Source.Content); isDirect {
+		if payload == "" {
+			// ！執行： with nothing after it: nothing to send, just consume it.
 			_ = moveFile(processingPath, pathIn(root, "inbox", "done", name))
 			return true, nil
 		}
-		if strings.HasPrefix(cmd, "!") {
-			if ri, ok := injector.(rawInjector); ok {
-				if err := ri.InjectRaw(ctx, cmd); err != nil {
-					// Pane busy (mid-turn/dialog): retry next cycle without burning an
-					// attempt, exactly like the normal inject path.
-					if errors.Is(err, errSessionBusy) {
-						_ = moveFile(processingPath, pathIn(root, "inbox", "pending", name))
-						return false, nil
-					}
-					requeueOrFail(root, processingPath, name, job)
-					return true, err
-				}
-				_ = moveFile(processingPath, pathIn(root, "inbox", "done", name))
-				return true, nil
-			}
-		} else if ci, ok := injector.(captureInjector); ok {
-			out, err := ci.RunAndCapture(ctx, cmd, job.JobID)
-			if err != nil {
+		if ri, ok := injector.(rawInjector); ok {
+			if err := ri.InjectRaw(ctx, payload); err != nil {
+				// Pane busy (mid-turn/dialog): retry next cycle without burning an
+				// attempt, exactly like the normal inject path.
 				if errors.Is(err, errSessionBusy) {
 					_ = moveFile(processingPath, pathIn(root, "inbox", "pending", name))
 					return false, nil
@@ -200,23 +150,11 @@ func RunWorkerOnce(ctx context.Context, root string, injector Injector, timeout 
 				requeueOrFail(root, processingPath, name, job)
 				return true, err
 			}
-			reply := OutputJob{
-				Schema:    1,
-				JobID:     job.JobID,
-				RequestID: job.RequestID,
-				InputHash: job.InputHash,
-				Send:      true,
-				Text:      formatDirectOutput(cmd, out),
-			}
-			if err := AtomicWriteJSON(outputPath, reply); err != nil {
-				_ = moveFile(processingPath, pathIn(root, "inbox", "failed", name))
-				return true, err
-			}
 			_ = moveFile(processingPath, pathIn(root, "inbox", "done", name))
 			return true, nil
 		}
-		// Injector lacks the needed capability (e.g. stdout test harness): fall
-		// through to the normal wrapped path rather than dropping the message.
+		// Injector can't do raw injection (e.g. stdout test harness): fall through
+		// to the normal wrapped path rather than dropping the message.
 	}
 
 	if err := AtomicWriteJSON(pathIn(root, "current_job.json"), job); err != nil {

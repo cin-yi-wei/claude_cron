@@ -4,7 +4,6 @@ import (
 	"context"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 )
@@ -20,14 +19,11 @@ func (f fakeInjector) Inject(_ context.Context, job InputJob, outputPath string)
 	return f.write(job, outputPath)
 }
 
-// rawFakeInjector records direct-mode calls (verbatim raw injects and captured
-// commands) and can simulate the pane being busy. out is what RunAndCapture
-// returns.
+// rawFakeInjector records the verbatim payloads passed to direct mode and can
+// simulate the pane being busy.
 type rawFakeInjector struct {
-	raw      []string
-	captured []string
-	out      string
-	busy     bool
+	raw  []string
+	busy bool
 }
 
 func (r *rawFakeInjector) Inject(context.Context, InputJob, string) error { return nil }
@@ -37,13 +33,6 @@ func (r *rawFakeInjector) InjectRaw(_ context.Context, text string) error {
 	}
 	r.raw = append(r.raw, text)
 	return nil
-}
-func (r *rawFakeInjector) RunAndCapture(_ context.Context, cmd, _ string) (string, error) {
-	if r.busy {
-		return "", errSessionBusy
-	}
-	r.captured = append(r.captured, cmd)
-	return r.out, nil
 }
 
 // glitchInjector writes no reply (simulating a glitched turn) and reports
@@ -342,12 +331,15 @@ func TestParseDirectCommand(t *testing.T) {
 		wantCmd string
 		wantOk  bool
 	}{
-		{"執行：!sudo apt-get update", "!sudo apt-get update", true},
-		{"執行:ls -la", "ls -la", true},        // half-width colon
-		{"  執行： echo hi  ", "echo hi", true}, // leading/trailing space trimmed
-		{"執行：", "", true},                    // prefix only → recognised, empty
+		{"！執行：ls -la", "ls -la", true},                           // full-width bang + colon
+		{"!執行:sudo apt-get update", "sudo apt-get update", true}, // half-width bang + colon
+		{"！執行： !curl http://x", "!curl http://x", true},          // payload verbatim — "!" NOT stripped
+		{"！執行： /login", "/login", true},                          // slash command passes through untouched
+		{"  ！執行： echo hi  ", "echo hi", true},                    // outer space trimmed
+		{"！執行：", "", true},                                       // prefix only → recognised, empty
+		{"執行：ls", "", false},                                     // plain 執行： is NOT a trigger anymore
 		{"hello world", "", false},
-		{"請執行：foo", "", false}, // prefix must be at the start
+		{"我！執行：foo", "", false}, // prefix must be at the very start
 	}
 	for _, c := range cases {
 		gotCmd, gotOk := parseDirectCommand(c.in)
@@ -357,30 +349,27 @@ func TestParseDirectCommand(t *testing.T) {
 	}
 }
 
-func TestWorkerDirectModeInjectsRawAndSkipsOutbox(t *testing.T) {
+func TestWorkerPlainExecIsNotDirectMode(t *testing.T) {
+	// A plain 執行： (no leading bang) must NOT trigger direct mode — it falls
+	// through to the normal wrapped path (current_job written for the LLM turn).
 	root := filepath.Join(t.TempDir(), ".channel-agent")
-	job := seedPendingJobContent(t, root, "m1", "執行：!echo hi")
+	seedPendingJobContent(t, root, "m1", "執行：ls")
 
 	inj := &rawFakeInjector{}
-	processed, err := RunWorkerOnce(context.Background(), root, inj, time.Second)
-	if err != nil {
-		t.Fatalf("RunWorkerOnce: %v", err)
+	if _, err := RunWorkerOnce(context.Background(), root, inj, 120*time.Millisecond); err == nil {
+		// The fake never writes a reply, so the wrapped path times out — expected;
+		// the point is direct mode must NOT have injected anything.
+		t.Fatal("expected wrapped-path timeout, got nil")
 	}
-	if !processed {
-		t.Fatal("processed = false, want true")
+	if len(inj.raw) != 0 {
+		t.Fatalf("plain 執行： must not run a command, but injected %v", inj.raw)
 	}
-	// Raw command was injected verbatim (prefix stripped).
-	if len(inj.raw) != 1 || inj.raw[0] != "!echo hi" {
-		t.Fatalf("InjectRaw got %v, want [\"!echo hi\"]", inj.raw)
-	}
-	// Direct mode: job done, NO outbox reply, NO current_job wrapper turn.
-	assertExists(t, filepath.Join(root, "inbox", "done", job.JobID+".json"))
-	assertNotExists(t, filepath.Join(root, "outbox", "pending", job.JobID+".json"))
+	assertExists(t, filepath.Join(root, "current_job.json")) // wrapped path engaged
 }
 
 func TestWorkerDirectModeBusyRequeuesWithoutBurningAttempt(t *testing.T) {
 	root := filepath.Join(t.TempDir(), ".channel-agent")
-	job := seedPendingJobContent(t, root, "m1", "執行：ls")
+	job := seedPendingJobContent(t, root, "m1", "！執行：ls")
 
 	inj := &rawFakeInjector{busy: true}
 	processed, err := RunWorkerOnce(context.Background(), root, inj, time.Second)
@@ -398,11 +387,11 @@ func TestWorkerDirectModeBusyRequeuesWithoutBurningAttempt(t *testing.T) {
 	}
 }
 
-func TestWorkerDirectModeCaptureReturnsOutput(t *testing.T) {
+func TestWorkerDirectModeInjectsVerbatimAndSkipsOutbox(t *testing.T) {
 	root := filepath.Join(t.TempDir(), ".channel-agent")
-	job := seedPendingJobContent(t, root, "m1", "執行：echo hi") // no "!" → capture sub-mode
+	job := seedPendingJobContent(t, root, "m1", "！執行： !curl http://x")
 
-	inj := &rawFakeInjector{out: "hi\n"}
+	inj := &rawFakeInjector{}
 	processed, err := RunWorkerOnce(context.Background(), root, inj, time.Second)
 	if err != nil {
 		t.Fatalf("RunWorkerOnce: %v", err)
@@ -410,38 +399,14 @@ func TestWorkerDirectModeCaptureReturnsOutput(t *testing.T) {
 	if !processed {
 		t.Fatal("processed = false, want true")
 	}
-	// Went through capture (not raw inject).
-	if len(inj.captured) != 1 || inj.captured[0] != "echo hi" {
-		t.Fatalf("RunAndCapture got %v, want [\"echo hi\"]", inj.captured)
+	// Payload injected VERBATIM (prefix stripped, but the "!" kept).
+	if len(inj.raw) != 1 || inj.raw[0] != "!curl http://x" {
+		t.Fatalf("InjectRaw got %v, want [\"!curl http://x\"]", inj.raw)
 	}
-	if len(inj.raw) != 0 {
-		t.Fatalf("raw inject should not be used for the no-! sub-mode, got %v", inj.raw)
-	}
-	// Output posted back to the channel as an outbox reply containing the result.
-	outPath := filepath.Join(root, "outbox", "pending", job.JobID+".json")
-	assertExists(t, outPath)
-	var reply OutputJob
-	if err := ReadJSON(outPath, &reply); err != nil {
-		t.Fatalf("read outbox reply: %v", err)
-	}
-	if !reply.Send || !strings.Contains(reply.Text, "hi") || !strings.Contains(reply.Text, "echo hi") {
-		t.Fatalf("reply text = %q, want it to echo the command and its output", reply.Text)
-	}
+	// Direct mode: job done, NO outbox reply, NO current_job wrapper turn.
 	assertExists(t, filepath.Join(root, "inbox", "done", job.JobID+".json"))
-}
-
-func TestFormatDirectOutput(t *testing.T) {
-	if got := formatDirectOutput("echo hi", "hi\n"); !strings.Contains(got, "echo hi") || !strings.Contains(got, "hi") {
-		t.Fatalf("formatDirectOutput = %q", got)
-	}
-	if got := formatDirectOutput("true", ""); !strings.Contains(got, "(無輸出)") {
-		t.Fatalf("empty output should show (無輸出), got %q", got)
-	}
-	long := strings.Repeat("x", directOutputMax+500)
-	got := formatDirectOutput("big", long)
-	if !strings.Contains(got, "…(前段略)") {
-		t.Fatalf("over-long output should be flagged truncated, got len %d", len(got))
-	}
+	assertNotExists(t, filepath.Join(root, "outbox", "pending", job.JobID+".json"))
+	assertNotExists(t, filepath.Join(root, "current_job.json"))
 }
 
 func assertExists(t *testing.T, path string) {
