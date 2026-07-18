@@ -2,6 +2,7 @@ package channelagent
 
 import (
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -98,6 +99,86 @@ func TestStaleLockTimeoutFitsHeartbeatDesign(t *testing.T) {
 	const worstNonHeartbeatedHold = 5 * time.Minute
 	if staleLockTimeout < worstNonHeartbeatedHold {
 		t.Fatalf("staleLockTimeout (%s) must clear the worst-case non-heartbeated hold (%s)", staleLockTimeout, worstNonHeartbeatedHold)
+	}
+}
+
+// TestLockHeartbeatSurvivesConcurrentAcquirers is the isolated validation of the
+// 2026-06-27 safety property: a long-but-working turn that heartbeats its lock is
+// NEVER stolen by concurrent acquirers, no matter how far it outruns the timeout;
+// and once it STOPS heartbeating (hangs), the lock IS reclaimed after the timeout.
+// Deterministic, no Claude session needed. Run under -race.
+func TestLockHeartbeatSurvivesConcurrentAcquirers(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agent.lock")
+	old := staleLockTimeout
+	staleLockTimeout = 100 * time.Millisecond
+	defer func() { staleLockTimeout = old }()
+
+	held, err := AcquireLock(path)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+
+	// Phase 1: heartbeat every 25ms for 1s — 10× the 100ms timeout. A concurrent
+	// acquirer hammering every 15ms must NEVER succeed (no mid-flight steal).
+	stop := make(chan struct{})
+	hbDone := make(chan struct{})
+	go func() {
+		defer close(hbDone)
+		tk := time.NewTicker(25 * time.Millisecond)
+		defer tk.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-tk.C:
+				_ = held.Touch()
+			}
+		}
+	}()
+
+	var stolen int32
+	robber := make(chan struct{})
+	robberDone := make(chan struct{})
+	go func() {
+		defer close(robberDone)
+		tk := time.NewTicker(15 * time.Millisecond)
+		defer tk.Stop()
+		for {
+			select {
+			case <-robber:
+				return
+			case <-tk.C:
+				if l, err := AcquireLock(path); err == nil {
+					atomic.AddInt32(&stolen, 1)
+					l.Release()
+				}
+			}
+		}
+	}()
+
+	time.Sleep(1 * time.Second)
+	if n := atomic.LoadInt32(&stolen); n != 0 {
+		t.Fatalf("lock stolen %d times while heartbeating — mid-flight steal regression", n)
+	}
+
+	// Phase 2: stop the heartbeat (simulate the turn hanging). The lock must now
+	// age out and become stealable within a few timeouts.
+	close(stop)
+	<-hbDone
+	stole := false
+	for i := 0; i < 40; i++ { // up to ~600ms >> 100ms timeout
+		time.Sleep(15 * time.Millisecond)
+		if l, err := AcquireLock(path); err == nil {
+			l.Release()
+			stole = true
+			break
+		}
+	}
+	close(robber)
+	<-robberDone
+	_ = held
+	if !stole {
+		t.Fatal("hung lock (no heartbeat) was never reclaimed after the timeout")
 	}
 }
 
