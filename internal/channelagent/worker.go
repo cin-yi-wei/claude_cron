@@ -31,6 +31,32 @@ type workingInspector interface {
 	SessionWorking(ctx context.Context) bool
 }
 
+// rawInjector is an optional Injector capability: inject a verbatim string into
+// the session, bypassing the current_job/outbox prompt wrapper. Backs "direct
+// mode" (see parseDirectCommand) — a message the user prefixes with 執行： is sent
+// into the pane as-is (e.g. a leading "!" then runs as bash via the Claude TUI),
+// with no LLM turn and no channel reply.
+type rawInjector interface {
+	InjectRaw(ctx context.Context, text string) error
+}
+
+// directCommandPrefixes trigger direct mode. Both the full-width and half-width
+// colon are accepted so the user doesn't have to fight IME colon variants.
+var directCommandPrefixes = []string{"執行：", "執行:"}
+
+// parseDirectCommand reports whether content is a direct-mode message (starts
+// with a 執行： prefix) and returns the command text after the prefix, trimmed.
+// A prefix with nothing after it returns ("", true) — recognised but empty.
+func parseDirectCommand(content string) (string, bool) {
+	s := strings.TrimSpace(content)
+	for _, p := range directCommandPrefixes {
+		if strings.HasPrefix(s, p) {
+			return strings.TrimSpace(strings.TrimPrefix(s, p)), true
+		}
+	}
+	return "", false
+}
+
 // stallWindow is how long the pane may sit not-working with no reply before the
 // turn is treated as hung. Kept well above normal between-tool gaps.
 const stallWindow = 90 * time.Second
@@ -91,6 +117,34 @@ func RunWorkerOnce(ctx context.Context, root string, injector Injector, timeout 
 			_ = moveFile(processingPath, pathIn(root, "inbox", "done", name))
 			return true, nil
 		}
+	}
+
+	// Direct mode: a message prefixed with 執行： is injected into the session
+	// verbatim, bypassing the current_job/outbox prompt wrapper — no LLM turn, no
+	// channel reply (output shows in the pane / activity mirror). Placed after the
+	// permission-gate check because a 執行： message is never a y/n decision.
+	if cmd, isDirect := parseDirectCommand(job.Source.Content); isDirect {
+		if ri, ok := injector.(rawInjector); ok {
+			if cmd == "" {
+				// 執行： with nothing after it: nothing to run, just consume it.
+				_ = moveFile(processingPath, pathIn(root, "inbox", "done", name))
+				return true, nil
+			}
+			if err := ri.InjectRaw(ctx, cmd); err != nil {
+				// Pane busy (mid-turn/dialog): retry next cycle without burning an
+				// attempt, exactly like the normal inject path.
+				if errors.Is(err, errSessionBusy) {
+					_ = moveFile(processingPath, pathIn(root, "inbox", "pending", name))
+					return false, nil
+				}
+				requeueOrFail(root, processingPath, name, job)
+				return true, err
+			}
+			_ = moveFile(processingPath, pathIn(root, "inbox", "done", name))
+			return true, nil
+		}
+		// Injector can't do raw injection (e.g. stdout test harness): fall through
+		// to the normal wrapped path rather than dropping the message.
 	}
 
 	if err := AtomicWriteJSON(pathIn(root, "current_job.json"), job); err != nil {

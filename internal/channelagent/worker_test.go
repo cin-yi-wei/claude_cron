@@ -19,6 +19,22 @@ func (f fakeInjector) Inject(_ context.Context, job InputJob, outputPath string)
 	return f.write(job, outputPath)
 }
 
+// rawFakeInjector records the verbatim text passed to direct mode and can
+// simulate the pane being busy.
+type rawFakeInjector struct {
+	raw  []string
+	busy bool
+}
+
+func (r *rawFakeInjector) Inject(context.Context, InputJob, string) error { return nil }
+func (r *rawFakeInjector) InjectRaw(_ context.Context, text string) error {
+	if r.busy {
+		return errSessionBusy
+	}
+	r.raw = append(r.raw, text)
+	return nil
+}
+
 // glitchInjector writes no reply (simulating a glitched turn) and reports
 // glitched=true, so a no-reply timeout should requeue instead of failing.
 type glitchInjector struct{ glitched bool }
@@ -275,6 +291,10 @@ func seedDecisionJob(t *testing.T, root, content string) InputJob {
 }
 
 func seedPendingJob(t *testing.T, root, messageID string) InputJob {
+	return seedPendingJobContent(t, root, messageID, "hello")
+}
+
+func seedPendingJobContent(t *testing.T, root, messageID, content string) InputJob {
 	t.Helper()
 	if err := Init(root); err != nil {
 		t.Fatalf("Init: %v", err)
@@ -285,7 +305,7 @@ func seedPendingJob(t *testing.T, root, messageID string) InputJob {
 		MessageID: messageID,
 		AuthorID:  "u1",
 		CreatedAt: "2026-06-16T01:30:12+08:00",
-		Content:   "hello",
+		Content:   content,
 	}
 	hash, err := HashSource(source)
 	if err != nil {
@@ -303,6 +323,68 @@ func seedPendingJob(t *testing.T, root, messageID string) InputJob {
 		t.Fatalf("write pending job: %v", err)
 	}
 	return job
+}
+
+func TestParseDirectCommand(t *testing.T) {
+	cases := []struct {
+		in      string
+		wantCmd string
+		wantOk  bool
+	}{
+		{"執行：!sudo apt-get update", "!sudo apt-get update", true},
+		{"執行:ls -la", "ls -la", true},        // half-width colon
+		{"  執行： echo hi  ", "echo hi", true}, // leading/trailing space trimmed
+		{"執行：", "", true},                    // prefix only → recognised, empty
+		{"hello world", "", false},
+		{"請執行：foo", "", false}, // prefix must be at the start
+	}
+	for _, c := range cases {
+		gotCmd, gotOk := parseDirectCommand(c.in)
+		if gotCmd != c.wantCmd || gotOk != c.wantOk {
+			t.Errorf("parseDirectCommand(%q) = (%q,%v), want (%q,%v)", c.in, gotCmd, gotOk, c.wantCmd, c.wantOk)
+		}
+	}
+}
+
+func TestWorkerDirectModeInjectsRawAndSkipsOutbox(t *testing.T) {
+	root := filepath.Join(t.TempDir(), ".channel-agent")
+	job := seedPendingJobContent(t, root, "m1", "執行：!echo hi")
+
+	inj := &rawFakeInjector{}
+	processed, err := RunWorkerOnce(context.Background(), root, inj, time.Second)
+	if err != nil {
+		t.Fatalf("RunWorkerOnce: %v", err)
+	}
+	if !processed {
+		t.Fatal("processed = false, want true")
+	}
+	// Raw command was injected verbatim (prefix stripped).
+	if len(inj.raw) != 1 || inj.raw[0] != "!echo hi" {
+		t.Fatalf("InjectRaw got %v, want [\"!echo hi\"]", inj.raw)
+	}
+	// Direct mode: job done, NO outbox reply, NO current_job wrapper turn.
+	assertExists(t, filepath.Join(root, "inbox", "done", job.JobID+".json"))
+	assertNotExists(t, filepath.Join(root, "outbox", "pending", job.JobID+".json"))
+}
+
+func TestWorkerDirectModeBusyRequeuesWithoutBurningAttempt(t *testing.T) {
+	root := filepath.Join(t.TempDir(), ".channel-agent")
+	job := seedPendingJobContent(t, root, "m1", "執行：ls")
+
+	inj := &rawFakeInjector{busy: true}
+	processed, err := RunWorkerOnce(context.Background(), root, inj, time.Second)
+	if err != nil {
+		t.Fatalf("RunWorkerOnce: %v", err)
+	}
+	if processed {
+		t.Fatal("processed = true, want false (deferred)")
+	}
+	// Busy pane → back to pending unchanged (Attempt not incremented), retry later.
+	assertExists(t, filepath.Join(root, "inbox", "pending", job.JobID+".json"))
+	assertNotExists(t, filepath.Join(root, "inbox", "failed", job.JobID+".json"))
+	if job.Attempt != 0 {
+		t.Fatalf("seed Attempt = %d, want 0", job.Attempt)
+	}
 }
 
 func assertExists(t *testing.T, path string) {

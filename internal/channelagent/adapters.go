@@ -99,6 +99,45 @@ func (i TmuxInjector) Inject(ctx context.Context, job InputJob, outputPath strin
 	return lastErr
 }
 
+// InjectRaw sends text into the session verbatim (direct mode), bypassing the
+// current_job/outbox prompt wrapper. It reuses the same C-c → type → verify-Enter
+// recipe as Inject (so a leading "!" runs as bash via the Claude TUI), but sends
+// the user's string as-is instead of a built prompt. Whitespace is collapsed to a
+// single line for the same reason Inject does it — an embedded newline would be
+// read as a premature Enter. Defers with errSessionBusy when the pane is busy.
+func (i TmuxInjector) InjectRaw(ctx context.Context, text string) error {
+	if strings.TrimSpace(i.Session) == "" {
+		return fmt.Errorf("tmux session is required")
+	}
+	if err := i.ensureSession(ctx); err != nil {
+		return err
+	}
+	if i.paneBusy(ctx) {
+		return errSessionBusy
+	}
+	line := collapseWhitespace(text)
+	var lastErr error
+	for attempt := 0; attempt < injectMaxAttempts; attempt++ {
+		if i.paneBusy(ctx) {
+			return errSessionBusy
+		}
+		if err := i.typeAndSubmit(ctx, line); err != nil {
+			if errors.Is(err, errSessionBusy) {
+				return err
+			}
+			lastErr = err
+			continue
+		}
+		time.Sleep(injectVerifyDelay)
+		pane, err := runExternalCommandOutput(ctx, "tmux", "capture-pane", "-pt", i.Session)
+		if err != nil || !inputBoxHasText(pane) {
+			return nil // can't verify, or input box is empty → submitted
+		}
+		lastErr = fmt.Errorf("inject raw: still in input box after attempt %d", attempt+1)
+	}
+	return lastErr
+}
+
 // LooksGlitched reports whether the session printed raw tool-call markup as text
 // (e.g. "<invoke name=...>" / "<parameter name=...>") instead of executing it — a
 // transient model glitch that ends the turn with no reply. Normal tool use
