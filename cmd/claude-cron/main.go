@@ -228,6 +228,24 @@ func run(args []string, stdout, stderr io.Writer) int {
 				}
 			}()
 		}
+		// 定時觸發器（scheduler）：每 30 秒檢查一次 triggers.json，到期的 cron
+		// 規則就合成一則訊息塞進對應 binding 的 inbox，沿用既有 pipeline 送達。
+		if !*once {
+			go func() {
+				t := time.NewTicker(30 * time.Second)
+				defer t.Stop()
+				for {
+					select {
+					case <-supCtx.Done():
+						return
+					case <-t.C:
+						if _, err := agent.RunSchedulerOnce(supCtx, *root, time.Now()); err != nil {
+							fmt.Fprintf(stderr, "scheduler error: %v\n", err)
+						}
+					}
+				}
+			}()
+		}
 		for {
 			if err := agent.RunSupervisorOnce(supCtx, *root, cfg, timeout, stdout, pushMgr); err != nil {
 				fmt.Fprintln(stderr, err)
@@ -323,6 +341,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 0
 	case "notify":
 		return runNotifyCommand(args[1:], stdout, stderr)
+	case "trigger":
+		return runTriggerCommand(args[1:], stdout, stderr)
 	case "bind", "unbind", "pause", "resume", "list", "set-default":
 		return runManageCommand(args[0], args[1:], stdout, stderr)
 	default:
@@ -409,6 +429,187 @@ func runManageCommand(name string, rest []string, stdout, stderr io.Writer) int 
 		return 1
 	}
 	return 0
+}
+
+func runTriggerCommand(rest []string, stdout, stderr io.Writer) int {
+	usage := "usage: claude-cron trigger add <name> --binding=<name> --cron=\"分 時 日 月 週\" --message=\"...\" [--timezone=Asia/Taipei] [--catch-up=true|false] [--root=...]\n" +
+		"       claude-cron trigger list [--root=...]\n" +
+		"       claude-cron trigger remove <name> [--root=...]\n" +
+		"       claude-cron trigger test <name> [--root=...]"
+	if len(rest) == 0 {
+		fmt.Fprintln(stderr, usage)
+		return 2
+	}
+	verb := rest[0]
+	rest = rest[1:]
+
+	root := ".channel-agent"
+	var pos []string
+	opts := map[string]string{}
+	for i := 0; i < len(rest); i++ {
+		switch {
+		case rest[i] == "--root":
+			if i+1 >= len(rest) {
+				fmt.Fprintln(stderr, "--root requires a value")
+				return 2
+			}
+			root = rest[i+1]
+			i++
+		case strings.HasPrefix(rest[i], "--"):
+			kv := strings.TrimPrefix(rest[i], "--")
+			if k, v, ok := strings.Cut(kv, "="); ok {
+				opts[k] = v
+			} else {
+				opts[kv] = "true"
+			}
+		default:
+			pos = append(pos, rest[i])
+		}
+	}
+	if abs, err := filepath.Abs(root); err == nil {
+		root = abs
+	}
+
+	switch verb {
+	case "add":
+		if len(pos) < 1 {
+			fmt.Fprintln(stderr, usage)
+			return 2
+		}
+		name := pos[0]
+		binding := opts["binding"]
+		cronExpr := opts["cron"]
+		message := opts["message"]
+		if binding == "" || cronExpr == "" || message == "" {
+			fmt.Fprintln(stderr, "需要 --binding --cron --message")
+			return 2
+		}
+		if _, err := agent.ParseCron(cronExpr); err != nil {
+			fmt.Fprintln(stderr, err)
+			return 2
+		}
+		tz := opts["timezone"]
+		if tz == "" {
+			tz = agent.DefaultTriggerTimezone
+		}
+		if _, err := time.LoadLocation(tz); err != nil {
+			fmt.Fprintln(stderr, err)
+			return 2
+		}
+		catchUp := true
+		if v, ok := opts["catch-up"]; ok {
+			catchUp = v == "true" || v == "1"
+		}
+		reg, err := agent.LoadRegistry(root)
+		if err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		if _, ok := reg.Get(binding); !ok {
+			fmt.Fprintf(stderr, "找不到 binding %q\n", binding)
+			return 1
+		}
+		cfg, err := agent.LoadTriggers(root)
+		if err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		now := time.Now().UTC().Format(time.RFC3339)
+		// LastChecked 設為建立時間：排程器只從「現在」開始算到期，不會回頭補跑
+		// 建立前的歷史時間點。
+		t := agent.Trigger{
+			Name:        name,
+			Binding:     binding,
+			Cron:        cronExpr,
+			Timezone:    tz,
+			Message:     message,
+			CatchUp:     catchUp,
+			Enabled:     true,
+			CreatedAt:   now,
+			LastChecked: now,
+		}
+		if err := cfg.Add(t); err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		if err := agent.SaveTriggers(root, cfg); err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "trigger %q 已新增（binding=%s cron=%q tz=%s catch_up=%t）\n", name, binding, cronExpr, tz, catchUp)
+		return 0
+
+	case "list":
+		cfg, err := agent.LoadTriggers(root)
+		if err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		for _, t := range cfg.Triggers {
+			fmt.Fprintf(stdout, "%s\tbinding=%s\tcron=%q\ttz=%s\tcatch_up=%t\tenabled=%t\tlast_checked=%s\n",
+				t.Name, t.Binding, t.Cron, t.Timezone, t.CatchUp, t.Enabled, t.LastChecked)
+		}
+		return 0
+
+	case "remove":
+		if len(pos) < 1 {
+			fmt.Fprintln(stderr, usage)
+			return 2
+		}
+		cfg, err := agent.LoadTriggers(root)
+		if err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		if !cfg.Remove(pos[0]) {
+			fmt.Fprintf(stderr, "找不到 trigger %q\n", pos[0])
+			return 1
+		}
+		if err := agent.SaveTriggers(root, cfg); err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "trigger %q 已移除\n", pos[0])
+		return 0
+
+	case "test":
+		if len(pos) < 1 {
+			fmt.Fprintln(stderr, usage)
+			return 2
+		}
+		cfg, err := agent.LoadTriggers(root)
+		if err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		t, ok := cfg.Get(pos[0])
+		if !ok {
+			fmt.Fprintf(stderr, "找不到 trigger %q\n", pos[0])
+			return 1
+		}
+		reg, err := agent.LoadRegistry(root)
+		if err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		binding, ok := reg.Get(t.Binding)
+		if !ok {
+			fmt.Fprintf(stderr, "找不到 binding %q\n", t.Binding)
+			return 1
+		}
+		now := time.Now()
+		msg := agent.BuildTriggerMessage(t, binding, now)
+		if _, err := agent.IngestMessages(context.Background(), binding.Root, []agent.SourceMessage{msg}); err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "已手動觸發 trigger %q 進 binding %q\n", t.Name, t.Binding)
+		return 0
+
+	default:
+		fmt.Fprintln(stderr, usage)
+		return 2
+	}
 }
 
 func takePlatformArg(args []string) (string, []string) {
