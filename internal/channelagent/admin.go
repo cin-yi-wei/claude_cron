@@ -181,6 +181,35 @@ func (h AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		default:
 			methodNotAllowed(w)
 		}
+	case path == "/api/triggers":
+		switch r.Method {
+		case http.MethodGet:
+			h.listTriggers(w)
+		case http.MethodPost:
+			h.createTrigger(w, r)
+		default:
+			methodNotAllowed(w)
+		}
+	case strings.HasPrefix(path, "/api/triggers/"):
+		rest := strings.TrimPrefix(path, "/api/triggers/")
+		if name, ok := strings.CutSuffix(rest, "/test"); ok {
+			h.testTrigger(w, r, name)
+			return
+		}
+		if name, ok := strings.CutSuffix(rest, "/enable"); ok {
+			h.setTriggerEnabled(w, r, name, true)
+			return
+		}
+		if name, ok := strings.CutSuffix(rest, "/disable"); ok {
+			h.setTriggerEnabled(w, r, name, false)
+			return
+		}
+		switch r.Method {
+		case http.MethodDelete:
+			h.deleteTrigger(w, rest)
+		default:
+			methodNotAllowed(w)
+		}
 	default:
 		http.NotFound(w, r)
 	}

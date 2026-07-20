@@ -1,5 +1,6 @@
 <script>
   import Bindings from './Bindings.svelte';
+  import Triggers from './Triggers.svelte';
   import Settings from './Settings.svelte';
   import CreateBinding from './CreateBinding.svelte';
   import ChatLayout from './ChatLayout.svelte';
@@ -33,6 +34,7 @@
     { id: 'bindings', key: 'nav.bindings', href: '#/bindings' },
     { id: 'chat', key: 'nav.chat', href: '#/chat' },
     { id: 'create', key: 'nav.create', href: '#/create' },
+    { id: 'triggers', key: 'nav.triggers', href: '#/triggers' },
     { id: 'settings', key: 'nav.settings', href: '#/settings' },
   ];
 </script>
@@ -62,6 +64,8 @@
     <Bindings {token} />
   {:else if route.view === 'create'}
     <CreateBinding {token} onCreated={() => (location.hash = '#/bindings')} />
+  {:else if route.view === 'triggers'}
+    <Triggers {token} />
   {:else if route.view === 'settings'}
     <Settings bind:token />
   {:else if route.view === 'chat'}
