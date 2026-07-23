@@ -41,7 +41,18 @@
 
 <nav class="container-fluid topnav">
   <ul class="navrow">
-    <li class="brand"><strong>claude_cron</strong></li>
+    <li class="brand">
+      <svg class="brandmark" viewBox="0 0 100 100" aria-hidden="true">
+        <circle cx="50" cy="50" r="34" fill="none" stroke="var(--pico-muted-border-color)" stroke-width="3"/>
+        <circle cx="50" cy="50" r="34" fill="none" stroke="#e8a33d" stroke-width="5" stroke-dasharray="14 193" stroke-linecap="round" transform="rotate(-90 50 50)"/>
+        <circle cx="50" cy="16" r="6" fill="#e8a33d"/>
+        <circle cx="76.4" cy="60.5" r="4.5" fill="#5fc9b0"/>
+        <circle cx="23.6" cy="60.5" r="3.4" fill="#5fc9b0" opacity="0.55"/>
+        <path d="M 38 42 L 50 50 L 38 58" fill="none" stroke="currentColor" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+        <rect x="55" y="53" width="12" height="4.6" rx="1.6" fill="currentColor"/>
+      </svg>
+      <strong>claude_cron</strong>
+    </li>
     {#each nav as n}
       <li><a href={n.href} class={route.view === n.id ? 'active' : ''}>{t(n.key)}</a></li>
     {/each}
@@ -79,7 +90,8 @@
      one line; it scrolls horizontally only if a very narrow screen can't fit. */
   .navrow { display: flex; align-items: center; flex-wrap: nowrap; gap: .25rem .4rem; margin: 0; list-style: none; padding: 0; overflow-x: auto; }
   .navrow li { flex: 0 0 auto; }
-  .navrow .brand { margin-right: .4rem; white-space: nowrap; }
+  .navrow .brand { margin-right: .4rem; white-space: nowrap; display: flex; align-items: center; gap: .35rem; }
+  .brandmark { width: 1.15rem; height: 1.15rem; flex: 0 0 auto; color: var(--pico-color); }
   .navrow .spacer { flex: 1 1 auto; }
   .topnav a { display: block; padding: .35rem .55rem; border-radius: var(--pico-border-radius); text-decoration: none; white-space: nowrap; }
   .topnav a.active { background: var(--pico-primary-background); color: var(--pico-primary-inverse); }
