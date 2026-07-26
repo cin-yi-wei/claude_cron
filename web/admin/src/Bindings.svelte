@@ -18,6 +18,7 @@
         try {
           const st = await getJSON(token, '/api/bindings/' + encodeURIComponent(b.name));
           b._alive = st.session_alive;
+          b._busy = st.busy;
           b._q = 'p' + st.pending + ' / r' + st.processing + ' / f' + st.failed;
         } catch { b._q = '?'; }
       }
@@ -33,6 +34,15 @@
       msg = j.result || (verb + ' ok');
       refresh();
     } catch (e) { err = String(e); }
+  }
+
+  let busyDuration = $state('1h');
+
+  function setBusy(b) {
+    act(b.name, 'busy', 'POST', '/api/bindings/' + encodeURIComponent(b.name) + '/busy?duration=' + encodeURIComponent(busyDuration || '1h'));
+  }
+  function clearBusy(b) {
+    act(b.name, 'busy', 'POST', '/api/bindings/' + encodeURIComponent(b.name) + '/busy?clear=true');
   }
 
   let delTarget = $state(null);   // binding being deleted (opens the modal)
@@ -56,6 +66,7 @@
   <header>
     <strong>{t('bindings.title')}</strong> ({bindings.length})
     <button class="mini" onclick={refresh} aria-busy={loading} style="float:right">↻</button>
+    <input class="mini durationbox" style="float:right" bind:value={busyDuration} placeholder="1h" title={t('bindings.busy.durationhint')} />
   </header>
   {#if err}<p class="bad">{err}</p>{/if}
   {#if msg}<p class="ok">{msg}</p>{/if}
@@ -70,7 +81,13 @@
               {#if b.control}<span class="badge ctrl">{t('bindings.control')}{b.default ? ' 🛡' : ''}</span>{/if}
             </td>
             <td><span class="badge">{b.platform} · {b.transport}</span></td>
-            <td>{#if b.paused}<span class="muted">{t('bindings.paused')}</span>{:else if b.sleeping}<span class="muted">💤 sleeping</span>{:else}{b._alive ? '🟢' : '🔴'} <small class="muted">{b.tmux_session}</small>{/if}</td>
+            <td>
+              {#if b.paused}<span class="muted">{t('bindings.paused')}</span>
+              {:else if b.sleeping}<span class="muted">💤 sleeping</span>
+              {:else}{b._alive ? '🟢' : '🔴'} <small class="muted">{b.tmux_session}</small>
+              {/if}
+              {#if b._busy}<span class="badge busy" title={t('bindings.busy.on')}>🔐 busy</span>{/if}
+            </td>
             <td><small>{b._q || ''}</small></td>
             <td class="actions">
               {#if chattable(b)}
@@ -88,6 +105,11 @@
                 onclick={() => act(b.name, 'autoapprove', 'POST', '/api/bindings/' + encodeURIComponent(b.name) + '/autoapprove?on=' + (!b.auto_approve))}>
                 {b.auto_approve ? '🔓' : '🔒'}
               </button>
+              {#if b._busy}
+                <button class="mini secondary" title={t('bindings.busy.clear')} onclick={() => clearBusy(b)}>🔓⏱</button>
+              {:else}
+                <button class="mini secondary" title={t('bindings.busy.set', { duration: busyDuration || '1h' })} onclick={() => setBusy(b)}>🔐⏱</button>
+              {/if}
               {#if !(b.control && b.default)}
                 <button class="mini contrast outline" onclick={() => del(b)}>🗑</button>
               {/if}
@@ -124,6 +146,8 @@
 <style>
   .badge { font-size: .72rem; padding: .1rem .5rem; border-radius: 1rem; background: var(--pico-secondary-background); color: var(--pico-secondary-inverse); }
   .badge.ctrl { background: var(--pico-primary); color: var(--pico-primary-inverse); margin-left: .35rem; }
+  .badge.busy { background: var(--pico-primary-background); color: var(--pico-primary-inverse); margin-left: .35rem; }
+  .durationbox { width: 4rem; padding: .2rem .4rem; margin: 0 .4rem 0 0; font-size: .85rem; }
   .muted { color: var(--pico-muted-color); }
   .bad { color: var(--pico-del-color); }
   .ok { color: var(--pico-ins-color); }

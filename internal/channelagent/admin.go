@@ -51,6 +51,10 @@ type adminStatusDTO struct {
 	Processing   int      `json:"processing"`
 	Failed       int      `json:"failed"`
 	FailedJobs   []string `json:"failed_jobs,omitempty"`
+	// Busy mirrors the state/busy.json marker (see sleep.go) — true while a
+	// worker has declared itself doing long background work the idle-sleep
+	// watchdog should leave alone.
+	Busy bool `json:"busy"`
 }
 
 // AdminHandler is the admin API as an http.Handler (testable without a
@@ -173,6 +177,10 @@ func (h AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			h.autoApprove(w, r, name)
 			return
 		}
+		if name, ok := strings.CutSuffix(rest, "/busy"); ok {
+			h.setBusy(w, r, name)
+			return
+		}
 		switch r.Method {
 		case http.MethodGet:
 			h.bindingStatus(w, rest)
@@ -268,6 +276,7 @@ func (h AdminHandler) bindingStatus(w http.ResponseWriter, name string) {
 		Processing: countJSON(pathIn(b.Root, "inbox", "processing")),
 		Failed:     countJSON(pathIn(b.Root, "inbox", "failed")),
 		FailedJobs: listJSONNames(pathIn(b.Root, "inbox", "failed"), 20),
+		Busy:       isBusy(b.Root),
 	})
 }
 
@@ -407,6 +416,47 @@ func (h AdminHandler) autoApprove(w http.ResponseWriter, r *http.Request, name s
 		sw = "off"
 	}
 	h.runWrite(w, Command{Name: "auto-approve", Args: []string{name, sw}, Flags: map[string]bool{}}, http.StatusOK)
+}
+
+// setBusy handles POST /api/bindings/<name>/busy?duration=1h (set) or
+// ?clear=true (clear) — the admin-UI equivalent of `claude-cron busy set/clear`.
+func (h AdminHandler) setBusy(w http.ResponseWriter, r *http.Request, name string) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if !validBindingName(name) {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	reg, err := LoadRegistry(h.Root)
+	if err != nil {
+		http.Error(w, "registry error", http.StatusInternalServerError)
+		return
+	}
+	b, ok := reg.Get(name)
+	if !ok {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	if r.URL.Query().Get("clear") == "true" {
+		if err := ClearBusy(b.Root); err != nil {
+			http.Error(w, "clear error", http.StatusInternalServerError)
+			return
+		}
+		writeJSONResponse(w, map[string]string{"result": name + " busy cleared"})
+		return
+	}
+	d, err := time.ParseDuration(r.URL.Query().Get("duration"))
+	if err != nil || d <= 0 {
+		http.Error(w, "invalid or missing ?duration (e.g. 1h)", http.StatusBadRequest)
+		return
+	}
+	if err := SetBusy(b.Root, d); err != nil {
+		http.Error(w, "set error", http.StatusInternalServerError)
+		return
+	}
+	writeJSONResponse(w, map[string]string{"result": name + " busy for " + d.String()})
 }
 
 func (h AdminHandler) restartBinding(w http.ResponseWriter, r *http.Request, name string) {
