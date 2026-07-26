@@ -63,10 +63,12 @@
 </script>
 
 <article>
-  <header>
-    <strong>{t('bindings.title')}</strong> ({bindings.length})
-    <button class="mini" onclick={refresh} aria-busy={loading} style="float:right">↻</button>
-    <input class="mini durationbox" style="float:right" bind:value={busyDuration} placeholder="1h" title={t('bindings.busy.durationhint')} />
+  <header class="head-row">
+    <span><strong>{t('bindings.title')}</strong> ({bindings.length})</span>
+    <span class="head-controls">
+      <input class="mini durationbox" bind:value={busyDuration} placeholder="1h" title={t('bindings.busy.durationhint')} />
+      <button class="mini" onclick={refresh} aria-busy={loading}>↻</button>
+    </span>
   </header>
   {#if err}<p class="bad">{err}</p>{/if}
   {#if msg}<p class="ok">{msg}</p>{/if}
@@ -147,7 +149,9 @@
   .badge { font-size: .72rem; padding: .1rem .5rem; border-radius: 1rem; background: var(--pico-secondary-background); color: var(--pico-secondary-inverse); }
   .badge.ctrl { background: var(--pico-primary); color: var(--pico-primary-inverse); margin-left: .35rem; }
   .badge.busy { background: var(--pico-primary-background); color: var(--pico-primary-inverse); margin-left: .35rem; }
-  .durationbox { width: 4rem; padding: .2rem .4rem; margin: 0 .4rem 0 0; font-size: .85rem; }
+  .head-row { display: flex; align-items: center; justify-content: space-between; gap: .5rem; flex-wrap: wrap; }
+  .head-controls { display: flex; align-items: center; gap: .4rem; flex: 0 0 auto; }
+  .durationbox { width: 4.5rem; max-width: 4.5rem; flex: 0 0 auto; padding: .2rem .4rem; margin: 0; font-size: .85rem; box-sizing: border-box; }
   .muted { color: var(--pico-muted-color); }
   .bad { color: var(--pico-del-color); }
   .ok { color: var(--pico-ins-color); }
