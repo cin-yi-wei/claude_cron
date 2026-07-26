@@ -35,12 +35,52 @@ func lastActivityUnixNano(bRoot, worktree string) int64 {
 	return newest
 }
 
+// busyState is a per-binding marker a worker sets before kicking off long
+// autonomous/background work that produces no inbox/outbox/transcript activity
+// on its own (e.g. dispatching a subagent and waiting on it), so the idle-sleep
+// check doesn't kill the session out from under it. See BusyMarkerPath.
+type busyState struct {
+	UntilUnixNano int64 `json:"until_unix_nano"`
+}
+
+// BusyMarkerPath is the per-binding busy-marker file path, exported so the CLI
+// (busy set/clear) and this package agree on the exact same location.
+func BusyMarkerPath(bRoot string) string {
+	return pathIn(bRoot, "state", "busy.json")
+}
+
+// isBusy reports whether bRoot has a live (non-expired) busy marker.
+func isBusy(bRoot string) bool {
+	var st busyState
+	if err := ReadJSON(BusyMarkerPath(bRoot), &st); err != nil {
+		return false
+	}
+	return st.UntilUnixNano > 0 && time.Now().UnixNano() < st.UntilUnixNano
+}
+
+// SetBusy marks bRoot busy for d, suppressing idle-sleep until it expires or
+// ClearBusy is called. Calling it again while already busy extends/replaces
+// the expiry (last call wins).
+func SetBusy(bRoot string, d time.Duration) error {
+	return AtomicWriteJSON(BusyMarkerPath(bRoot), busyState{UntilUnixNano: time.Now().Add(d).UnixNano()})
+}
+
+// ClearBusy removes the busy marker, restoring normal idle-sleep behavior
+// immediately instead of waiting for it to expire.
+func ClearBusy(bRoot string) error {
+	return AtomicWriteJSON(BusyMarkerPath(bRoot), busyState{})
+}
+
 // shouldSleep reports whether an active binding has been idle longer than the
 // timeout (with no queued input). timeout<=0 disables. A binding with no
-// activity signal yet (0) is left alone.
+// activity signal yet (0) is left alone. A live busy marker (see isBusy)
+// overrides everything else — never sleep while one is set.
 func shouldSleep(bRoot, worktree string, timeout time.Duration) bool {
 	if timeout <= 0 {
 		return false
+	}
+	if isBusy(bRoot) {
+		return false // worker declared itself busy — don't reap it
 	}
 	if countJSON(pathIn(bRoot, "inbox", "pending")) > 0 {
 		return false // work queued → not idle

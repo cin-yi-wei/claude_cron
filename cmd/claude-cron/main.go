@@ -343,6 +343,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runNotifyCommand(args[1:], stdout, stderr)
 	case "trigger":
 		return runTriggerCommand(args[1:], stdout, stderr)
+	case "busy":
+		return runBusyCommand(args[1:], stdout, stderr)
 	case "bind", "unbind", "pause", "resume", "list", "set-default":
 		return runManageCommand(args[0], args[1:], stdout, stderr)
 	default:
@@ -606,6 +608,71 @@ func runTriggerCommand(rest []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "已手動觸發 trigger %q 進 binding %q\n", t.Name, t.Binding)
 		return 0
 
+	default:
+		fmt.Fprintln(stderr, usage)
+		return 2
+	}
+}
+
+// runBusyCommand implements `claude-cron busy set <duration>|clear`. --root
+// here is the BINDING's own root (the same root a worker already sees in its
+// job prompts, e.g. .../bindings/<name>) — not the global registry root —
+// since the busy marker is per-binding state.
+func runBusyCommand(rest []string, stdout, stderr io.Writer) int {
+	usage := "usage: claude-cron busy set <duration e.g. 30m|1h> [--root=...]\n" +
+		"       claude-cron busy clear [--root=...]"
+	if len(rest) == 0 {
+		fmt.Fprintln(stderr, usage)
+		return 2
+	}
+	verb := rest[0]
+	rest = rest[1:]
+
+	root := ".channel-agent"
+	var pos []string
+	for i := 0; i < len(rest); i++ {
+		switch {
+		case rest[i] == "--root":
+			if i+1 >= len(rest) {
+				fmt.Fprintln(stderr, "--root requires a value")
+				return 2
+			}
+			root = rest[i+1]
+			i++
+		case strings.HasPrefix(rest[i], "--root="):
+			root = strings.TrimPrefix(rest[i], "--root=")
+		default:
+			pos = append(pos, rest[i])
+		}
+	}
+	if abs, err := filepath.Abs(root); err == nil {
+		root = abs
+	}
+
+	switch verb {
+	case "set":
+		if len(pos) < 1 {
+			fmt.Fprintln(stderr, usage)
+			return 2
+		}
+		d, err := time.ParseDuration(pos[0])
+		if err != nil || d <= 0 {
+			fmt.Fprintf(stderr, "invalid duration %q: %v\n", pos[0], err)
+			return 2
+		}
+		if err := agent.SetBusy(root, d); err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "busy 標記已設定，%s 內不會被 idle-sleep 回收\n", d)
+		return 0
+	case "clear":
+		if err := agent.ClearBusy(root); err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		fmt.Fprintln(stdout, "busy 標記已清除")
+		return 0
 	default:
 		fmt.Fprintln(stderr, usage)
 		return 2
