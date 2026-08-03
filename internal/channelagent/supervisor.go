@@ -536,8 +536,34 @@ func RunSupervisorOnce(ctx context.Context, root string, cfg Config, timeout tim
 		// worker loop uses. Without this, control planes had zero login handling:
 		// on creds expiry they'd sit at a login screen forever. Now they auto-/login
 		// + relay the paste-code URL to their own channel like any binding.
-		if lpane := capturePane(ctx, b.TmuxSession); classifyScreen(lpane) == ScreenLogin {
+		lpane := capturePane(ctx, b.TmuxSession)
+		lscreen := classifyScreen(lpane)
+		if lscreen == ScreenLogin {
 			if handleLoginScreen(ctx, b, cfg, token, lpane, stdout) {
+				continue
+			}
+		}
+		// Confirm watchdog for CONTROL planes — same mechanism the worker loop uses
+		// (see below). Without this, control planes had zero protection against
+		// Claude's native confirm dialogs (create SKILL.md, edit a sensitive file,
+		// proceed?): the PreToolUse gate never sees them, so the session just blocks
+		// on a keypress forever until someone notices the raw tmux pane. Surface the
+		// dialog to the channel; apply the user's reply by typing it into the pane
+		// (both done out of band, like the permission y/n side-route).
+		if lscreen == ScreenConfirm {
+			if dlg, ok := parseConfirmDialog(lpane); ok {
+				if resolveConfirmReply(ctx, b.Root, b.TmuxSession, dlg) {
+					confirmPostedMu.Lock()
+					delete(confirmPostedHash, b.Name)
+					confirmPostedMu.Unlock()
+					fmt.Fprintf(stdout, "control-binding[%s] confirm dialog answered from channel\n", b.Name)
+				} else {
+					postConfirmOnce(b.Root, b.Name, dlg)
+				}
+				// The session is blocked on the dialog, so don't queue the assistant
+				// turn this cycle — but flush the sender now, or the confirm prompt we
+				// just queued never reaches the channel until next cycle.
+				_, _ = RunSenderOnce(ctx, b.Root, snd)
 				continue
 			}
 		}
