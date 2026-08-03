@@ -417,11 +417,18 @@ func applyPermissionInteraction(reg Registry, channelID, customID string) (resul
 	case "deny":
 		allow, remember, line = false, false, "❌ 已拒絕"
 	}
+	// 按鈕點下去前，先把原始請求內容（tool/detail）讀出來，這樣編輯訊息時才能
+	// 保留「當初允許/拒絕的是什麼」，不會被結果那行整段蓋掉，使用者事後也查得到。
+	var req map[string]string
+	_ = ReadJSON(pathIn(permPendingDir(b.Root), pid+".json"), &req)
 	if err := resolvePermission(b.Root, pid, allow, remember); err != nil {
 		return "", "", "", false
 	}
 	// 移除這個 id 的 pending 標記（決定已寫入 decision 檔，等待中的 gate 會讀到）。
 	_ = os.Remove(pathIn(permPendingDir(b.Root), pid+".json"))
+	if req["tool"] != "" {
+		line = fmt.Sprintf("🔐 權限請求：session 想執行 %s\n```\n%s\n```\n%s", req["tool"], req["detail"], line)
+	}
 	return line, b.Name, pid, true
 }
 

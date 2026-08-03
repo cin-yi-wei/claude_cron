@@ -3,6 +3,7 @@ package channelagent
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -51,5 +52,29 @@ func TestApplyPermissionInteractionWritesDecision(t *testing.T) {
 	// unknown channel → no-op
 	if _, _, _, ok := applyPermissionInteraction(reg, "nope", "ccperm|allow|"+pid); ok {
 		t.Errorf("unknown channel should not resolve")
+	}
+}
+
+// The edited message must keep showing what was actually requested (tool +
+// detail), not just a bare result line — otherwise the user can't tell what
+// they approved once the buttons are gone.
+func TestApplyPermissionInteractionKeepsRequestDetail(t *testing.T) {
+	root := t.TempDir()
+	if err := Init(root); err != nil {
+		t.Fatal(err)
+	}
+	pid := "Write-20260803T134400000"
+	os.MkdirAll(permPendingDir(root), 0o755)
+	AtomicWriteJSON(filepath.Join(permPendingDir(root), pid+".json"), map[string]string{
+		"id": pid, "tool": "Write", "detail": "/home/conray/.claude/skills/gstack-review/SKILL.md",
+	})
+	reg := Registry{Bindings: []Binding{{Name: "w1", Root: root, ChannelID: "chan1"}}}
+
+	line, _, _, ok := applyPermissionInteraction(reg, "chan1", "ccperm|allow|"+pid)
+	if !ok {
+		t.Fatal("apply failed")
+	}
+	if !strings.Contains(line, "Write") || !strings.Contains(line, "gstack-review/SKILL.md") || !strings.Contains(line, "已允許") {
+		t.Fatalf("edited message lost the request detail: %q", line)
 	}
 }
