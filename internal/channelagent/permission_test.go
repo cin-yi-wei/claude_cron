@@ -115,6 +115,32 @@ func TestPermissionGateEditInWorktreeAutoAllows(t *testing.T) {
 	}
 }
 
+// A worker writing its OWN outbox reply (job_id.json.tmp) lives under b.Root
+// (the .channel-agent state dir), NOT b.Worktree (the git checkout) — those are
+// two separate trees. This must auto-allow same as an in-worktree edit, or
+// every single job reply would wrongly ask the channel for permission to write
+// itself (the regression this test guards against).
+func TestPermissionGateWriteToOwnOutboxAutoAllows(t *testing.T) {
+	root := filepath.Join(t.TempDir(), ".channel-agent")
+	_ = Init(root)
+	wt := t.TempDir()
+	bRoot := pathIn(root, "bindings", "b")
+	seedBinding(t, root, Binding{Name: "b", ChannelID: "c1", Worktree: wt, Root: bRoot})
+
+	target := pathIn(bRoot, "outbox", "pending", "20260803T000000000000000-1-abc.json.tmp")
+	hookJSON := `{"cwd":"` + wt + `","tool_name":"Write","tool_input":{"file_path":"` + target + `"}}`
+	var out bytes.Buffer
+	if err := RunPermissionGate(context.Background(), root, strings.NewReader(hookJSON), &out, 10*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), `"permissionDecision":"allow"`) {
+		t.Fatalf("writing its own outbox reply should auto-allow; got %s", out.String())
+	}
+	if n := countJSONFilesSafe(pathIn(bRoot, "outbox", "pending")); n != 0 {
+		t.Fatalf("should not have posted a permission request, got %d pending", n)
+	}
+}
+
 func TestPermissionGateWriteOutsideWorktreeAsksChannel(t *testing.T) {
 	root := filepath.Join(t.TempDir(), ".channel-agent")
 	if err := Init(root); err != nil {

@@ -223,12 +223,17 @@ func RunPermissionGate(ctx context.Context, registryRoot string, in io.Reader, o
 		return nil
 	}
 
-	// Edit/Write inside the binding's own worktree are routine (reading a job,
-	// writing a reply, editing project code) — auto-allow without asking. Only
-	// Edit/Write reaching OUTSIDE the worktree (shared config, other repos, the
-	// user's home dotfiles) is worth a human decision.
+	// Edit/Write inside the binding's own worktree OR its own .channel-agent
+	// state dir (b.Root: inbox/outbox/state/permissions — where every job reply
+	// is written, job_id.json.tmp included) are routine — auto-allow without
+	// asking. Only Edit/Write reaching OUTSIDE both (shared config, other repos,
+	// the user's home dotfiles) is worth a human decision. b.Root is a SEPARATE
+	// tree from b.Worktree (registry state vs. the git checkout) — checking only
+	// Worktree made every single job's own outbox write look "out of scope" and
+	// asked the channel for permission to write its own reply.
 	if hi.ToolName == "Edit" || hi.ToolName == "Write" {
-		if inScope(b.Worktree, filePathOf(hi.ToolInput)) {
+		path := filePathOf(hi.ToolInput)
+		if inScope(b.Worktree, path) || inScope(b.Root, path) {
 			fmt.Fprint(out, hookDecisionJSON(true, "permission gate: in-worktree edit auto-allowed"))
 			return nil
 		}
