@@ -6,8 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -135,18 +138,99 @@ func (s DiscordSender) Send(ctx context.Context, output OutputJob) error {
 	chunks := chunkDiscord(output.Text, 2000)
 	for i, content := range chunks {
 		var comps []any
+		var files []string
 		if i == len(chunks)-1 {
 			comps = output.Components
+			files = output.Attachments // 檔案跟著最後一個 chunk 送，同組件按鈕的邏輯
+		}
+		if len(files) > 0 {
+			body, contentType, err := buildDiscordMultipartBody(content, comps, files)
+			if err != nil {
+				return err
+			}
+			if err := s.postMessage(ctx, client, baseURL, body, contentType); err != nil {
+				return err
+			}
+			continue
 		}
 		body, err := buildDiscordSendBody(content, comps)
 		if err != nil {
 			return err
 		}
-		if err := s.postMessage(ctx, client, baseURL, body); err != nil {
+		if err := s.postMessage(ctx, client, baseURL, body, "application/json"); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// discordMaxAttachmentBytes is a conservative per-file cap (Discord's default
+// non-boosted-guild limit; boosted guilds allow more, but we don't know this
+// guild's boost tier here, so stay on the safe side rather than let Discord
+// reject the whole message after we've already spent the upload).
+const discordMaxAttachmentBytes = 8 << 20 // 8MB
+
+// buildDiscordMultipartBody builds a Discord multipart/form-data message-create
+// body carrying one or more local files as real attachments: a "payload_json"
+// part (same content/components/attachments-index shape as the plain-JSON path)
+// plus one "files[N]" part per path, read fully into memory (attachment sizes
+// are small enough — see discordMaxAttachmentBytes — that streaming isn't worth
+// the complexity). Returns the finished body and its multipart Content-Type
+// (boundary included), ready to POST as-is.
+func buildDiscordMultipartBody(content string, components []any, paths []string) ([]byte, string, error) {
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+
+	type attRef struct {
+		ID       string `json:"id"`
+		Filename string `json:"filename"`
+	}
+	var attachments []attRef
+	for i, p := range paths {
+		info, err := os.Stat(p)
+		if err != nil {
+			return nil, "", fmt.Errorf("attachment %s: %w", p, err)
+		}
+		if info.Size() > discordMaxAttachmentBytes {
+			return nil, "", fmt.Errorf("attachment %s is %dMB, over the %dMB limit", p, info.Size()>>20, discordMaxAttachmentBytes>>20)
+		}
+		f, err := os.Open(p)
+		if err != nil {
+			return nil, "", fmt.Errorf("attachment %s: %w", p, err)
+		}
+		id := strconv.Itoa(i)
+		part, err := w.CreateFormFile("files["+id+"]", filepath.Base(p))
+		if err != nil {
+			f.Close()
+			return nil, "", err
+		}
+		if _, err := io.Copy(part, f); err != nil {
+			f.Close()
+			return nil, "", err
+		}
+		f.Close()
+		attachments = append(attachments, attRef{ID: id, Filename: filepath.Base(p)})
+	}
+
+	m := map[string]any{"content": content, "attachments": attachments}
+	if len(components) > 0 {
+		m["components"] = components
+	}
+	payload, err := json.Marshal(m)
+	if err != nil {
+		return nil, "", err
+	}
+	pj, err := w.CreateFormField("payload_json")
+	if err != nil {
+		return nil, "", err
+	}
+	if _, err := pj.Write(payload); err != nil {
+		return nil, "", err
+	}
+	if err := w.Close(); err != nil {
+		return nil, "", err
+	}
+	return buf.Bytes(), w.FormDataContentType(), nil
 }
 
 // discordMaxSendAttempts bounds the per-message POST retries (one extra try per
@@ -174,7 +258,7 @@ var discordSendBudget = 12 * time.Second
 // un-throttled activity ticker fired bursts of POSTs that 429'd en masse and the
 // messages were lost (diff cards vanished, replies delayed). Non-429 HTTP errors
 // return immediately (retrying won't help).
-func (s DiscordSender) postMessage(ctx context.Context, client *http.Client, baseURL string, body []byte) error {
+func (s DiscordSender) postMessage(ctx context.Context, client *http.Client, baseURL string, body []byte, contentType string) error {
 	// Cap the total time all retries may block, so one rate-limited/hung channel
 	// can't stall the sequential activity ticker for every other binding.
 	ctx, cancel := context.WithTimeout(ctx, discordSendBudget)
@@ -187,7 +271,7 @@ func (s DiscordSender) postMessage(ctx context.Context, client *http.Client, bas
 			return err
 		}
 		req.Header.Set("Authorization", "Bot "+s.Token)
-		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Content-Type", contentType)
 		resp, err := client.Do(req)
 		if err != nil {
 			// Transient network blip: brief backoff then retry.

@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -115,6 +117,75 @@ func TestDiscordSenderPostsMessage(t *testing.T) {
 	}
 	if gotBody["content"] != "reply" {
 		t.Fatalf("content = %q, want reply", gotBody["content"])
+	}
+}
+
+func TestDiscordSenderSendsAttachmentAsMultipart(t *testing.T) {
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "report.txt")
+	if err := os.WriteFile(filePath, []byte("hello attachment"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var gotContentType, gotFilename, gotFileContent, gotPayloadContent string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotContentType = r.Header.Get("Content-Type")
+		if err := r.ParseMultipartForm(1 << 20); err != nil {
+			t.Fatalf("ParseMultipartForm: %v", err)
+		}
+		gotPayloadContent = r.FormValue("payload_json")
+		f, fh, err := r.FormFile("files[0]")
+		if err != nil {
+			t.Fatalf("FormFile: %v", err)
+		}
+		defer f.Close()
+		gotFilename = fh.Filename
+		b, _ := io.ReadAll(f)
+		gotFileContent = string(b)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"sent"}`))
+	}))
+	defer server.Close()
+
+	err := DiscordSender{BaseURL: server.URL + "/api/v10", Token: "tok", ChannelID: "c1"}.Send(context.Background(),
+		OutputJob{Send: true, Text: "here's the report", Attachments: []string{filePath}})
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if !strings.HasPrefix(gotContentType, "multipart/form-data") {
+		t.Fatalf("Content-Type = %q, want multipart/form-data", gotContentType)
+	}
+	if gotFilename != "report.txt" {
+		t.Fatalf("filename = %q, want report.txt", gotFilename)
+	}
+	if gotFileContent != "hello attachment" {
+		t.Fatalf("file content = %q", gotFileContent)
+	}
+	if !strings.Contains(gotPayloadContent, "here's the report") {
+		t.Fatalf("payload_json content missing text: %q", gotPayloadContent)
+	}
+}
+
+func TestDiscordSenderRejectsOversizedAttachment(t *testing.T) {
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "big.bin")
+	if err := os.WriteFile(filePath, make([]byte, discordMaxAttachmentBytes+1), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	err := DiscordSender{BaseURL: server.URL + "/api/v10", Token: "tok", ChannelID: "c1"}.Send(context.Background(),
+		OutputJob{Send: true, Text: "too big", Attachments: []string{filePath}})
+	if err == nil {
+		t.Fatal("expected an error for an oversized attachment")
+	}
+	if called {
+		t.Fatal("should not have POSTed an oversized attachment to Discord")
 	}
 }
 
