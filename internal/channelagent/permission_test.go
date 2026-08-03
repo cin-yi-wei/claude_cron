@@ -92,3 +92,59 @@ func TestPermissionGateTimeoutDenies(t *testing.T) {
 		t.Fatalf("timeout should deny; got %s", out.String())
 	}
 }
+
+func TestPermissionGateEditInWorktreeAutoAllows(t *testing.T) {
+	root := filepath.Join(t.TempDir(), ".channel-agent")
+	_ = Init(root)
+	wt := t.TempDir()
+	seedBinding(t, root, Binding{Name: "b", ChannelID: "c1", Worktree: wt, Root: pathIn(root, "bindings", "b")})
+
+	target := filepath.Join(wt, "app", "models", "foo.rb")
+	hookJSON := `{"cwd":"` + wt + `","tool_name":"Edit","tool_input":{"file_path":"` + target + `"}}`
+	var out bytes.Buffer
+	if err := RunPermissionGate(context.Background(), root, strings.NewReader(hookJSON), &out, 10*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), `"permissionDecision":"allow"`) {
+		t.Fatalf("in-worktree Edit should auto-allow; got %s", out.String())
+	}
+	// No channel round-trip should have happened.
+	bRoot := pathIn(root, "bindings", "b")
+	if n := countJSONFilesSafe(pathIn(bRoot, "outbox", "pending")); n != 0 {
+		t.Fatalf("in-worktree Edit should not post to the channel, got %d pending", n)
+	}
+}
+
+func TestPermissionGateWriteOutsideWorktreeAsksChannel(t *testing.T) {
+	root := filepath.Join(t.TempDir(), ".channel-agent")
+	if err := Init(root); err != nil {
+		t.Fatal(err)
+	}
+	wt := t.TempDir()
+	seedBinding(t, root, Binding{Name: "b", ChannelID: "c1", Worktree: wt, Root: pathIn(root, "bindings", "b")})
+
+	outside := filepath.Join(t.TempDir(), "skills", "gstack-review", "SKILL.md")
+	hookJSON := `{"cwd":"` + wt + `","tool_name":"Write","tool_input":{"file_path":"` + outside + `"}}`
+
+	var out bytes.Buffer
+	done := make(chan struct{})
+	go func() {
+		_ = RunPermissionGate(context.Background(), root, strings.NewReader(hookJSON), &out, 10*time.Second)
+		close(done)
+	}()
+
+	bRoot := pathIn(root, "bindings", "b")
+	waitFor(t, func() bool { return oldestPendingPermission(bRoot) != "" })
+	if n := countJSONFilesSafe(pathIn(bRoot, "outbox", "pending")); n < 1 {
+		t.Fatalf("expected out-of-worktree Write to post a permission request, got %d", n)
+	}
+	id := oldestPendingPermission(bRoot)
+	if err := resolvePermission(bRoot, id, true, false); err != nil { // allow once
+		t.Fatal(err)
+	}
+	<-done
+
+	if !strings.Contains(out.String(), `"permissionDecision":"allow"`) {
+		t.Fatalf("gate output = %s", out.String())
+	}
+}

@@ -106,13 +106,16 @@ func sessionPaneReady(pane string) bool {
 }
 
 // agentSettings is the Claude Code permission config for a WORKER binding's
-// worktree. Read/Write/Edit are auto-allowed (read job, write reply); Bash,
-// WebFetch, WebSearch and MCP route through the permission-gate so the user
-// approves them in the channel (a tmux-driven session can't answer Claude's own
-// interactive prompt, so everything not auto-allowed must go through the gate).
+// worktree. Read is auto-allowed. Edit/Write/Bash/WebFetch/WebSearch/MCP all
+// route through the permission-gate — but the gate itself auto-allows Edit/Write
+// that stay inside the binding's own worktree and ordinary (non-risky) Bash, so
+// in practice only Edit/Write reaching outside the worktree, risky Bash, and
+// WebFetch/WebSearch/MCP actually ask the channel (a tmux-driven session can't
+// answer Claude's own interactive prompt, so everything not auto-allowed must go
+// through the gate).
 const agentSettings = `{
   "permissions": {
-    "allow": ["Read", "Write", "Edit"]
+    "allow": ["Read"]
   },
   "enabledPlugins": {
     "ruby-lsp@claude-plugins-official": false
@@ -122,6 +125,8 @@ const agentSettings = `{
       { "hooks": [ { "type": "command", "command": "claude-cron session-hook" } ] }
     ],
     "PreToolUse": [
+      { "matcher": "Edit", "hooks": [ { "type": "command", "command": "claude-cron permission-gate --timeout=1800s", "timeout": 1860 } ] },
+      { "matcher": "Write", "hooks": [ { "type": "command", "command": "claude-cron permission-gate --timeout=1800s", "timeout": 1860 } ] },
       { "matcher": "Bash", "hooks": [ { "type": "command", "command": "claude-cron permission-gate --timeout=1800s", "timeout": 1860 } ] },
       { "matcher": "WebFetch", "hooks": [ { "type": "command", "command": "claude-cron permission-gate --timeout=1800s", "timeout": 1860 } ] },
       { "matcher": "WebSearch", "hooks": [ { "type": "command", "command": "claude-cron permission-gate --timeout=1800s", "timeout": 1860 } ] },
@@ -132,18 +137,23 @@ const agentSettings = `{
 `
 
 // controlAgentSettings is the permission config for a CONTROL session. Same as a
-// worker BUT Bash is auto-allowed (the control assistant runs management/deploy
-// shell freely — gating it would prompt on every git/curl/sudo). WebFetch /
-// WebSearch / MCP still route through the gate → the user approves in the channel.
+// worker BUT Bash is auto-allowed outright (the control assistant runs
+// management/deploy shell freely — gating it would prompt on every git/curl/
+// sudo). Edit/Write still route through the gate, which auto-allows them inside
+// the control session's own worktree and only asks the channel for edits that
+// reach outside it (e.g. ~/.claude/skills/). WebFetch/WebSearch/MCP still route
+// through the gate too → the user approves in the channel.
 const controlAgentSettings = `{
   "permissions": {
-    "allow": ["Read", "Write", "Edit", "Bash"]
+    "allow": ["Read", "Bash"]
   },
   "hooks": {
     "SessionStart": [
       { "hooks": [ { "type": "command", "command": "claude-cron session-hook" } ] }
     ],
     "PreToolUse": [
+      { "matcher": "Edit", "hooks": [ { "type": "command", "command": "claude-cron permission-gate --timeout=1800s", "timeout": 1860 } ] },
+      { "matcher": "Write", "hooks": [ { "type": "command", "command": "claude-cron permission-gate --timeout=1800s", "timeout": 1860 } ] },
       { "matcher": "WebFetch", "hooks": [ { "type": "command", "command": "claude-cron permission-gate --timeout=1800s", "timeout": 1860 } ] },
       { "matcher": "WebSearch", "hooks": [ { "type": "command", "command": "claude-cron permission-gate --timeout=1800s", "timeout": 1860 } ] },
       { "matcher": "mcp__.*", "hooks": [ { "type": "command", "command": "claude-cron permission-gate --timeout=1800s", "timeout": 1860 } ] }

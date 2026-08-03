@@ -72,6 +72,27 @@ func bashCommand(raw json.RawMessage) string {
 	return ""
 }
 
+// filePathOf extracts the target path from an Edit/Write tool_input.
+func filePathOf(raw json.RawMessage) string {
+	var m map[string]any
+	_ = json.Unmarshal(raw, &m)
+	if p, ok := m["file_path"].(string); ok {
+		return p
+	}
+	return ""
+}
+
+// inScope reports whether path is the worktree itself or somewhere under it.
+// An empty worktree or unparseable path is never in scope (fail safe: ask).
+func inScope(worktree, path string) bool {
+	if worktree == "" || path == "" {
+		return false
+	}
+	wt := cleanAbs(worktree)
+	p := cleanAbs(path)
+	return p == wt || strings.HasPrefix(p, wt+string(filepath.Separator))
+}
+
 // matchedRiskyPattern returns the risky pattern a bash command matches (install,
 // download, privilege, destructive), or "" if none. The pattern doubles as the
 // "remember" key, so approving once can auto-allow that category later.
@@ -153,6 +174,9 @@ func summarizeToolInput(toolName string, raw json.RawMessage) string {
 	if q, ok := m["query"].(string); ok && q != "" { // WebSearch
 		return q
 	}
+	if p, ok := m["file_path"].(string); ok && p != "" { // Edit/Write outside the worktree
+		return p
+	}
 	// MCP / other tools: show the full input so you can judge safety. Only clamp
 	// absurdly large payloads, and say how much was hidden (never silently abbreviate).
 	s := string(raw)
@@ -197,6 +221,17 @@ func RunPermissionGate(ctx context.Context, registryRoot string, in io.Reader, o
 	if b.AutoApprove {
 		fmt.Fprint(out, hookDecisionJSON(true, "permission gate: auto-approved (binding bypass)"))
 		return nil
+	}
+
+	// Edit/Write inside the binding's own worktree are routine (reading a job,
+	// writing a reply, editing project code) — auto-allow without asking. Only
+	// Edit/Write reaching OUTSIDE the worktree (shared config, other repos, the
+	// user's home dotfiles) is worth a human decision.
+	if hi.ToolName == "Edit" || hi.ToolName == "Write" {
+		if inScope(b.Worktree, filePathOf(hi.ToolInput)) {
+			fmt.Fprint(out, hookDecisionJSON(true, "permission gate: in-worktree edit auto-allowed"))
+			return nil
+		}
 	}
 
 	// Only escalate the things worth a human decision (installs / downloads /
