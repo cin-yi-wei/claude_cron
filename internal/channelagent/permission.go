@@ -93,6 +93,32 @@ func inScope(worktree, path string) bool {
 	return p == wt || strings.HasPrefix(p, wt+string(filepath.Separator))
 }
 
+// projectSlug 把路徑轉成 Claude Code 的專案 slug：每個非英數字元都換成 '-'
+// （/home/u/p/a_b → -home-u-p-a-b）。scratchpad 與 ~/.claude/projects/ 都用
+// 這個命名規則。
+func projectSlug(p string) string {
+	b := []byte(cleanAbs(p))
+	for i, c := range b {
+		alnum := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+		if !alnum {
+			b[i] = '-'
+		}
+	}
+	return string(b)
+}
+
+// scratchpadRoot 回傳這個 worktree 專屬的 harness 暫存區：
+// <TMPDIR>/claude-<uid>/<worktree slug>。session 的系統提示就是叫它把草稿與
+// 中間產物寫在這底下，所以每寫一次就問使用者一次毫無意義。這裡只放行「屬於
+// 這個 binding 的那一格」，不是整個 /tmp/claude-<uid>／——A binding 的 session
+// 仍然碰不到 B 的暫存區。worktree 為空時回傳空字串，inScope 會據此 fail safe。
+func scratchpadRoot(worktree string) string {
+	if worktree == "" {
+		return ""
+	}
+	return filepath.Join(os.TempDir(), fmt.Sprintf("claude-%d", os.Getuid()), projectSlug(worktree))
+}
+
 // matchedRiskyPattern returns the risky pattern a bash command matches (install,
 // download, privilege, destructive), or "" if none. The pattern doubles as the
 // "remember" key, so approving once can auto-allow that category later.
@@ -230,11 +256,20 @@ func RunPermissionGate(ctx context.Context, registryRoot string, in io.Reader, o
 	// the user's home dotfiles) is worth a human decision. b.Root is a SEPARATE
 	// tree from b.Worktree (registry state vs. the git checkout) — checking only
 	// Worktree made every single job's own outbox write look "out of scope" and
-	// asked the channel for permission to write its own reply.
+	// asked the channel for permission to write its own reply. The session's
+	// scratchpad (<TMPDIR>/claude-<uid>/<slug>) is a THIRD such tree, and the
+	// same oversight applied to it: the harness tells every session to put
+	// drafts there, so leaving it out meant a button press per draft file.
 	if hi.ToolName == "Edit" || hi.ToolName == "Write" {
 		path := filePathOf(hi.ToolInput)
-		if inScope(b.Worktree, path) || inScope(b.Root, path) {
+		switch {
+		case inScope(b.Worktree, path) || inScope(b.Root, path):
 			fmt.Fprint(out, hookDecisionJSON(true, "permission gate: in-worktree edit auto-allowed"))
+			return nil
+		// 第三個放行區：session 自己的 scratchpad（<TMPDIR>/claude-<uid>/<slug>）。
+		// worker 被指示把草稿寫在那裡，漏掉它等於每份草稿都要人按一次按鈕。
+		case inScope(scratchpadRoot(b.Worktree), path):
+			fmt.Fprint(out, hookDecisionJSON(true, "permission gate: session scratchpad write auto-allowed"))
 			return nil
 		}
 	}

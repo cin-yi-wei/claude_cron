@@ -141,6 +141,82 @@ func TestPermissionGateWriteToOwnOutboxAutoAllows(t *testing.T) {
 	}
 }
 
+// projectSlug must match the harness's own naming, which is what
+// <TMPDIR>/claude-<uid>/<slug> and ~/.claude/projects/<slug> are built from:
+// every non-alphanumeric byte becomes '-'. The second case is a real path from
+// this deployment (note '_' and '.' both collapse to '-').
+func TestProjectSlug(t *testing.T) {
+	for _, c := range []struct{ in, want string }{
+		{"/home/conray/project/fatgame-jfg-4908", "-home-conray-project-fatgame-jfg-4908"},
+		{"/home/conray/project/claude_cron/.channel-agent/control-dc-workspace",
+			"-home-conray-project-claude-cron--channel-agent-control-dc-workspace"},
+	} {
+		if got := projectSlug(c.in); got != c.want {
+			t.Errorf("projectSlug(%q) = %q want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// The harness tells every session to put drafts and intermediate files in its
+// scratchpad (<TMPDIR>/claude-<uid>/<worktree slug>/<session>/scratchpad). That
+// is a third tree outside both b.Worktree and b.Root, so without an explicit
+// allowance every single draft file asked the channel for permission — which is
+// exactly what happened in production (reply6.txt, reply7.txt, ...).
+func TestPermissionGateWriteToScratchpadAutoAllows(t *testing.T) {
+	root := filepath.Join(t.TempDir(), ".channel-agent")
+	_ = Init(root)
+	wt := t.TempDir()
+	bRoot := pathIn(root, "bindings", "b")
+	seedBinding(t, root, Binding{Name: "b", ChannelID: "c1", Worktree: wt, Root: bRoot})
+
+	target := filepath.Join(scratchpadRoot(wt), "68673ea1-session", "scratchpad", "reply6.txt")
+	hookJSON := `{"cwd":"` + wt + `","tool_name":"Write","tool_input":{"file_path":"` + target + `"}}`
+	var out bytes.Buffer
+	if err := RunPermissionGate(context.Background(), root, strings.NewReader(hookJSON), &out, 10*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), `"permissionDecision":"allow"`) {
+		t.Fatalf("scratchpad write should auto-allow; got %s", out.String())
+	}
+	if n := countJSONFilesSafe(pathIn(bRoot, "outbox", "pending")); n != 0 {
+		t.Fatalf("scratchpad write should not post to the channel, got %d pending", n)
+	}
+}
+
+// The scratchpad allowance is scoped to THIS binding's own slug, not to the
+// whole <TMPDIR>/claude-<uid> tree: one binding's session must not silently
+// write into another binding's scratchpad.
+func TestPermissionGateWriteToOtherBindingScratchpadAsksChannel(t *testing.T) {
+	root := filepath.Join(t.TempDir(), ".channel-agent")
+	if err := Init(root); err != nil {
+		t.Fatal(err)
+	}
+	wt := t.TempDir()
+	bRoot := pathIn(root, "bindings", "b")
+	seedBinding(t, root, Binding{Name: "b", ChannelID: "c1", Worktree: wt, Root: bRoot})
+
+	// Same /tmp/claude-<uid> parent, different project slug.
+	other := filepath.Join(scratchpadRoot(t.TempDir()), "sess", "scratchpad", "steal.txt")
+	hookJSON := `{"cwd":"` + wt + `","tool_name":"Write","tool_input":{"file_path":"` + other + `"}}`
+
+	var out bytes.Buffer
+	done := make(chan struct{})
+	go func() {
+		_ = RunPermissionGate(context.Background(), root, strings.NewReader(hookJSON), &out, 10*time.Second)
+		close(done)
+	}()
+
+	waitFor(t, func() bool { return oldestPendingPermission(bRoot) != "" })
+	id := oldestPendingPermission(bRoot)
+	if id == "" {
+		t.Fatal("writing another binding's scratchpad must ask the channel")
+	}
+	if err := resolvePermission(bRoot, id, true, false); err != nil {
+		t.Fatal(err)
+	}
+	<-done
+}
+
 func TestPermissionGateWriteOutsideWorktreeAsksChannel(t *testing.T) {
 	root := filepath.Join(t.TempDir(), ".channel-agent")
 	if err := Init(root); err != nil {
