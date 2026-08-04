@@ -114,6 +114,7 @@ func sessionPaneReady(pane string) bool {
 // answer Claude's own interactive prompt, so everything not auto-allowed must go
 // through the gate).
 const agentSettings = `{
+  "model": "opus",
   "permissions": {
     "allow": ["Read"]
   },
