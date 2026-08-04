@@ -35,6 +35,35 @@ func TestParseCommand(t *testing.T) {
 	}
 }
 
+// An absolute path always begins with "/", so a prefix-only check swallowed
+// pasted paths as bogus commands and answered with usage — the message never
+// reached the control assistant. Only known command names count as commands;
+// everything else (paths, code, mistyped commands) is free text.
+func TestParseCommandOnlyKnownNames(t *testing.T) {
+	notCommands := []string{
+		"/home/conray/.claude/projects/-home-conray-project-fatgame/memory/x.md",
+		"/tmp/claude-1000/foo/scratchpad/reply6.txt",
+		"/usr/local/bin/claude-cron",
+		"/lst",         // mistyped /list → assistant can suggest, not a usage dump
+		"/未知的中文指令", // non-ASCII leading token
+	}
+	for _, s := range notCommands {
+		if cmd, ok := ParseCommand(s); ok {
+			t.Errorf("ParseCommand(%q) parsed as command %q; want free text", s, cmd.Name)
+		}
+	}
+
+	// Every name HandleCommand switches on must still parse.
+	for _, s := range []string{
+		"/bind a /p b", "/unbind a", "/pause a", "/resume a", "/set-default a",
+		"/auto-approve a on", "/autoapprove a", "/list", "/status a", "/help",
+	} {
+		if _, ok := ParseCommand(s); !ok {
+			t.Errorf("ParseCommand(%q) should parse as a command", s)
+		}
+	}
+}
+
 func newTestDeps(root string, created *[]string) ControlDeps {
 	return ControlDeps{
 		Root:    root,

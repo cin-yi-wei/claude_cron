@@ -18,9 +18,22 @@ type Command struct {
 	Opts map[string]string
 }
 
-// ParseCommand parses a control message. Returns ok=false for non-command text
-// (anything not starting with "/"). Tokens of the form --key=value become Opts;
-// bare --flag become Flags; everything else is a positional Arg.
+// knownCommands 是控制台實際支援的指令名（與 HandleCommand 的 switch 一致）。
+// ParseCommand 只認這些；其餘 "/" 開頭的文字一律當一般訊息。
+var knownCommands = map[string]bool{
+	"bind": true, "unbind": true, "pause": true, "resume": true,
+	"set-default": true, "auto-approve": true, "autoapprove": true,
+	"list": true, "status": true, "help": true,
+}
+
+// ParseCommand parses a control message. Returns ok=false for non-command text:
+// anything not starting with "/", AND anything whose first token is not a known
+// command. That second condition matters — 絕對路徑一定以 "/" 開頭，早期只看
+// 前綴會把使用者貼的 /home/... 當成指令名吃掉，回一段 usage 就結束，訊息永遠
+// 送不到 control assistant 手上（見 HandleCommand 呼叫端：判定成指令就直接回、
+// 不會 enqueue）。貼路徑、貼 code、打錯指令現在都會正常轉給助理。
+// Tokens of the form --key=value become Opts; bare --flag become Flags;
+// everything else is a positional Arg.
 func ParseCommand(content string) (Command, bool) {
 	content = strings.TrimSpace(content)
 	if !strings.HasPrefix(content, "/") {
@@ -28,6 +41,9 @@ func ParseCommand(content string) (Command, bool) {
 	}
 	fields := strings.Fields(content[1:])
 	if len(fields) == 0 {
+		return Command{}, false
+	}
+	if !knownCommands[fields[0]] {
 		return Command{}, false
 	}
 	cmd := Command{Name: fields[0], Flags: map[string]bool{}, Opts: map[string]string{}}

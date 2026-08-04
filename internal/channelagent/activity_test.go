@@ -47,6 +47,35 @@ func TestActivityMessages(t *testing.T) {
 	}
 }
 
+// Discord's limit counts characters, not bytes. Chinese is 3 bytes per
+// character, so measuring with len()/Builder.Len() split CJK activity roughly
+// every max/3 characters — 3x more cuts than intended, and each extra cut is
+// another chance to land inside a code fence. Content that fits the cap in
+// characters must go out as ONE message even when its byte length exceeds it.
+func TestActivityMessagesCountsRunesNotBytes(t *testing.T) {
+	// 700 Chinese chars = 2100 bytes: over activityMsgMax in bytes, under in runes.
+	entry := strings.Repeat("中", 700)
+	if len(entry) <= activityMsgMax {
+		t.Fatalf("test setup: want byte length > %d, got %d", activityMsgMax, len(entry))
+	}
+	if len([]rune(entry)) >= activityMsgMax {
+		t.Fatalf("test setup: want rune length < %d, got %d", activityMsgMax, len([]rune(entry)))
+	}
+
+	if got := splitEntry(entry, activityMsgMax); len(got) != 1 {
+		t.Errorf("splitEntry split CJK that fits in runes: got %d pieces", len(got))
+	}
+	msgs := activityMessages([]string{entry})
+	if len(msgs) != 1 {
+		t.Errorf("activityMessages split CJK that fits in runes: got %d messages", len(msgs))
+	}
+	for i, m := range msgs {
+		if n := len([]rune(m)); n > activityMsgMax {
+			t.Fatalf("message %d over cap: %d > %d", i, n, activityMsgMax)
+		}
+	}
+}
+
 func TestActivityMessagesSplitsInsteadOfTruncating(t *testing.T) {
 	// Two large entries that together exceed one message must spill to >1 message,
 	// and the full content must survive (no "截斷").

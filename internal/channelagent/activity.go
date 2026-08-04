@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode/utf8"
 )
 
 // Activity streaming: surface what a Claude session is DOING (thinking + tool
@@ -289,8 +290,8 @@ func activityMessages(lines []string) []string {
 	}
 	for _, entry := range lines {
 		for _, piece := range splitEntry(entry, activityMsgMax) {
-			// +1 for the joining newline.
-			if cur.Len() > 0 && cur.Len()+1+len(piece) > activityMsgMax {
+			// +1 for the joining newline. 字元計算，理由同 splitEntry。
+			if cur.Len() > 0 && utf8.RuneCountInString(cur.String())+1+utf8.RuneCountInString(piece) > activityMsgMax {
 				flush()
 			}
 			if cur.Len() > 0 {
@@ -327,7 +328,10 @@ func splitEntry(entry string, max int) []string {
 			add = fenceOpen + "\n" + ln
 			reopen = false
 		}
-		if b.Len() > 0 && b.Len()+1+len(add) > max {
+		// 用「字元」量，不是位元組：中文一個字 3 bytes，用 b.Len() 會在約 max/3
+		// 個字就硬切一刀，刀口常落在 fence 中間。上面 313 行的門檻本來就是字元，
+		// 這裡跟著一致才不會同一個函式兩套尺。
+		if b.Len() > 0 && utf8.RuneCountInString(b.String())+1+utf8.RuneCountInString(add) > max {
 			s := b.String()
 			if strings.Count(s, "```")%2 == 1 {
 				s += "\n```" // close dangling fence
