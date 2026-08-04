@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -210,6 +211,73 @@ func TestPermissionGateWriteToOtherBindingScratchpadAsksChannel(t *testing.T) {
 	id := oldestPendingPermission(bRoot)
 	if id == "" {
 		t.Fatal("writing another binding's scratchpad must ask the channel")
+	}
+	if err := resolvePermission(bRoot, id, true, false); err != nil {
+		t.Fatal(err)
+	}
+	<-done
+}
+
+// Auto-memory is a harness feature the session drives itself: it writes memory
+// files under ~/.claude/projects/<slug>/memory. That directory keys off the
+// project's main repo, not the worktree the worker runs in, so both slugs must
+// be allowed — otherwise every saved memory raises a channel prompt.
+func TestPermissionGateWriteToProjectMemoryAutoAllows(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skip("no home dir")
+	}
+	root := filepath.Join(t.TempDir(), ".channel-agent")
+	_ = Init(root)
+	bRoot := pathIn(root, "bindings", "b")
+	projectDir := "/home/x/project/fatgame"
+	worktree := "/home/x/project/fatgame-jfg-4908"
+	seedBinding(t, root, Binding{Name: "b", ChannelID: "c1", ProjectDir: projectDir, Worktree: worktree, Root: bRoot})
+
+	// Memory dir derived from ProjectDir (the main repo), not the worktree.
+	target := filepath.Join(home, ".claude", "projects", projectSlug(projectDir), "memory", "project_betlog.md")
+	hookJSON := `{"cwd":"` + worktree + `","tool_name":"Write","tool_input":{"file_path":"` + target + `"}}`
+	var out bytes.Buffer
+	if err := RunPermissionGate(context.Background(), root, strings.NewReader(hookJSON), &out, 10*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), `"permissionDecision":"allow"`) {
+		t.Fatalf("project memory write should auto-allow; got %s", out.String())
+	}
+	if n := countJSONFilesSafe(pathIn(bRoot, "outbox", "pending")); n != 0 {
+		t.Fatalf("memory write should not post to the channel, got %d pending", n)
+	}
+}
+
+// The memory allowance covers THIS project only: another project's memory dir
+// is still a cross-project write and must be asked about.
+func TestPermissionGateWriteToOtherProjectMemoryAsksChannel(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skip("no home dir")
+	}
+	root := filepath.Join(t.TempDir(), ".channel-agent")
+	if err := Init(root); err != nil {
+		t.Fatal(err)
+	}
+	bRoot := pathIn(root, "bindings", "b")
+	worktree := "/home/x/project/fatgame-jfg-4908"
+	seedBinding(t, root, Binding{Name: "b", ChannelID: "c1", ProjectDir: "/home/x/project/fatgame", Worktree: worktree, Root: bRoot})
+
+	other := filepath.Join(home, ".claude", "projects", projectSlug("/home/x/project/some-other-repo"), "memory", "steal.md")
+	hookJSON := `{"cwd":"` + worktree + `","tool_name":"Write","tool_input":{"file_path":"` + other + `"}}`
+
+	var out bytes.Buffer
+	done := make(chan struct{})
+	go func() {
+		_ = RunPermissionGate(context.Background(), root, strings.NewReader(hookJSON), &out, 10*time.Second)
+		close(done)
+	}()
+
+	waitFor(t, func() bool { return oldestPendingPermission(bRoot) != "" })
+	id := oldestPendingPermission(bRoot)
+	if id == "" {
+		t.Fatal("another project's memory dir must ask the channel")
 	}
 	if err := resolvePermission(bRoot, id, true, false); err != nil {
 		t.Fatal(err)

@@ -119,6 +119,37 @@ func scratchpadRoot(worktree string) string {
 	return filepath.Join(os.TempDir(), fmt.Sprintf("claude-%d", os.Getuid()), projectSlug(worktree))
 }
 
+// memoryDirs 回傳這個 binding 的 session 可以自由寫入的自動記憶目錄
+// （~/.claude/projects/<slug>/memory）。ProjectDir 與 Worktree 兩個 slug 都要
+// 放行：worker 跑在 worktree 裡，但 Claude Code 的記憶目錄是掛在專案主 repo
+// 上（worktree 的 slug 未必是實際落地的那個），兩者取聯集才不會漏。範圍只到
+// memory 子目錄，不是整個 projects/<slug>/——transcript 不歸 Write 工具管。
+// 其他專案的記憶目錄不在內，跨專案寫入仍然要問。
+func memoryDirs(projectDir, worktree string) []string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return nil
+	}
+	var dirs []string
+	for _, p := range []string{projectDir, worktree} {
+		if p == "" {
+			continue
+		}
+		dirs = append(dirs, filepath.Join(home, ".claude", "projects", projectSlug(p), "memory"))
+	}
+	return dirs
+}
+
+// inAnyScope 是 inScope 的多目錄版本（任一命中即可）。
+func inAnyScope(roots []string, path string) bool {
+	for _, r := range roots {
+		if inScope(r, path) {
+			return true
+		}
+	}
+	return false
+}
+
 // matchedRiskyPattern returns the risky pattern a bash command matches (install,
 // download, privilege, destructive), or "" if none. The pattern doubles as the
 // "remember" key, so approving once can auto-allow that category later.
@@ -270,6 +301,11 @@ func RunPermissionGate(ctx context.Context, registryRoot string, in io.Reader, o
 		// worker 被指示把草稿寫在那裡，漏掉它等於每份草稿都要人按一次按鈕。
 		case inScope(scratchpadRoot(b.Worktree), path):
 			fmt.Fprint(out, hookDecisionJSON(true, "permission gate: session scratchpad write auto-allowed"))
+			return nil
+		// 第四個放行區：這個專案自己的自動記憶目錄。記憶功能就是設計成 session
+		// 會主動寫檔，每存一則記憶都要人按一次按鈕同樣沒有意義。
+		case inAnyScope(memoryDirs(b.ProjectDir, b.Worktree), path):
+			fmt.Fprint(out, hookDecisionJSON(true, "permission gate: project memory write auto-allowed"))
 			return nil
 		}
 	}
