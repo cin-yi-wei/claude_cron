@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -29,6 +31,16 @@ func (s *StubExecutor) Start(_ context.Context, task A2ATask, prompt string) err
 	s.LastPrompt = prompt
 	return nil
 }
+
+// a2aContextIDRe bounds the caller-controlled contextId. SessionNameFor feeds
+// it through sanitize (watcher.go), which strips every non-alphanumeric
+// character. If this let through dashes, underscores, dots, spaces, etc.,
+// two different contextIds (e.g. "c-1" and "c_1") could sanitize down to the
+// same session name and collide once real sandboxes exist. Restricting the
+// charset to plain alphanumerics makes sanitize a no-op on any accepted
+// contextId, so distinct valid contextIds can never collide downstream.
+// 1-128 chars is a conservative bound on a caller-supplied token.
+var a2aContextIDRe = regexp.MustCompile(`^[A-Za-z0-9]{1,128}$`)
 
 // MessageSendParams is the params body of the message/send method.
 type MessageSendParams struct {
@@ -114,6 +126,10 @@ func (s *A2AServer) handleRPC(w http.ResponseWriter, r *http.Request) {
 		writeRPC(w, RPCFail(req.ID, RPCInvalidParams, "agent and contextId are required"))
 		return
 	}
+	if !a2aContextIDRe.MatchString(p.ContextID) {
+		writeRPC(w, RPCFail(req.ID, RPCInvalidParams, "contextId must be 1-128 alphanumeric characters"))
+		return
+	}
 
 	agents, err := LoadAgents(s.Root)
 	if err != nil {
@@ -127,7 +143,13 @@ func (s *A2AServer) handleRPC(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// The grant list is the whole policy: every capability the agent needs must
-	// have been granted to this caller. No runtime prompt.
+	// have been granted to this caller. No runtime prompt. An agent that
+	// declares zero capabilities must fail closed, not open — it must state
+	// what it needs in order to be callable at all.
+	if len(agent.Capabilities) == 0 {
+		writeRPC(w, RPCFail(req.ID, RPCForbidden, "agent "+agent.Name+" declares no capabilities and cannot be called"))
+		return
+	}
 	for _, need := range agent.Capabilities {
 		if !caller.Allows(need) {
 			writeRPC(w, RPCFail(req.ID, RPCForbidden, "caller lacks capability "+need))
@@ -140,6 +162,20 @@ func (s *A2AServer) handleRPC(w http.ResponseWriter, r *http.Request) {
 		writeRPC(w, RPCFail(req.ID, RPCInternalError, "task store unavailable"))
 		return
 	}
+
+	// contextId is caller-controlled. Without an ownership check, a second
+	// caller could reuse another caller's contextId and overwrite its task row
+	// (CallerID, Session, State), making the original task unbookkeepable. A
+	// caller may only reuse a contextId that is unclaimed, terminal, or
+	// already theirs.
+	if existing, ok := tasks.ByContext(p.ContextID); ok {
+		active := existing.State == TaskSubmitted || existing.State == TaskWorking
+		if active && existing.CallerID != caller.CallerID {
+			writeRPC(w, RPCFail(req.ID, RPCForbidden, "contextId is owned by another caller"))
+			return
+		}
+	}
+
 	task := A2ATask{
 		ContextID: p.ContextID,
 		TaskID:    p.TaskID,
@@ -157,7 +193,19 @@ func (s *A2AServer) handleRPC(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.Executor.Start(r.Context(), task, p.Text); err != nil {
-		writeRPC(w, RPCFail(req.ID, RPCInternalError, "dispatch failed: "+err.Error()))
+		// Never echo the underlying error to an internet-facing caller: once
+		// the real executor lands, this detail will carry worktree paths, git
+		// output and tmux state — exactly the private project information
+		// this design exists to keep off the wire. Log it server-side instead,
+		// and mark the task failed so it stops occupying capacity forever.
+		log.Printf("a2a: dispatch failed for task %s (agent=%s contextId=%s): %v", task.TaskID, task.Agent, task.ContextID, err)
+		task.State = TaskFailed
+		task.Detail = err.Error()
+		tasks.Upsert(task)
+		if serr := SaveTasks(s.Root, tasks); serr != nil {
+			log.Printf("a2a: failed to persist failed task state for %s/%s: %v", task.Agent, task.ContextID, serr)
+		}
+		writeRPC(w, RPCFail(req.ID, RPCInternalError, "dispatch failed"))
 		return
 	}
 

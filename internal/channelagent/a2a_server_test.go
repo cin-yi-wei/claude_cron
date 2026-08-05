@@ -1,7 +1,10 @@
 package channelagent
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -146,5 +149,248 @@ func TestUnknownMethodRejected(t *testing.T) {
 	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
 	if resp.Error == nil || resp.Error.Code != RPCMethodNotFound {
 		t.Fatalf("want method not found, got %#v", resp.Error)
+	}
+}
+
+// --- Fix-round coverage (review findings 1-5) ---
+
+// failingExecutor lets tests force a dispatch failure without touching tmux.
+type failingExecutor struct {
+	err error
+}
+
+func (f *failingExecutor) Start(_ context.Context, _ A2ATask, _ string) error {
+	return f.err
+}
+
+// Finding 1: a dispatch failure must never echo the underlying error text
+// (worktree paths, git/tmux output) to the internet-facing caller.
+func TestDispatchFailureMessageIsGeneric(t *testing.T) {
+	s, _ := newTestA2AServer(t)
+	secretErr := errors.New("worktree /home/conray/private-project: git checkout failed")
+	s.Executor = &failingExecutor{err: secretErr}
+
+	rec := postRPC(t, s.Handler(), "secret-1", `{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"agent":"codereview","contextId":"c1","text":"hi"}}`)
+	var resp RPCResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	if resp.Error == nil {
+		t.Fatal("want an error, got success")
+	}
+	if resp.Error.Code != RPCInternalError {
+		t.Fatalf("code = %d, want RPCInternalError", resp.Error.Code)
+	}
+	if strings.Contains(resp.Error.Message, "private-project") || strings.Contains(resp.Error.Message, "git checkout") {
+		t.Fatalf("internal error detail leaked to caller: %q", resp.Error.Message)
+	}
+}
+
+// Finding 4: a failed dispatch must not leave the task row stuck in a
+// non-terminal state forever, silently eating capacity.
+func TestFailedDispatchMarksTaskFailedNotSubmitted(t *testing.T) {
+	s, root := newTestA2AServer(t)
+	s.Executor = &failingExecutor{err: errors.New("boom")}
+
+	rec := postRPC(t, s.Handler(), "secret-1", `{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"agent":"codereview","contextId":"c1","text":"hi"}}`)
+	var resp RPCResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	if resp.Error == nil {
+		t.Fatal("want an error, got success")
+	}
+
+	tasks, _ := LoadTasks(root)
+	tk, ok := tasks.ByContext("c1")
+	if !ok {
+		t.Fatal("task not persisted")
+	}
+	if tk.State != TaskFailed {
+		t.Fatalf("state = %s, want failed (a failed dispatch must not stay submitted forever)", tk.State)
+	}
+	if tk.Detail == "" {
+		t.Fatal("Detail should carry the failure reason server-side")
+	}
+	if tasks.ActiveCount() != 0 {
+		t.Fatalf("ActiveCount = %d, want 0 (a failed dispatch must not keep occupying capacity)", tasks.ActiveCount())
+	}
+}
+
+// Finding 2: an agent that declares zero capabilities must fail closed, not
+// open. The grant list is stated to be the entire policy; an agent that asks
+// for nothing must not be callable by everyone.
+func TestZeroCapabilityAgentDeniedByDefault(t *testing.T) {
+	s, root := newTestA2AServer(t)
+	agents, _ := LoadAgents(root)
+	agents.Agents[0].Capabilities = nil
+	_ = SaveAgents(root, agents)
+
+	rec := postRPC(t, s.Handler(), "secret-1", `{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"agent":"codereview","contextId":"c1","text":"hi"}}`)
+	var resp RPCResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	if resp.Error == nil || resp.Error.Code != RPCForbidden {
+		t.Fatalf("want forbidden for a zero-capability agent, got %#v", resp.Error)
+	}
+	tasks, _ := LoadTasks(root)
+	if _, ok := tasks.ByContext("c1"); ok {
+		t.Fatal("task was persisted for a denied zero-capability agent")
+	}
+}
+
+// Finding 3a: a contextId is caller-controlled. A second caller must not be
+// able to hijack another caller's contextId and overwrite its task row, while
+// the original owner resubmitting the same contextId (a legitimate
+// multi-turn continuation) must still work.
+func TestContextIDOwnershipEnforced(t *testing.T) {
+	s, root := newTestA2AServer(t)
+	callers, _ := LoadCallers(root)
+	_ = callers.Register("peer-b", "secret-2")
+	callers.Approve("peer-b", []string{"read"})
+	if err := SaveCallers(root, callers); err != nil {
+		t.Fatalf("SaveCallers: %v", err)
+	}
+
+	// peer-a opens context c1.
+	rec := postRPC(t, s.Handler(), "secret-1", `{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"agent":"codereview","contextId":"c1","text":"hi"}}`)
+	var resp RPCResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	if resp.Error != nil {
+		t.Fatalf("setup: unexpected error: %#v", resp.Error)
+	}
+
+	// peer-a continuing its own context must still be allowed.
+	rec = postRPC(t, s.Handler(), "secret-1", `{"jsonrpc":"2.0","id":2,"method":"message/send","params":{"agent":"codereview","contextId":"c1","text":"follow up"}}`)
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	if resp.Error != nil {
+		t.Fatalf("owner continuation: unexpected error: %#v", resp.Error)
+	}
+
+	// peer-b trying to hijack peer-a's contextId must be forbidden.
+	rec = postRPC(t, s.Handler(), "secret-2", `{"jsonrpc":"2.0","id":3,"method":"message/send","params":{"agent":"codereview","contextId":"c1","text":"steal"}}`)
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	if resp.Error == nil || resp.Error.Code != RPCForbidden {
+		t.Fatalf("want forbidden for a contextId hijack attempt, got %#v", resp.Error)
+	}
+
+	tasks, _ := LoadTasks(root)
+	tk, ok := tasks.ByContext("c1")
+	if !ok {
+		t.Fatal("task missing")
+	}
+	if tk.CallerID != "peer-a" {
+		t.Fatalf("CallerID = %q, want peer-a (task must not be hijacked by another caller)", tk.CallerID)
+	}
+	if tk.Prompt != "follow up" {
+		t.Fatalf("Prompt = %q, want the owner's last message, not the hijacker's", tk.Prompt)
+	}
+}
+
+// Finding 3b: contextId is fed through sanitize() (watcher.go) inside
+// SessionNameFor, which strips every non-alphanumeric character. Reject
+// anything outside a conservative alphanumeric charset and length bound at
+// the boundary so two distinct accepted contextIds can never collide once
+// they reach SessionNameFor.
+func TestContextIDCharsetAndLengthValidated(t *testing.T) {
+	s, _ := newTestA2AServer(t)
+	invalid := []string{
+		"c 1",                    // space
+		"c.1",                    // dot
+		"c/1",                    // slash
+		"c-1",                    // dash: would sanitize to the same session as "c1"
+		"c_1",                    // underscore: same collision risk
+		strings.Repeat("a", 129), // over the length bound
+	}
+	for _, cid := range invalid {
+		body := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"agent":"codereview","contextId":%q,"text":"hi"}}`, cid)
+		rec := postRPC(t, s.Handler(), "secret-1", body)
+		var resp RPCResponse
+		_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+		if resp.Error == nil || resp.Error.Code != RPCInvalidParams {
+			t.Fatalf("contextId %q: want invalid params, got %#v", cid, resp.Error)
+		}
+	}
+}
+
+// Finding 5: a disabled agent must be indistinguishable from one that does
+// not exist at all, so the card's opt-in exposure cannot be probed around.
+func TestDisabledAgentIndistinguishableFromNonexistent(t *testing.T) {
+	s, root := newTestA2AServer(t)
+	agents, _ := LoadAgents(root)
+	_ = agents.Add(Agent{Name: "ghost", ProjectDir: "/p/y", Description: "d", Capabilities: []string{"read"}, Enabled: false})
+	if err := SaveAgents(root, agents); err != nil {
+		t.Fatalf("SaveAgents: %v", err)
+	}
+
+	body := `{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"agent":"ghost","contextId":"c2","text":"hi"}}`
+	rec1 := postRPC(t, s.Handler(), "secret-1", body)
+	var resp1 RPCResponse
+	_ = json.Unmarshal(rec1.Body.Bytes(), &resp1)
+
+	// Now the agent doesn't exist at all.
+	agents2, _ := LoadAgents(root)
+	agents2.Remove("ghost")
+	if err := SaveAgents(root, agents2); err != nil {
+		t.Fatalf("SaveAgents: %v", err)
+	}
+
+	rec2 := postRPC(t, s.Handler(), "secret-1", body)
+	var resp2 RPCResponse
+	_ = json.Unmarshal(rec2.Body.Bytes(), &resp2)
+
+	if resp1.Error == nil || resp2.Error == nil {
+		t.Fatalf("expected errors in both cases, got %#v / %#v", resp1.Error, resp2.Error)
+	}
+	if resp1.Error.Code != RPCInvalidParams {
+		t.Fatalf("disabled-agent code = %d, want RPCInvalidParams", resp1.Error.Code)
+	}
+	if resp1.Error.Code != resp2.Error.Code || resp1.Error.Message != resp2.Error.Message {
+		t.Fatalf("disabled vs nonexistent agent responses differ: %#v vs %#v", resp1.Error, resp2.Error)
+	}
+}
+
+// Finding 5: the request body must be size-limited. We can't directly assert
+// on memory use from a unit test, but we can assert the security-relevant
+// consequence: an oversized body must never result in an accepted, persisted
+// task — that would mean the limit silently stopped applying.
+func TestOversizedBodyNeverProducesATask(t *testing.T) {
+	s, root := newTestA2AServer(t)
+	huge := strings.Repeat("a", 2<<20) // 2MiB, past the 1MiB io.LimitReader cap
+	body := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"agent":"codereview","contextId":"c1","text":%q}}`, huge)
+	if len(body) <= 1<<20 {
+		t.Fatalf("test body not large enough: %d bytes", len(body))
+	}
+
+	rec := postRPC(t, s.Handler(), "secret-1", body)
+	var resp RPCResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	if resp.Error == nil {
+		t.Fatalf("want an error for an oversized body, got success: %#v", resp.Result)
+	}
+	tasks, _ := LoadTasks(root)
+	if _, ok := tasks.ByContext("c1"); ok {
+		t.Fatal("oversized body must never result in a persisted task")
+	}
+}
+
+// Finding 5: an Authorization header that is present but malformed (wrong
+// scheme, or "Bearer" with no token) must be rejected exactly like a missing
+// header — not accidentally treated as a valid credential.
+func TestMalformedAuthorizationHeaderRejected(t *testing.T) {
+	s, _ := newTestA2AServer(t)
+	cases := []struct {
+		name   string
+		header string
+	}{
+		{"raw token, no scheme", "secret-1"},
+		{"Bearer with empty token", "Bearer "},
+		{"wrong scheme", "Basic secret-1"},
+	}
+	for _, c := range cases {
+		req := httptest.NewRequest(http.MethodPost, "/a2a", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"agent":"codereview","contextId":"c1","text":"hi"}}`))
+		req.Header.Set("Authorization", c.header)
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, req)
+		var resp RPCResponse
+		_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+		if resp.Error == nil || resp.Error.Code != RPCUnauthorized {
+			t.Fatalf("%s: want unauthorized, got %#v", c.name, resp.Error)
+		}
 	}
 }
