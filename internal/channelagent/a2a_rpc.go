@@ -48,6 +48,14 @@ func ParseRPC(body []byte) (RPCRequest, *RPCError) {
 }
 
 func RPCOK(id any, result any) RPCResponse {
+	if result == nil {
+		// Result any `json:"result,omitempty"` only omits the field when the
+		// interface itself is nil — a legitimate "success, no payload" ack
+		// would otherwise silently drop the key, leaving the response with
+		// neither "result" nor "error". Substitute an explicit JSON null so
+		// the key always survives.
+		result = json.RawMessage("null")
+	}
 	return RPCResponse{JSONRPC: "2.0", ID: id, Result: result}
 }
 
