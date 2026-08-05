@@ -82,6 +82,22 @@ func assertFailedRowKeepsIdentity(t *testing.T, root, contextID, wantWorktree, w
 	}
 }
 
+// seedTask persists task into the store exactly as given, standing in for
+// any actor that writes a row independently of the executor: a2a_server.go
+// before it ever calls Executor.Start, an operator cancel path, or task 11's
+// future sweep.
+func seedTask(t *testing.T, root string, task A2ATask) {
+	t.Helper()
+	tasks, err := LoadTasks(root)
+	if err != nil {
+		t.Fatalf("LoadTasks: %v", err)
+	}
+	tasks.Upsert(task)
+	if err := SaveTasks(root, tasks); err != nil {
+		t.Fatalf("SaveTasks: %v", err)
+	}
+}
+
 // seedSubmittedTask mimics what a2a_server.go actually does before ever
 // calling TaskExecutor.Start: it persists the task as TaskSubmitted with no
 // Worktree/Branch yet (those are the executor's job to compute). Tests must
@@ -92,14 +108,7 @@ func assertFailedRowKeepsIdentity(t *testing.T, root, contextID, wantWorktree, w
 // with.
 func seedSubmittedTask(t *testing.T, root string, task A2ATask) {
 	t.Helper()
-	tasks, err := LoadTasks(root)
-	if err != nil {
-		t.Fatalf("LoadTasks: %v", err)
-	}
-	tasks.Upsert(task)
-	if err := SaveTasks(root, tasks); err != nil {
-		t.Fatalf("SaveTasks: %v", err)
-	}
+	seedTask(t, root, task)
 }
 
 func TestSandboxExecutorMarksFailedWhenStartFails(t *testing.T) {
@@ -199,5 +208,103 @@ func TestSandboxExecutorPersistsIdentityBeforeSessionSideEffects(t *testing.T) {
 	}
 	if spy.sawSession != session {
 		t.Fatalf("session not persisted before EnsureWorkspace: got %q want %q", spy.sawSession, session)
+	}
+}
+
+// TestSandboxExecutorPersistGuardRefusesToReviveTerminalRow pins the
+// round-2 latent-issue finding: persist() must not silently revert an
+// already-terminal row back to Submitted. Unreachable in production today
+// (nothing yet cancels a task before Executor.Start runs), but task 11 adds
+// exactly such a sweep, so the guard is required now.
+func TestSandboxExecutorPersistGuardRefusesToReviveTerminalRow(t *testing.T) {
+	root := t.TempDir()
+	agents := AgentStore{}
+	_ = agents.Add(Agent{Name: "codereview", ProjectDir: "/p/x", Enabled: true})
+	_ = SaveAgents(root, agents)
+
+	session := SessionNameFor("codereview", "c1")
+	seedTask(t, root, A2ATask{ContextID: "c1", Agent: "codereview", Session: session, State: TaskCanceled, Detail: "canceled by operator"})
+
+	fake := &FakeSessionManager{}
+	ex := NewSandboxExecutor(root, fake)
+	task := A2ATask{ContextID: "c1", Agent: "codereview", Session: session, State: TaskSubmitted}
+	if err := ex.Start(context.Background(), task, "x"); err != nil {
+		t.Fatalf("Start should report success for an already-terminal task (an error here would let a2a_server.go clobber it to Failed), got: %v", err)
+	}
+
+	if len(fake.Workspaces) != 0 || len(fake.Started) != 0 || len(fake.Injected) != 0 {
+		t.Fatalf("no side effect should run once the row is already terminal: workspaces=%v started=%v injected=%v", fake.Workspaces, fake.Started, fake.Injected)
+	}
+
+	tasks, _ := LoadTasks(root)
+	got, ok := tasks.ByContext("c1")
+	if !ok {
+		t.Fatal("task row must not disappear")
+	}
+	if got.State != TaskCanceled || got.Detail != "canceled by operator" {
+		t.Fatalf("terminal row must be left untouched, got %#v", got)
+	}
+}
+
+// cancelDuringInject wraps FakeSessionManager and, immediately after a
+// successful Inject, flips the on-disk task row to TaskCanceled —
+// simulating an external actor canceling the task in the narrow window
+// while its session was still starting. This is round 2's terminal-conflict
+// sub-case: by the time Start reaches its final check, EnsureWorkspace and
+// Sessions.Start have already succeeded, so a real (fake) session is
+// "running" that the now-canceled row no longer references.
+type cancelDuringInject struct {
+	*FakeSessionManager
+	root      string
+	contextID string
+}
+
+func (c *cancelDuringInject) Inject(ctx context.Context, root string, msg SourceMessage) error {
+	if err := c.FakeSessionManager.Inject(ctx, root, msg); err != nil {
+		return err
+	}
+	tasks, _ := LoadTasks(c.root)
+	if cur, ok := tasks.ByContext(c.contextID); ok {
+		cur.State = TaskCanceled
+		cur.Detail = "canceled mid-start"
+		tasks.Upsert(cur)
+		_ = SaveTasks(c.root, tasks)
+	}
+	return nil
+}
+
+// TestSandboxExecutorTearsDownSessionWhenTaskCanceledDuringStart pins the
+// chosen resolution for round-2 finding 2: when the row is found terminal
+// after the session is already up, Start must stop that session (no
+// orphan) and report success (never an error a2a_server.go would clobber
+// the terminal row with), leaving the canceled row exactly as it was.
+func TestSandboxExecutorTearsDownSessionWhenTaskCanceledDuringStart(t *testing.T) {
+	root := t.TempDir()
+	agents := AgentStore{}
+	_ = agents.Add(Agent{Name: "codereview", ProjectDir: "/p/x", Enabled: true})
+	_ = SaveAgents(root, agents)
+
+	session := SessionNameFor("codereview", "c1")
+	spy := &cancelDuringInject{FakeSessionManager: &FakeSessionManager{}, root: root, contextID: "c1"}
+	ex := NewSandboxExecutor(root, spy)
+
+	task := A2ATask{ContextID: "c1", Agent: "codereview", Session: session, State: TaskSubmitted}
+	seedSubmittedTask(t, root, task)
+
+	if err := ex.Start(context.Background(), task, "x"); err != nil {
+		t.Fatalf("Start should report success (row already terminal) rather than an error a2a_server.go would clobber, got: %v", err)
+	}
+
+	if len(spy.Stopped) != 1 || spy.Stopped[0] != session {
+		t.Fatalf("orphaned session must be stopped, got Stopped=%#v", spy.Stopped)
+	}
+
+	tasks, _ := LoadTasks(root)
+	got, ok := tasks.ByContext("c1")
+	if !ok {
+		t.Fatal("task row must not disappear")
+	}
+	if got.State != TaskCanceled || got.Detail != "canceled mid-start" {
+		t.Fatalf("canceled row must be left exactly as it was, got %#v", got)
 	}
 }

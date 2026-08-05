@@ -2,6 +2,7 @@ package channelagent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"path/filepath"
@@ -36,12 +37,35 @@ func SandboxWorktree(projectDir, session string) string {
 // BranchFor namespaces sandbox branches so they are obvious in git output.
 func BranchFor(session string) string { return "aa/" + session }
 
+// isTerminal reports whether a TaskState is one CanTransition treats as
+// final: nothing may transition out of it. Round 2 of the task-8 review
+// treats "already terminal" as its own case, distinct from a transient I/O
+// error: it means some other actor (an operator, or task 11's future sweep)
+// already decided this task's fate, and that decision must not be reverted.
+func isTerminal(s TaskState) bool {
+	return s == TaskFailed || s == TaskCompleted || s == TaskCanceled
+}
+
+// errTaskAlreadyTerminal signals that persist found the on-disk row already
+// terminal. Callers must NOT let this surface as a returned error from
+// Start: a2a_server.go marks ANY non-nil Start() error TaskFailed
+// unconditionally, using its own stale pre-call copy of the task — which
+// would clobber the true terminal state this guard exists to protect.
+var errTaskAlreadyTerminal = errors.New("task already reached a terminal state")
+
 // persist writes task into the store, preserving whatever other tasks are
-// already there.
+// already there. It refuses to overwrite an already-terminal row: without
+// this guard, a call racing behind an external cancel/complete/fail would
+// silently revive the row back to task.State (task-8 review round 2,
+// latent-issue finding — unreachable today, but task 11 adds a sweep that
+// would hit it).
 func (e *SandboxExecutor) persist(task A2ATask) error {
 	tasks, err := LoadTasks(e.Root)
 	if err != nil {
 		return err
+	}
+	if cur, ok := tasks.ByContext(task.ContextID); ok && isTerminal(cur.State) {
+		return errTaskAlreadyTerminal
 	}
 	tasks.Upsert(task)
 	return SaveTasks(e.Root, tasks)
@@ -102,6 +126,14 @@ func (e *SandboxExecutor) Start(ctx context.Context, task A2ATask, prompt string
 	// that already points at whatever got created — never an orphaned
 	// worktree/session that nothing references (task-8 review finding 1).
 	if err := e.persist(task); err != nil {
+		if errors.Is(err, errTaskAlreadyTerminal) {
+			// The row was already terminal (e.g. canceled) before we ever
+			// created a worktree or session. Nothing has happened yet, so
+			// there is nothing to tear down: bail out without touching the
+			// row, and report success rather than an error a2a_server.go
+			// would clobber it with (task-8 review round 2, finding 2).
+			return nil
+		}
 		e.markFailed(task, "persist sandbox identity: "+err.Error())
 		return err
 	}
@@ -134,16 +166,31 @@ func (e *SandboxExecutor) Start(ctx context.Context, task A2ATask, prompt string
 
 	// From this point the sandbox is genuinely running: EnsureWorkspace,
 	// Start and Inject all succeeded. a2a_server.go treats ANY non-nil error
-	// returned from Start as TaskFailed, unconditionally — so a transient
-	// failure to update bookkeeping here must NOT be surfaced as an error,
-	// or a live, working sandbox gets mislabeled failed while its session
-	// keeps running untracked (task-8 review finding 2). We choose to return
-	// success and leave the row for the normal lifecycle to reconcile,
-	// rather than fabricate a failure that contradicts the sandbox's actual
-	// state.
+	// returned from Start as TaskFailed, unconditionally, using its own
+	// stale pre-call copy of the task — so nothing below may return an
+	// error, or a live, working sandbox gets mislabeled failed (or a true
+	// terminal state gets clobbered back to Failed). Every branch here
+	// reports success; the two terminal-vs-transient sub-cases are handled
+	// distinctly (task-8 review round 2, finding 2).
 	tasks, err := LoadTasks(e.Root)
 	if err != nil {
+		// Transient I/O error: the session really is running and we simply
+		// couldn't reload the store to record TaskWorking. Log and leave the
+		// row for the normal lifecycle to reconcile rather than fabricate a
+		// failure that contradicts the sandbox's actual state.
 		log.Printf("a2a: session %s is running but reloading the task store to mark it working failed: %v", task.Session, err)
+		return nil
+	}
+	if cur, ok := tasks.ByContext(task.ContextID); ok && isTerminal(cur.State) {
+		// The task reached a terminal state (most likely canceled) while its
+		// session was starting: EnsureWorkspace/Start/Inject already
+		// succeeded, so a real tmux session is now running that this
+		// terminal row does not reference. Tear it down — the work in
+		// flight is correctly discarded, since the task was already decided
+		// — and leave the terminal row exactly as it is.
+		if serr := e.Sessions.Stop(ctx, task.Session); serr != nil {
+			log.Printf("a2a: task %s reached terminal state %s during start; stopping its orphaned session %s failed: %v", task.ContextID, cur.State, task.Session, serr)
+		}
 		return nil
 	}
 	if cur, ok := tasks.ByContext(task.ContextID); ok && !CanTransition(cur.State, TaskWorking) {
