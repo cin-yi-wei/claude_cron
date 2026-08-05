@@ -192,6 +192,17 @@ func (s *A2AServer) handleRPC(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !HasCapacity(tasks) {
+		// Queued, not rejected: it stays in TaskSubmitted for DrainQueue.
+		writeRPC(w, RPCOK(req.ID, map[string]any{
+			"contextId": task.ContextID,
+			"taskId":    task.TaskID,
+			"state":     string(TaskSubmitted),
+			"queued":    true,
+		}))
+		return
+	}
+
 	if err := s.Executor.Start(r.Context(), task, p.Text); err != nil {
 		// Never echo the underlying error to an internet-facing caller: once
 		// the real executor lands, this detail will carry worktree paths, git
