@@ -935,10 +935,14 @@ type RPCError struct {
 }
 
 type RPCResponse struct {
-	JSONRPC string    `json:"jsonrpc"`
-	ID      any       `json:"id"`
-	Result  any       `json:"result,omitempty"`
-	Error   *RPCError `json:"error,omitempty"`
+	JSONRPC string `json:"jsonrpc"`
+	ID      any    `json:"id"`
+	// omitempty on Result is required so an error response carries no result
+	// key. But it also omits a nil result, which would leave a success response
+	// with NEITHER result nor error — forbidden by JSON-RPC 2.0. RPCOK therefore
+	// substitutes an explicit JSON null for a nil result; see below.
+	Result any       `json:"result,omitempty"`
+	Error  *RPCError `json:"error,omitempty"`
 }
 
 func ParseRPC(body []byte) (RPCRequest, *RPCError) {
@@ -956,6 +960,11 @@ func ParseRPC(body []byte) (RPCRequest, *RPCError) {
 }
 
 func RPCOK(id any, result any) RPCResponse {
+	if result == nil {
+		// Explicit JSON null: without this, omitempty drops the field and the
+		// response carries neither result nor error.
+		result = json.RawMessage("null")
+	}
 	return RPCResponse{JSONRPC: "2.0", ID: id, Result: result}
 }
 
