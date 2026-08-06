@@ -242,7 +242,7 @@ func (d *SandboxDriver) loop(ctx context.Context, task A2ATask, inj Injector) {
 					// screen.go:180。SelectTrustSettings 是 supervisor.go 的
 					// 登入 watchdog 用的同一個 helper；沙盒沒有人可以問，得自
 					// 己回這個閘。
-					h := gateHash("managedSettings", low)
+					h := gateHash("managedSettings")
 					if h != lastAnsweredHash {
 						if err := guardedKeystrokes(session, func() error {
 							return TmuxInjector{Session: session}.SelectTrustSettings(ctx)
@@ -256,7 +256,7 @@ func (d *SandboxDriver) loop(ctx context.Context, task A2ATask, inj Injector) {
 					loginStrikes = 0
 				case !paneHasConclusiveLoginPhrase(low) && paneAwaitingLoginContinue(low):
 					// screen.go:174。同上，送一個 Enter 推進去。
-					h := gateHash("loginContinue", low)
+					h := gateHash("loginContinue")
 					if h != lastAnsweredHash {
 						if err := guardedKeystrokes(session, func() error {
 							return TmuxInjector{Session: session}.PressEnter(ctx)
@@ -273,14 +273,31 @@ func (d *SandboxDriver) loop(ctx context.Context, task A2ATask, inj Injector) {
 					// classifyScreen 其他子情況（select-login-method / paste
 					// code / URL / transient「請執行 /login」）。沙盒永遠不
 					// 驅動登入流程：那是 operator 的事，一個沙盒去操作 /login
-					// 會動到全機共用的憑證。但這裡不能單拍就判定——同一段話
-					// 只要連續 loginFailureStrikes 拍都還在，才真的像是登出
-					// 而不是一次性的 grep 命中；worktree 保留供 forensics。
-					lastAnsweredHash = ""
-					loginStrikes++
-					if loginStrikes >= loginFailureStrikes {
-						markSandboxLoginFailure(d.root, task, channel)
-						return
+					// 會動到全機共用的憑證。
+					//
+					// 但這裡還不能就此判定失敗：如果畫面同時還亮著 spinner（esc
+					// to interrupt / ↓ tokens），這個沙盒明明還在工作——真的登出
+					// 的畫面不會有 spinner，這幾乎必然是它自己在 grep/Read
+					// screen.go 或 relogin.go（或顯示一份引用了這些字面字串的
+					// diff），字面字串恰好落在這一拍的截圖裡。這道檢查跟
+					// loginStrikes 是兩道獨立防線：只要 spinner 還在，這一拍就
+					// 完全不計 strike，不管門檻設多少——「還在工作」本身就是
+					// 判定「不是登出」的直接證據，不必等連續多拍才確認。見
+					// paneIsActivelyWorking。
+					//
+					// spinner 消失之後才看 loginStrikes：同一段話只要連續
+					// loginFailureStrikes 拍都還在，才真的像是登出而不是一次性
+					// 的 grep 命中；worktree 保留供 forensics。
+					if paneIsActivelyWorking(low) {
+						lastAnsweredHash = ""
+						loginStrikes = 0
+					} else {
+						lastAnsweredHash = ""
+						loginStrikes++
+						if loginStrikes >= loginFailureStrikes {
+							markSandboxLoginFailure(d.root, task, channel)
+							return
+						}
 					}
 					skip = true
 				}
@@ -395,18 +412,26 @@ func (t *driverErrorThrottle) allow(msg string, now time.Time) bool {
 var driverPollInterval = time.Second
 
 // loginFailureStrikes is how many CONSECUTIVE ticks must classify a pane as a
-// genuine login failure (ScreenLogin, neither known post-login gate) before
-// the task is actually failed. A real logout persists tick over tick — the
-// pane keeps showing it until an operator intervenes. A healthy sandbox that
-// greps/reads screen.go or relogin.go, or renders a diff quoting their
-// literal phrases, renders those substrings for exactly the one capture that
-// catches it mid-tool-call; the next capture has moved on to the tool's
-// result or the next turn. Requiring persistence across multiple captures
-// (rather than a boot-window timer) catches both cases correctly regardless
-// of WHEN in the task's lifetime the phrase appears — a boot-only grace would
-// not protect a mid-task grep hit, which is exactly the failure mode this
-// guards against.
-const loginFailureStrikes = 3
+// genuine login failure (ScreenLogin, neither known post-login gate, AND not
+// actively working — see paneIsActivelyWorking) before the task is actually
+// failed. A real logout persists tick over tick, indefinitely, until an
+// operator intervenes — there is no cost to waiting tens of ticks for
+// certainty. A healthy sandbox that greps/reads screen.go or relogin.go, or
+// renders a diff quoting their literal phrases, can leave that text sitting
+// on the pane for the rest of a long tool call or turn — tens of SECONDS at
+// this driver's ~1s poll interval, not merely one capture. 3 strikes (pinned
+// by an earlier round as "small enough that a genuine logout still fails
+// within a few ticks") tolerated only about three seconds of that — nowhere
+// near enough, and it is what let a healthy sandbox reading its own source
+// code get marked failed and abandoned. Raised to 30 (~30s at the real
+// driverPollInterval): still resolves a genuine logout in well under a
+// minute, but gives comfortable headroom over how long a single grep/Read
+// tool call's output can plausibly linger on screen without the working
+// indicator (paneIsActivelyWorking) also being true — which is checked FIRST
+// and is the primary defense; this count is the backstop for the moments
+// between tool calls where the spinner may not be up yet a stale phrase is
+// still on screen.
+const loginFailureStrikes = 30
 
 // loginConclusivePhrases mirrors screen.go:38's list. classifyScreen treats
 // any of these as conclusive proof of a genuine logout no matter where in the
@@ -435,12 +460,49 @@ func paneHasConclusiveLoginPhrase(low string) bool {
 	return false
 }
 
-// gateHash produces a short debounce key for one of the two known
-// screen-and-answer gates (managed settings / login continue) — the loop
-// equivalent of confirmDialog.hash() for the confirm-dialog path. kind keeps
-// the two gates from ever comparing equal to each other by coincidence.
-func gateHash(kind, low string) string {
-	h := sha1.Sum([]byte(kind + "\x00" + low))
+// paneIsActivelyWorking mirrors screen.go:106's ScreenWorking spinner cue
+// (low is ANSI-stripped, lowercased). classifyScreen itself never reaches
+// that check for a pane also carrying a conclusive login phrase — the phrase
+// check at screen.go:38 runs first and wins unconditionally — so a sandbox
+// that is genuinely still generating/running a tool WHILE its own pane
+// happens to display "not logged in" (from grepping/reading screen.go,
+// relogin.go, or a diff quoting them) is classified ScreenLogin, not
+// ScreenWorking, by classifyScreen. This driver cannot change that priority
+// (screen.go is out of scope; supervisor.go relies on its exact ordering for
+// ~40 production cc- bindings), so it re-checks the same spinner signal here,
+// independently, for its OWN narrower decision: "is this pane showing signs
+// of active work RIGHT NOW." A pane that is actively working is never a
+// genuine logout — an authentication failure does not render a spinner — so
+// this is checked before loginStrikes is ever incremented, not merely
+// factored into the threshold. Keep in sync with screen.go:106 if that
+// detector's signal set ever changes.
+func paneIsActivelyWorking(low string) bool {
+	return strings.Contains(low, "esc to interrupt") || strings.Contains(low, "· ↓") ||
+		strings.Contains(low, "↓ ") && strings.Contains(low, "tokens")
+}
+
+// gateHash produces a debounce key for one of the two known screen-and-answer
+// gates (managed settings / login continue) — the loop equivalent of
+// confirmDialog.hash() for the confirm-dialog path.
+//
+// Unlike an earlier version of this function, it does NOT hash any pane text
+// — only kind, the gate's own stable identity. Both gates are fixed-phrase
+// matches (paneAwaitingManagedSettings/paneAwaitingLoginContinue): there is no
+// "different dialog with the same kind" case the way a confirm dialog can have
+// a different question/options, so kind alone fully identifies "which
+// occurrence this is." Hashing the whole (ANSI-stripped, lowercased) pane text
+// instead — as this function used to — meant ANY incidental redraw while the
+// gate was still up (the selection highlight repainting after our own "1"
+// lands, a terminal resize reflowing the line wrap) changed the hash even
+// though the same gate was still showing, making the loop treat it as a brand
+// new occurrence and re-send [1 Enter]. A caller that has already moved past
+// this gate (pane now idle, or a fresh occurrence later) is still detected
+// correctly: every OTHER branch in loop() resets lastAnsweredHash to "" the
+// moment classification stops matching whatever produced it, so a genuinely
+// new occurrence of the same gate — after the pane visibly left this state in
+// between — is answered again regardless of kind alone being unchanged.
+func gateHash(kind string) string {
+	h := sha1.Sum([]byte("gate\x00" + kind))
 	return hex.EncodeToString(h[:8])
 }
 

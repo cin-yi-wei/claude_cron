@@ -553,6 +553,88 @@ func TestSandboxDriverAdvancesLoginContinueScreen(t *testing.T) {
 	}
 }
 
+// managedSettingsPaneFixtureResized carries the exact two substrings
+// paneAwaitingManagedSettings requires, and is still the SAME gate as
+// managedSettingsPaneFixture — but differs in incidental whitespace/line
+// layout (one blank line collapsed), standing in for a resize reflow or the
+// selection-highlight repaint after our own "1" lands. Neither of those is a
+// new occurrence of the gate.
+const managedSettingsPaneFixtureResized = `
+ Managed settings require approval
+ This project has managed settings. Do you trust these settings?
+ ❯ 1. Yes, I trust these settings
+   2. No, exit
+`
+
+// TestSandboxDriverGateDebounceSurvivesIncidentalRedraw pins review Minor 1:
+// gateHash must key off the gate's STABLE identity (which of the two known
+// gates this is), the way confirmDialog.hash() keys off the parsed
+// question+options rather than raw pane text. The old gateHash hashed the
+// whole (ANSI-stripped, lowercased) pane — so ANY incidental redraw while the
+// SAME gate was still up (a resize, the selection highlight repainting after
+// our own "1" lands) changed the hash and made the loop treat it as a brand
+// new occurrence, re-sending [1 Enter]. That stray "1" would land in the
+// input box of a session that has since gone idle and submit as a prompt —
+// exactly the risk the debounce exists to prevent. This test alternates
+// between two textually different renders of the SAME gate every tick; the
+// gate must still be answered exactly once.
+func TestSandboxDriverGateDebounceSurvivesIncidentalRedraw(t *testing.T) {
+	oldOut, oldRun := runExternalCommandOutput, runExternalCommand
+	defer func() { runExternalCommandOutput, runExternalCommand = oldOut, oldRun }()
+	oldPoll := driverPollInterval
+	driverPollInterval = 20 * time.Millisecond
+	defer func() { driverPollInterval = oldPoll }()
+	oldDelay := injectSubmitDelay
+	injectSubmitDelay = 5 * time.Millisecond
+	defer func() { injectSubmitDelay = oldDelay }()
+
+	var mu sync.Mutex
+	var sent []string
+	tick := 0
+	runExternalCommandOutput = func(_ context.Context, _ string, _ ...string) (string, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		tick++
+		if tick%2 == 1 {
+			return managedSettingsPaneFixture, nil
+		}
+		return managedSettingsPaneFixtureResized, nil
+	}
+	runExternalCommand = func(_ context.Context, _ string, args ...string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		sent = append(sent, args[len(args)-1])
+		return nil
+	}
+
+	root := t.TempDir()
+	task := A2ATask{ContextID: "c1", Agent: "pm", Session: SessionNameFor("pm", "c1"), State: TaskWorking}
+	_ = Init(SandboxRoot(root, task.Session))
+
+	d := NewSandboxDriver(root, time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d.Ensure(ctx, task, &recordingInjector{})
+	time.Sleep(500 * time.Millisecond) // many ticks, alternating render each time
+	d.StopAll()
+
+	if len(sent) != 2 || sent[0] != "1" || sent[1] != "Enter" {
+		t.Fatalf("keystrokes = %#v, want the gate answered EXACTLY ONCE with [1 Enter] despite incidental pane redraws between ticks", sent)
+	}
+}
+
+// gateHash must depend only on which gate this is, not on any pane text —
+// see TestSandboxDriverGateDebounceSurvivesIncidentalRedraw for the
+// behavioural version of this guarantee through the full driver loop.
+func TestGateHashDependsOnlyOnKind(t *testing.T) {
+	if gateHash("managedSettings") != gateHash("managedSettings") {
+		t.Fatal("gateHash must be stable for the same gate kind")
+	}
+	if gateHash("managedSettings") == gateHash("loginContinue") {
+		t.Fatal("gateHash must distinguish the two different gate kinds")
+	}
+}
+
 // 真的登出時，沙盒永遠不驅動登入流程：那是 operator 的事，一個沙盒去操作
 // /login 會動到全機共用的憑證。任務標 failed 並停掉本 driver — 但要連續
 // loginFailureStrikes 拍都判為登出才失敗（review Critical），所以這裡把
@@ -614,16 +696,79 @@ const screenGrepHitFixture = `
 // healthyIdlePaneFixture 是完全正常、沒有任何登入相關字串的待命畫面。
 const healthyIdlePaneFixture = "\n 好，已經看完了。\n\n ❯ \n"
 
-// TestSandboxDriverToleratesTransientLoginPhraseInHealthyPane pins the review
-// Critical fix: a login-phrase hit that does NOT persist across ticks (a grep
-// result the pane moves past almost immediately) must never fail the task —
-// only loginFailureStrikes CONSECUTIVE ticks may. Before the fix this failed
-// the task on the very first tick.
-func TestSandboxDriverToleratesTransientLoginPhraseInHealthyPane(t *testing.T) {
+// screenGrepHitWhileWorkingFixture is screenGrepHitFixture's payload PLUS the
+// spinner status line Claude Code renders while a turn is actually running
+// ("esc to interrupt · <elapsed> · ↓ <tokens>"). This is the actual review
+// Critical repro, not the old round's alternating fixture: a healthy sandbox
+// mid-tool-call has BOTH the grep hit's literal phrase AND the working
+// indicator on the SAME capture, and the phrase can stay on screen — with the
+// spinner still up — for tens of seconds, not just one tick.
+const screenGrepHitWhileWorkingFixture = `
+ ● Bash(grep -n "not logged in" internal/channelagent/screen.go)
+   ⎿  38:  for _, sig := range []string{"invalid authentication credentials", "not logged in", "/login to authenticate"} {
+
+ ✳ Thinking… (esc to interrupt · 12s · ↓ 3.2k tokens)
+`
+
+// TestSandboxDriverToleratesPersistentLoginPhraseWhileWorking pins the review
+// Critical fix, reproduced faithfully this time: the PREVIOUS round's test
+// (TestSandboxDriverToleratesTransientLoginPhraseInHealthyPane, since removed)
+// alternated the grep-hit fixture with a completely clean pane every other
+// tick — exactly the one shape that survives ANY strike count trivially,
+// because the phrase never appeared on two consecutive captures, so the
+// strike counter (and therefore the defect it was meant to catch) was never
+// actually exercised. Real healthy sandboxes don't clear the screen between
+// ticks; the phrase plus the spinner sit on the SAME capture, unchanged, for
+// as long as the tool call/turn keeps running. This fixture never changes and
+// is held for far longer than the (now-raised) loginFailureStrikes count —
+// the task must never be failed while the pane keeps showing the active-work
+// indicator, no matter how many ticks pass.
+func TestSandboxDriverToleratesPersistentLoginPhraseWhileWorking(t *testing.T) {
+	var sent []string
+	stubTmuxPane(t, screenGrepHitWhileWorkingFixture, &sent)
+	oldPoll := driverPollInterval
+	driverPollInterval = 10 * time.Millisecond
+	defer func() { driverPollInterval = oldPoll }()
+
+	root := t.TempDir()
+	task := A2ATask{ContextID: "c1", Agent: "pm", Session: SessionNameFor("pm", "c1"), State: TaskWorking}
+	_ = Init(SandboxRoot(root, task.Session))
+	_ = WithTasks(root, func(s *TaskStore) error { s.Upsert(task); return nil })
+
+	d := NewSandboxDriver(root, time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d.Ensure(ctx, task, &recordingInjector{})
+	// (loginFailureStrikes+20) 拍，遠遠超過門檻 —— 連舊的 3 拍門檻都撐不住這
+	// 個常數畫面，證明擋下失敗的是 spinner 檢查本身，不是門檻高低。
+	time.Sleep(time.Duration(loginFailureStrikes+20) * 10 * time.Millisecond)
+	d.StopAll()
+
+	tasks, _ := LoadTasks(root)
+	tk, _ := tasks.ByContext("c1")
+	if tk.State == TaskFailed {
+		t.Fatalf("task failed while the pane still showed the active-working indicator: state=%q detail=%q", tk.State, tk.Detail)
+	}
+	if len(sent) != 0 {
+		t.Fatalf("keystrokes = %#v, want none — this pane is not one of the two known gates", sent)
+	}
+}
+
+// TestSandboxDriverToleratesTenConsecutiveLoginPhraseHitsBelowRaisedThreshold
+// pins the OTHER half of the review Critical fix — raising loginFailureStrikes
+// from 3 to a number that reflects a real logout — independently of the
+// spinner check above. Ten consecutive hits with NO working indicator at all
+// must still not fail the task under the raised threshold, even though it
+// would have failed at (old) loginFailureStrikes=3 by the third hit.
+func TestSandboxDriverToleratesTenConsecutiveLoginPhraseHitsBelowRaisedThreshold(t *testing.T) {
+	const hits = 10
+	if loginFailureStrikes <= hits {
+		t.Fatalf("test assumption broken: loginFailureStrikes=%d must exceed %d for this test to discriminate the raised threshold", loginFailureStrikes, hits)
+	}
 	oldOut, oldRun := runExternalCommandOutput, runExternalCommand
 	defer func() { runExternalCommandOutput, runExternalCommand = oldOut, oldRun }()
 	oldPoll := driverPollInterval
-	driverPollInterval = 30 * time.Millisecond
+	driverPollInterval = 10 * time.Millisecond
 	defer func() { driverPollInterval = oldPoll }()
 
 	var mu sync.Mutex
@@ -632,13 +777,11 @@ func TestSandboxDriverToleratesTransientLoginPhraseInHealthyPane(t *testing.T) {
 		mu.Lock()
 		defer mu.Unlock()
 		tick++
-		if tick%2 == 1 {
-			// 奇數拍：健康沙盒剛好在讀/grep 自己的原始碼，畫面上短暫出現確
-			// 鑿字串。
+		if tick <= hits {
+			// 連續 hits 拍都是確鑿字串（沒有 spinner），模擬一次持續數秒但終
+			// 究會過去的殘留畫面。
 			return screenGrepHitFixture, nil
 		}
-		// 偶數拍：畫面已經翻頁翻過去了，回到完全健康的待命畫面——證明這個字
-		// 串從未連續出現超過一拍。
 		return healthyIdlePaneFixture, nil
 	}
 	runExternalCommand = func(_ context.Context, _ string, _ ...string) error { return nil }
@@ -652,14 +795,13 @@ func TestSandboxDriverToleratesTransientLoginPhraseInHealthyPane(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	d.Ensure(ctx, task, &recordingInjector{})
-	// 遠遠超過 loginFailureStrikes 拍（在舊行為下，第一拍就會失敗）。
-	time.Sleep(600 * time.Millisecond)
+	time.Sleep(time.Duration(loginFailureStrikes+20) * 10 * time.Millisecond)
 	d.StopAll()
 
 	tasks, _ := LoadTasks(root)
 	tk, _ := tasks.ByContext("c1")
 	if tk.State == TaskFailed {
-		t.Fatalf("task failed on a transient (non-consecutive) login-phrase hit in an otherwise healthy pane: state=%q detail=%q", tk.State, tk.Detail)
+		t.Fatalf("task failed after only %d consecutive hits, below loginFailureStrikes=%d: state=%q detail=%q", hits, loginFailureStrikes, tk.State, tk.Detail)
 	}
 }
 
@@ -756,24 +898,47 @@ func TestDriverErrorThrottleDeduplicatesAndCaps(t *testing.T) {
 	}
 }
 
-// review Minor 2: allow must be a ROLLING one-minute window, not a tumbling
-// one. A tumbling window (fixed clock-minute buckets) resets wholesale at the
-// minute boundary, so 60 distinct errors right before the boundary plus 60
-// more right after add up to 120 lines inside one real 60-second span — the
-// cap it claims to enforce would be meaningless.
+// review Minor 2: the ORIGINAL version of this test (kept here in the
+// comment, not the code) filled the cap with 60 entries all timestamped at
+// t=59s, then asserted a 61st was still blocked at t=61s. That assertion
+// holds under BOTH a genuine rolling window AND a tumbling one whose anchor
+// happens to be set by the first call (t=59s): from either implementation's
+// perspective only 2s have elapsed since the anchor, so no reset fires
+// either way — the test could not fail against the pre-fix tumbling code, it
+// only happened to also pass against the post-fix rolling code. A test that
+// cannot fail proves nothing.
+//
+// The actual distinguishing behaviour between rolling and tumbling is HOW
+// capacity is freed as time passes, not merely "does old traffic still
+// count shortly after." A rolling window frees capacity one entry at a time,
+// exactly as each individual entry ages past 60s. A tumbling window frees
+// capacity in one lump when the whole bucket resets. So: fill the cap with
+// 60 DISTINCT entries spread one per second (t=0..59s) — at any point during
+// that fill, no entry is yet 60s old, so nothing is pruned and all 60 succeed
+// (same as the dedup/cap test). Then, at t=60.5s — just past when the SINGLE
+// t=0s entry (and only that one) has aged out of the last-60s window — a new
+// distinct message must be admitted (exactly one slot freed). Immediately
+// asking for a SECOND new message at the same instant must still be
+// refused: only one entry (t=0s) has aged out so far, entries from t=1s
+// onward are all still within the window. A tumbling implementation that
+// resets its whole bucket once 60s have elapsed since its anchor would
+// instead admit a burst of new messages right at that boundary, not exactly
+// one — so this genuinely fails against a reintroduced tumbling
+// implementation, unlike the original assertion.
 func TestDriverErrorThrottleIsRollingNotTumbling(t *testing.T) {
 	th := newDriverErrorThrottle()
 	base := time.Now()
-	// 60 個各不相同的錯誤集中在視窗尾端（t=59s）。
 	for i := 0; i < 60; i++ {
-		if !th.allow(fmt.Sprintf("a%d", i), base.Add(59*time.Second)) {
-			t.Fatalf("distinct error a%d at t=59s must be emitted", i)
+		at := base.Add(time.Duration(i) * time.Second)
+		if !th.allow(fmt.Sprintf("a%d", i), at) {
+			t.Fatalf("distinct error a%d at t=%ds must be emitted while filling the window", i, i)
 		}
 	}
-	// t=61s 距離 t=59s 只過了 2 秒，兩批理應同屬「最近 60 秒」——tumbling
-	// window 會在 t=60s 邊界整批重置，讓這裡又能塞滿 60 個；rolling window
-	// 不能。
-	if th.allow("b0", base.Add(61*time.Second)) {
-		t.Fatal("a rolling one-minute window must still count the t=59s batch at t=61s")
+	justPastFirstExpiry := base.Add(60*time.Second + 500*time.Millisecond)
+	if !th.allow("f0", justPastFirstExpiry) {
+		t.Fatal("a rolling window must free exactly the one slot (t=0s) that has aged past 60s")
+	}
+	if th.allow("f1", justPastFirstExpiry) {
+		t.Fatal("only ONE slot aged out — a second brand-new message at the same instant must still be suppressed, not admitted by a whole-bucket reset")
 	}
 }
