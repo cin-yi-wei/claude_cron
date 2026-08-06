@@ -1314,3 +1314,164 @@ func TestSweepFailsTasksWhoseSessionVanished(t *testing.T) {
 		t.Fatalf("c2 = %q; a task inside the liveness grace must be left alone", c2.State)
 	}
 }
+
+// D6, running half: DrainQueue's revalidation never sees a row again once it
+// reaches TaskWorking — it never returns to DrainQueue's claim loop. A caller
+// revoked while its sandbox is already running must still be stopped from
+// acting, not merely bounded by HardTimeout. sweep now closes that gap by
+// rewriting the sandbox's policy to revoked (denying its very next tool call)
+// and routing the actual teardown through the existing stopOnly/
+// stopSessionGuarded path.
+func TestSweepRevokesRunningTaskWhoseCallerWasRevoked(t *testing.T) {
+	root := t.TempDir()
+	var callers CallerStore
+	_ = callers.Register("peer-a", "s")
+	callers.Approve("peer-a", []string{"read"})
+	callers.SetGrantLevel("peer-a", GrantFull)
+	callers.Revoke("peer-a")
+	_ = SaveCallers(root, callers)
+
+	var agents AgentStore
+	_ = agents.Add(Agent{Name: "a", ProjectDir: "/p/a", Capabilities: []string{"read"}, Enabled: true})
+	_ = SaveAgents(root, agents)
+
+	now := time.Now().UTC()
+	const session = "aa-a-c1"
+	var s TaskStore
+	s.Upsert(A2ATask{
+		ContextID: "c1", TaskID: "t1", Agent: "a", CallerID: "peer-a", Level: GrantFull,
+		Session: session, State: TaskWorking, StartedAt: now.Format(time.RFC3339),
+	})
+	if err := SaveTasks(root, s); err != nil {
+		t.Fatalf("SaveTasks: %v", err)
+	}
+	if err := WriteSandboxPolicy(root, SandboxPolicy{
+		Session: session, ContextID: "c1", Agent: "a", CallerID: "peer-a", Level: GrantFull,
+	}); err != nil {
+		t.Fatalf("WriteSandboxPolicy: %v", err)
+	}
+
+	fake := &FakeSessionManager{}
+	if _, _, err := SweepTimeouts(context.Background(), root, fake, now, nil); err != nil {
+		t.Fatalf("SweepTimeouts: %v", err)
+	}
+
+	// 政策檔必須立刻變成 revoked：gate 每次工具呼叫都重讀，這是唯一真正讓
+	// 沙盒下一次工具呼叫就被擋的動作。
+	pol, err := LoadSandboxPolicy(root, session)
+	if err != nil {
+		t.Fatalf("LoadSandboxPolicy: %v", err)
+	}
+	if pol.Level != GrantRevoked {
+		t.Fatalf("policy level = %q, want revoked — a running sandbox's very next tool call must be denied", pol.Level)
+	}
+
+	// row 必須落在一個「說明原因」的終態，不是繼續 TaskWorking，也不是被
+	// 誤標成 canceled（那會套錯 forensics 邊界）。
+	got, _ := LoadTasks(root)
+	tk, _ := got.ByContext("c1")
+	if tk.State != TaskFailed || !strings.Contains(tk.Detail, "revoked") {
+		t.Fatalf("row = %q / %q, want failed with a revocation detail", tk.State, tk.Detail)
+	}
+
+	// 既有的單一拆除路徑必須真的跑到：driver/tmux 停掉，不是只改政策檔跟
+	// row 狀態就結束。
+	if len(fake.Stopped) != 1 || fake.Stopped[0] != session {
+		t.Fatalf("session not stopped: %#v — the existing single teardown path must still run", fake.Stopped)
+	}
+}
+
+// task 9 review: ordering must be fail-safe in the OTHER direction too — the
+// slower step (stopping the session) failing must never leave the sandbox
+// MORE capable than the (already revoked) policy says. Capability removal
+// happened first and does not get undone by a later failure.
+func TestSweepPolicyRevocationSurvivesSessionStopFailure(t *testing.T) {
+	root := t.TempDir()
+	var callers CallerStore
+	_ = callers.Register("peer-a", "s")
+	callers.Approve("peer-a", []string{"read"})
+	callers.Revoke("peer-a")
+	_ = SaveCallers(root, callers)
+	var agents AgentStore
+	_ = agents.Add(Agent{Name: "a", ProjectDir: "/p/a", Capabilities: []string{"read"}, Enabled: true})
+	_ = SaveAgents(root, agents)
+
+	now := time.Now().UTC()
+	const session = "aa-a-c1"
+	var s TaskStore
+	s.Upsert(A2ATask{
+		ContextID: "c1", TaskID: "t1", Agent: "a", CallerID: "peer-a", Level: GrantReadOnly,
+		Session: session, State: TaskWorking, StartedAt: now.Format(time.RFC3339),
+	})
+	if err := SaveTasks(root, s); err != nil {
+		t.Fatalf("SaveTasks: %v", err)
+	}
+	if err := WriteSandboxPolicy(root, SandboxPolicy{
+		Session: session, ContextID: "c1", Agent: "a", CallerID: "peer-a", Level: GrantReadOnly,
+	}); err != nil {
+		t.Fatalf("WriteSandboxPolicy: %v", err)
+	}
+
+	fake := &FakeSessionManager{FailOn: "stop"} // the slower teardown step fails
+	if _, _, err := SweepTimeouts(context.Background(), root, fake, now, nil); err != nil {
+		t.Fatalf("SweepTimeouts: %v", err)
+	}
+
+	pol, err := LoadSandboxPolicy(root, session)
+	if err != nil {
+		t.Fatalf("LoadSandboxPolicy: %v", err)
+	}
+	if pol.Level != GrantRevoked {
+		t.Fatalf("policy level = %q, want revoked regardless of the later session-stop failure", pol.Level)
+	}
+	got, _ := LoadTasks(root)
+	tk, _ := got.ByContext("c1")
+	if tk.State != TaskFailed {
+		t.Fatalf("row state = %q, want failed even though the session itself could not be stopped", tk.State)
+	}
+}
+
+// task 9 review: the mirror ordering proof — if the FIRST, fastest step
+// (the policy rewrite itself) fails, nothing downstream may run: the row
+// must stay exactly as capable as before (still TaskWorking, session never
+// touched), never transitioned to a state that implies it was handled when
+// its policy was, in fact, never revoked. session is deliberately an invalid
+// sandbox session name (rejected by PolicyPath's regex) — a clean,
+// deterministic, OS-independent way to force RevokeSandboxPolicy to fail
+// without touching filesystem permissions.
+func TestSweepLeavesRunningTaskUntouchedWhenPolicyRevocationFails(t *testing.T) {
+	root := t.TempDir()
+	var callers CallerStore
+	_ = callers.Register("peer-a", "s")
+	callers.Approve("peer-a", []string{"read"})
+	callers.Revoke("peer-a")
+	_ = SaveCallers(root, callers)
+	var agents AgentStore
+	_ = agents.Add(Agent{Name: "a", ProjectDir: "/p/a", Capabilities: []string{"read"}, Enabled: true})
+	_ = SaveAgents(root, agents)
+
+	now := time.Now().UTC()
+	const session = "aa bad session" // fails sandboxSessionRe
+	var s TaskStore
+	s.Upsert(A2ATask{
+		ContextID: "c1", TaskID: "t1", Agent: "a", CallerID: "peer-a", Level: GrantReadOnly,
+		Session: session, State: TaskWorking, StartedAt: now.Format(time.RFC3339),
+	})
+	if err := SaveTasks(root, s); err != nil {
+		t.Fatalf("SaveTasks: %v", err)
+	}
+
+	fake := &FakeSessionManager{}
+	if _, _, err := SweepTimeouts(context.Background(), root, fake, now, nil); err != nil {
+		t.Fatalf("SweepTimeouts: %v", err)
+	}
+
+	got, _ := LoadTasks(root)
+	tk, _ := got.ByContext("c1")
+	if tk.State != TaskWorking {
+		t.Fatalf("row state = %q, want still working — a failed policy revocation must retry next sweep, not fail the row while its policy was never actually touched", tk.State)
+	}
+	if len(fake.Stopped) != 0 {
+		t.Fatalf("session must not be stopped when its policy could not be revoked: %#v", fake.Stopped)
+	}
+}

@@ -626,6 +626,90 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 		})
 	}
 
+	// --- 撤銷偵測，跑得到的一半（D6）。DrainQueue 的重驗證只碰得到還在佇列
+	// 裡、還沒認領成功的 row——一旦一列真的變成 TaskWorking（或還在
+	// TaskDispatching 途中），它再也不會回到 DrainQueue 的認領迴圈，caller
+	// 被撤銷、agent 被停用完全不會反映到它身上，只能等它自然做完或撐到兩
+	// 小時硬逾時。這裡補上對稱的一半：重讀 callers.json / agents.json，套
+	// 用跟 DrainQueue 完全一樣的 drainRejectReason，任何驗證失敗的
+	// TaskWorking / TaskDispatching row 先把政策檔覆寫成 revoked——這是
+	// 唯一真正讓沙盒下一次工具呼叫就被擋的動作，比等 session 被拆掉快得
+	// 多——再交給既有的單一拆除路徑（下面的 stopOnly + stopSessionGuarded，
+	// 跟派送中崩潰那條路完全同一段程式碼）停掉 driver 與 tmux，不新開第二
+	// 條拆除路徑。CallerID 為空的 row 視為不受 A2A caller/agent 授權模型
+	// 管轄（合成/內部用途；真正經 message/send 派送的任務一律有非空
+	// CallerID），略過——否則會誤殺大量跟撤銷完全無關、本來就沒有登記
+	// caller 的既有沙盒逾時/回收測試。
+	var authCheck []A2ATask
+	_ = WithTasks(root, func(tasks *TaskStore) error {
+		for _, t := range tasks.Tasks {
+			if t.State != TaskWorking && t.State != TaskDispatching {
+				continue
+			}
+			if t.Session == "" || t.CallerID == "" {
+				continue
+			}
+			authCheck = append(authCheck, t)
+		}
+		return errNothingSwept // 只讀不寫
+	})
+	if len(authCheck) > 0 {
+		callers, cerr := LoadCallers(root)
+		agents, aerr := LoadAgents(root)
+		for _, t := range authCheck {
+			reason := drainRejectReason(callers, agents, cerr, aerr, t)
+			if reason == "" {
+				continue
+			}
+			unlock, ok := tryLockSandboxSessionForTeardown(t.Session)
+			if !ok {
+				log.Printf("a2a: sweep: context %s 的 session %s 目前正在使用中，本輪跳過撤銷，留給下一次 sweep", t.ContextID, t.Session)
+				continue
+			}
+			// 重新確認身分：authCheck 是在上面釋放鎖之前讀到的快照，鎖內動手
+			// 前必須再讀一次，否則可能撤銷一個剛好合法重新建起來的新任務
+			// （跟 candidateStillMatches / stopTargetStillMatches 同一個道
+			// 理，直接借用後者的欄位比對——TaskID/State/Session 三欄）。
+			pre := stopTarget{taskID: t.TaskID, contextID: t.ContextID, session: t.Session, state: t.State}
+			if !stopTargetStillMatches(root, pre) {
+				log.Printf("a2a: sweep: context %s 在撤銷前已換身分，跳過（不動它的 session）", t.ContextID)
+				unlock()
+				continue
+			}
+			// 能力先收回，任何更慢的事之後才做（fail-safe 的核心順序）：
+			// 覆寫政策檔失敗就整段放棄，row 保持原樣、留給下一次 sweep 重
+			// 試——絕不能先把 row 轉成 failed、卻讓沙盒帶著原本沒被動過的
+			// 政策檔繼續跑，那樣它反而變得比修之前更難被發現還在運作。
+			if err := RevokeSandboxPolicy(root, t.Session); err != nil {
+				log.Printf("a2a: sweep: 撤銷 %s 的政策檔失敗，本輪放棄（下一趟重試）: %v", t.Session, err)
+				unlock()
+				continue
+			}
+			changed := false
+			_ = WithTasks(root, func(tasks *TaskStore) error {
+				cur, ok := tasks.ByContext(t.ContextID)
+				if !ok || cur.TaskID != t.TaskID || cur.State != t.State || cur.Session != t.Session {
+					return errNothingSwept
+				}
+				cur.State = TaskFailed
+				cur.Detail = reason
+				cur.CompletedAt = now.UTC().Format(time.RFC3339)
+				tasks.Upsert(cur)
+				changed = true
+				return nil
+			})
+			unlock()
+			if changed {
+				// 併入既有的 stopOnly：跟派送中崩潰那條路完全相同的落地
+				// 方式——不多開一條拆除路徑，只是多一種產生 stopTarget 的
+				// 理由。worktree/Session 留給鑑識，跟任何其他 TaskFailed
+				// row 一樣，由 MaxRetainedFailedSandboxes 的上限機制決定
+				// 何時真的回收。
+				stopOnly = append(stopOnly, stopTarget{taskID: t.TaskID, contextID: t.ContextID, session: t.Session, state: TaskFailed})
+			}
+		}
+	}
+
 	// --- Step 2: 鎖外。每個 session 一把鎖，鎖內才准動手，動不了就放棄。 ---
 	//
 	// stopOnly 的 session（TaskFailed 殘留、只停不拆）先處理。刻意不追蹤
