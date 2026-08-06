@@ -100,6 +100,30 @@ RunWorkerOnce(ctx, SandboxRoot(root, task.Session),
 
 **做法**：沙盒回收時一併移除 worktree 與 sandbox root。`failed` 仍依 forensics 規則保留 — 但需補一條**上限**（保留數量或保留天數），否則 forensics 規則本身就是一條無上限成長路徑。
 
+## 沙盒的內建對話框（C1 的上游問題）
+
+Claude Code 自己的確認框（信任資料夾、`Do you want to proceed?`）**不受 PreToolUse hook 管**。現有唯一的處理是 `supervisor.go:660` 的 confirm watchdog，它把對話框發到**該 binding 的頻道**再把回覆打進 pane。沙盒不是 binding，這條路不存在。
+
+而 `EnsureWorktree` 會對每個新 worktree 執行 `EnsureAgentSettings`，新資料夾第一次開 session 必定跳信任提示（2026-08-06 `cc-calc-dev` 實測如此）。因此**每個新沙盒都會在 prompt 送進去之前就卡住**，無人可答，直到 2 小時後被 sweep 砍掉。這比 C1 更前面。
+
+**做法（採 1+3）**：
+
+1. **預先消除**：沙盒建立時就把信任狀態預先寫好，讓提示根本不跳。需先確認 Claude Code 把信任記錄在哪、是否可預設。
+2. **自動回答**：仍然跳出來的內建對話框，由驅動 goroutine 偵測並自動回答（信任 = 1、proceed = 1）。這與「授權清單就是全部政策」一致——對外的門已在 A2A 層守過。
+
+自動回答**只適用於 `aa-` 沙盒**。`cc-` binding 的 confirm watchdog 行為完全不動。
+
+## agent 頻道（唯讀輸出）
+
+每個 `aa-<agent>` **身分**擁有一個 Discord 頻道；`aa-<agent>-<ctx>` 任務實例**不另開頻道**。同一個 agent 的多個併發任務共用該頻道。用途是能見度與監控——看得出它到底有沒有在動。
+
+- **單向輸出**。該頻道**絕不 ingest**。這是安全要求，不只是簡化：若吃進使用者輸入，任何能在 Discord 打字的人就能直接對沙盒下指令，繞過整個 A2A 認證與能力授權。實作上必須確保它不被註冊進任何 poll/push ingest 路徑。
+- **每則輸出必須標註 contextId**（短前綴即可）。同一頻道會有多個併發任務交錯，沒有標註就是一團無法解讀的雜訊。
+- **沿用既有 activity mirror**（`activity.go`）。它已經在做「把 session 正在做什麼串到頻道」，且 `discord.go:255-268` 已有 per-channel throttle 與 429 `retry_after` 退避——那是 2026-06 activity ticker 爆量 429 之後補的。不要另寫一條發送路徑繞過它。
+- **併發量需留意**：最多 8 個沙盒同時串流到少數幾個 agent 頻道，是既有 throttle 未曾承受過的形狀。需驗證 throttle 是 per-channel 而非 per-binding。
+
+`cc-` 任務委派給某個 agent 時，該工作的輸出出現在該 agent 的頻道，而非委派來源的頻道。
+
 ## 明確不做
 
 - 不改動 `cc-` 機制（`bindings.json` / `registry.go` / `supervisor.go` / `reap.go`）
