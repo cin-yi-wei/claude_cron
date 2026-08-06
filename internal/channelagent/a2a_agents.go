@@ -17,6 +17,11 @@ type Agent struct {
 	Description  string   `json:"description"`
 	Capabilities []string `json:"capabilities"`
 	Enabled      bool     `json:"enabled"`
+	// ChannelID is this agent identity's output-only Discord channel. All of the
+	// agent's concurrent tasks stream there so an operator can see whether work
+	// is actually progressing. It is NEVER ingested: reading it would let anyone
+	// who can type in Discord drive a sandbox, bypassing A2A auth entirely.
+	ChannelID string `json:"channel_id,omitempty"`
 }
 
 type AgentStore struct {
