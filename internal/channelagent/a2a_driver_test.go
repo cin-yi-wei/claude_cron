@@ -2,6 +2,7 @@ package channelagent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -188,7 +189,10 @@ func TestAutoAnswerSandboxConfirmAnswersRealDialog(t *testing.T) {
 	var sent []string
 	stubTmuxPane(t, confirmPaneFixture, &sent)
 
-	got := autoAnswerSandboxConfirm(context.Background(), "aa-codereview-c1", confirmPaneFixture, "")
+	got, err := autoAnswerSandboxConfirm(context.Background(), "aa-codereview-c1", confirmPaneFixture, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if got == "" {
 		t.Fatal("expected a non-empty dialog hash after answering a real dialog")
 	}
@@ -204,7 +208,10 @@ func TestAutoAnswerSandboxConfirmIgnoresProse(t *testing.T) {
 	var sent []string
 	stubTmuxPane(t, proseNumberedListFixture, &sent)
 
-	got := autoAnswerSandboxConfirm(context.Background(), "aa-codereview-c1", proseNumberedListFixture, "")
+	got, err := autoAnswerSandboxConfirm(context.Background(), "aa-codereview-c1", proseNumberedListFixture, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if got != "" {
 		t.Fatalf("hash = %q, want empty — prose must not parse as a confirm dialog", got)
 	}
@@ -222,7 +229,10 @@ func TestAutoAnswerSandboxConfirmNeverTouchesCCSession(t *testing.T) {
 	var sent []string
 	stubTmuxPane(t, confirmPaneFixture, &sent) // a REAL dialog is showing
 
-	got := autoAnswerSandboxConfirm(context.Background(), "cc-somebinding", confirmPaneFixture, "")
+	got, err := autoAnswerSandboxConfirm(context.Background(), "cc-somebinding", confirmPaneFixture, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if got != "" {
 		t.Fatalf("hash = %q, want empty — cc- sessions must never be auto-answered", got)
 	}
@@ -239,8 +249,11 @@ func TestAutoAnswerSandboxConfirmDebouncesRepeatedDialog(t *testing.T) {
 	var sent []string
 	stubTmuxPane(t, confirmPaneFixture, &sent)
 
-	h1 := autoAnswerSandboxConfirm(context.Background(), "aa-codereview-c1", confirmPaneFixture, "")
-	h2 := autoAnswerSandboxConfirm(context.Background(), "aa-codereview-c1", confirmPaneFixture, h1)
+	h1, err1 := autoAnswerSandboxConfirm(context.Background(), "aa-codereview-c1", confirmPaneFixture, "")
+	h2, err2 := autoAnswerSandboxConfirm(context.Background(), "aa-codereview-c1", confirmPaneFixture, h1)
+	if err1 != nil || err2 != nil {
+		t.Fatalf("unexpected errors: %v, %v", err1, err2)
+	}
 
 	if h1 == "" || h1 != h2 {
 		t.Fatalf("hash changed across identical dialog captures: h1=%q h2=%q", h1, h2)
@@ -259,12 +272,41 @@ func TestAutoAnswerSandboxConfirmRequiresPrefixNotSubstring(t *testing.T) {
 	var sent []string
 	stubTmuxPane(t, confirmPaneFixture, &sent) // a REAL dialog is showing
 
-	got := autoAnswerSandboxConfirm(context.Background(), "cc-aa-not-a-sandbox", confirmPaneFixture, "")
+	got, err := autoAnswerSandboxConfirm(context.Background(), "cc-aa-not-a-sandbox", confirmPaneFixture, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if got != "" {
 		t.Fatalf("hash = %q, want empty — a session merely containing \"aa-\" must not be auto-answered", got)
 	}
 	if len(sent) != 0 {
 		t.Fatalf("keystrokes = %#v, want none", sent)
+	}
+}
+
+// The aa- prefix check exists on every keystroke-sending site, not just at the
+// top of autoAnswerSandboxConfirm — guardedKeystrokes is the shared primitive
+// each site (managed-settings gate, login-continue gate, confirm dialog) routes
+// through. Unit-tested directly here since it's cheap and precise.
+func TestGuardedKeystrokesRefusesNonAASession(t *testing.T) {
+	called := false
+	err := guardedKeystrokes("cc-somebinding", func() error { called = true; return nil })
+	if err == nil {
+		t.Fatal("want an error for a non-aa- session")
+	}
+	if called {
+		t.Fatal("send must never be invoked for a non-aa- session")
+	}
+}
+
+func TestGuardedKeystrokesInvokesSendForAASession(t *testing.T) {
+	called := false
+	err := guardedKeystrokes("aa-codereview-c1", func() error { called = true; return nil })
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !called {
+		t.Fatal("send must be invoked for an aa- session")
 	}
 }
 
@@ -435,9 +477,21 @@ const loggedOutPaneFixture = `
 // typeAndSubmit，把 prompt 打進核准畫面；驗證條件是「輸入框裡還有沒有字」
 // （adapters.go:94），核准畫面沒有輸入框 → Inject 回報成功、job 移進 done、
 // prompt 消失。skip 掉才擋得住。
+//
+// This also pins the debounce (review Important 1): the fixture pane never
+// changes, so without a debounce the gate would be re-answered every tick for
+// as long as the driver runs. driverPollInterval is sped up so the test can
+// observe several ticks — and therefore several chances to double-send —
+// without a multi-second sleep.
 func TestSandboxDriverSkipsWorkOnManagedSettingsGate(t *testing.T) {
 	var sent []string
 	stubTmuxPane(t, managedSettingsPaneFixture, &sent)
+	oldPoll := driverPollInterval
+	driverPollInterval = 30 * time.Millisecond
+	defer func() { driverPollInterval = oldPoll }()
+	oldDelay := injectSubmitDelay
+	injectSubmitDelay = 5 * time.Millisecond
+	defer func() { injectSubmitDelay = oldDelay }()
 
 	root := t.TempDir()
 	task := A2ATask{ContextID: "c1", Agent: "pm", Session: SessionNameFor("pm", "c1"), State: TaskWorking}
@@ -457,14 +511,14 @@ func TestSandboxDriverSkipsWorkOnManagedSettingsGate(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	d.Ensure(ctx, task, inj)
-	time.Sleep(600 * time.Millisecond)
+	time.Sleep(500 * time.Millisecond) // many ticks at the sped-up poll interval
 	d.StopAll()
 
 	if inj.count() != 0 {
 		t.Fatalf("driver injected %d job(s) into a managed-settings approval screen; the prompt would have vanished", inj.count())
 	}
-	if len(sent) < 2 || sent[0] != "1" || sent[1] != "Enter" {
-		t.Fatalf("keystrokes = %#v, want the gate answered with [1 Enter]", sent)
+	if len(sent) != 2 || sent[0] != "1" || sent[1] != "Enter" {
+		t.Fatalf("keystrokes = %#v, want the gate answered EXACTLY ONCE with [1 Enter] — a persisting gate must not be re-answered every tick", sent)
 	}
 	// 該 job 必須還在 pending，沒有被 RunWorkerOnce 消化掉。
 	entries, _ := os.ReadDir(pathIn(sandbox, "inbox", "pending"))
@@ -473,9 +527,15 @@ func TestSandboxDriverSkipsWorkOnManagedSettingsGate(t *testing.T) {
 	}
 }
 
+// Same debounce guarantee (review Important 1) for the OTHER new gate branch:
+// a persisting login-continue screen must get exactly one bare Enter, not one
+// per tick.
 func TestSandboxDriverAdvancesLoginContinueScreen(t *testing.T) {
 	var sent []string
 	stubTmuxPane(t, loginContinuePaneFixture, &sent)
+	oldPoll := driverPollInterval
+	driverPollInterval = 30 * time.Millisecond
+	defer func() { driverPollInterval = oldPoll }()
 
 	root := t.TempDir()
 	task := A2ATask{ContextID: "c1", Agent: "pm", Session: SessionNameFor("pm", "c1"), State: TaskWorking}
@@ -485,19 +545,103 @@ func TestSandboxDriverAdvancesLoginContinueScreen(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	d.Ensure(ctx, task, &recordingInjector{})
-	time.Sleep(400 * time.Millisecond)
+	time.Sleep(400 * time.Millisecond) // many ticks at the sped-up poll interval
 	d.StopAll()
 
-	if len(sent) == 0 || sent[len(sent)-1] != "Enter" {
-		t.Fatalf("keystrokes = %#v, want a bare Enter", sent)
+	if len(sent) != 1 || sent[0] != "Enter" {
+		t.Fatalf("keystrokes = %#v, want a SINGLE bare Enter — a persisting gate must not be re-answered every tick", sent)
 	}
 }
 
 // 真的登出時，沙盒永遠不驅動登入流程：那是 operator 的事，一個沙盒去操作
-// /login 會動到全機共用的憑證。任務標 failed 並停掉本 driver。
+// /login 會動到全機共用的憑證。任務標 failed 並停掉本 driver — 但要連續
+// loginFailureStrikes 拍都判為登出才失敗（review Critical），所以這裡把
+// driverPollInterval 調快，讓測試不用真的等好幾秒。
 func TestSandboxDriverFailsTaskWhenLoggedOut(t *testing.T) {
 	var sent []string
 	stubTmuxPane(t, loggedOutPaneFixture, &sent)
+	oldPoll := driverPollInterval
+	driverPollInterval = 30 * time.Millisecond
+	defer func() { driverPollInterval = oldPoll }()
+
+	root := t.TempDir()
+	task := A2ATask{ContextID: "c1", Agent: "pm", Session: SessionNameFor("pm", "c1"), State: TaskWorking}
+	_ = Init(SandboxRoot(root, task.Session))
+	_ = WithTasks(root, func(s *TaskStore) error { s.Upsert(task); return nil })
+
+	inj := &recordingInjector{}
+	d := NewSandboxDriver(root, time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d.Ensure(ctx, task, inj)
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && len(d.Running()) != 0 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := d.Running(); len(got) != 0 {
+		t.Fatalf("driver still running on a logged-out session: %#v", got)
+	}
+	tasks, _ := LoadTasks(root)
+	tk, _ := tasks.ByContext("c1")
+	if tk.State != TaskFailed || !strings.Contains(tk.Detail, "login") {
+		t.Fatalf("task = %q / %q, want failed with a login detail", tk.State, tk.Detail)
+	}
+	// Meaningful in place of the old vacuous loop (review Minor 4): a genuine,
+	// persisting logout must never send ANY keystroke (unlike the two known
+	// gates, which do send [1 Enter] / [Enter]) — the sandbox only ever
+	// observes and, once persistent, fails; it never types anything back,
+	// /login included.
+	if len(sent) != 0 {
+		t.Fatalf("keystrokes = %#v, want none — a sandbox must never drive the login flow", sent)
+	}
+	if inj.count() != 0 {
+		t.Fatalf("driver injected %d job(s) into a session it was about to fail for being logged out", inj.count())
+	}
+}
+
+// screenGrepHitFixture 模擬一個健康沙盒正在讀/grep screen.go 或 relogin.go（或
+// 顯示一份引用了它們字面字串的 diff）：畫面上出現了 classifyScreen 視為「確
+// 鑿」的登出片語（screen.go:38 的 "not logged in"），但這只是檔案內容，不是
+// 真的登出。這正是 review 抓到的 Critical 缺陷：單拍命中就判定失敗，會讓一個
+// 健康的沙盒因為讀自己的原始碼而被判死。
+const screenGrepHitFixture = `
+ ● Bash(grep -n "not logged in" internal/channelagent/screen.go)
+   ⎿  38:  for _, sig := range []string{"invalid authentication credentials", "not logged in", "/login to authenticate"} {
+
+`
+
+// healthyIdlePaneFixture 是完全正常、沒有任何登入相關字串的待命畫面。
+const healthyIdlePaneFixture = "\n 好，已經看完了。\n\n ❯ \n"
+
+// TestSandboxDriverToleratesTransientLoginPhraseInHealthyPane pins the review
+// Critical fix: a login-phrase hit that does NOT persist across ticks (a grep
+// result the pane moves past almost immediately) must never fail the task —
+// only loginFailureStrikes CONSECUTIVE ticks may. Before the fix this failed
+// the task on the very first tick.
+func TestSandboxDriverToleratesTransientLoginPhraseInHealthyPane(t *testing.T) {
+	oldOut, oldRun := runExternalCommandOutput, runExternalCommand
+	defer func() { runExternalCommandOutput, runExternalCommand = oldOut, oldRun }()
+	oldPoll := driverPollInterval
+	driverPollInterval = 30 * time.Millisecond
+	defer func() { driverPollInterval = oldPoll }()
+
+	var mu sync.Mutex
+	tick := 0
+	runExternalCommandOutput = func(_ context.Context, _ string, _ ...string) (string, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		tick++
+		if tick%2 == 1 {
+			// 奇數拍：健康沙盒剛好在讀/grep 自己的原始碼，畫面上短暫出現確
+			// 鑿字串。
+			return screenGrepHitFixture, nil
+		}
+		// 偶數拍：畫面已經翻頁翻過去了，回到完全健康的待命畫面——證明這個字
+		// 串從未連續出現超過一拍。
+		return healthyIdlePaneFixture, nil
+	}
+	runExternalCommand = func(_ context.Context, _ string, _ ...string) error { return nil }
 
 	root := t.TempDir()
 	task := A2ATask{ContextID: "c1", Agent: "pm", Session: SessionNameFor("pm", "c1"), State: TaskWorking}
@@ -508,22 +652,80 @@ func TestSandboxDriverFailsTaskWhenLoggedOut(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	d.Ensure(ctx, task, &recordingInjector{})
+	// 遠遠超過 loginFailureStrikes 拍（在舊行為下，第一拍就會失敗）。
+	time.Sleep(600 * time.Millisecond)
+	d.StopAll()
 
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) && len(d.Running()) != 0 {
-		time.Sleep(20 * time.Millisecond)
-	}
-	if got := d.Running(); len(got) != 0 {
-		t.Fatalf("driver still running on a logged-out session: %#v", got)
-	}
 	tasks, _ := LoadTasks(root)
 	tk, _ := tasks.ByContext("c1")
-	if tk.State != TaskFailed || !strings.Contains(tk.Detail, "login") {
-		t.Fatalf("task = %q / %q, want failed with a login detail", tk.State, tk.Detail)
+	if tk.State == TaskFailed {
+		t.Fatalf("task failed on a transient (non-consecutive) login-phrase hit in an otherwise healthy pane: state=%q detail=%q", tk.State, tk.Detail)
 	}
-	for _, k := range sent {
-		if k == "/login" {
-			t.Fatal("a sandbox must never drive the login flow")
+}
+
+// TestSandboxDriverSurfacesGateSendKeysFailure pins the review Important 2
+// fix: when send-keys itself fails on one of the two gate branches, the error
+// must reach the agent channel (through the same throttle RunWorkerOnce's
+// errors use) instead of being discarded with `_ =`. Before the fix a
+// permanently failing send-keys reproduced a silent hang indistinguishable
+// from the one this whole task exists to remove — the loop would skip
+// RunWorkerOnce forever and never tell anyone why.
+func TestSandboxDriverSurfacesGateSendKeysFailure(t *testing.T) {
+	oldOut, oldRun := runExternalCommandOutput, runExternalCommand
+	defer func() { runExternalCommandOutput, runExternalCommand = oldOut, oldRun }()
+	oldPoll := driverPollInterval
+	driverPollInterval = 20 * time.Millisecond
+	defer func() { driverPollInterval = oldPoll }()
+
+	runExternalCommandOutput = func(_ context.Context, _ string, _ ...string) (string, error) {
+		return managedSettingsPaneFixture, nil
+	}
+	sendErr := errors.New("boom: tmux not reachable")
+	runExternalCommand = func(_ context.Context, _ string, _ ...string) error { return sendErr }
+
+	root := t.TempDir()
+	agents := AgentStore{}
+	if err := agents.Add(Agent{Name: "pm", ChannelID: "chan-pm", Enabled: true}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if err := SaveAgents(root, agents); err != nil {
+		t.Fatalf("SaveAgents: %v", err)
+	}
+	task := A2ATask{ContextID: "c1", Agent: "pm", Session: SessionNameFor("pm", "c1"), State: TaskWorking}
+	if err := Init(SandboxRoot(root, task.Session)); err != nil {
+		t.Fatal(err)
+	}
+
+	type sentLine struct{ channelID, text string }
+	got := make(chan sentLine, 32)
+	send := func(_ context.Context, channelID, text string) error {
+		got <- sentLine{channelID, text}
+		return nil
+	}
+	sinkCtx, sinkCancel := context.WithCancel(context.Background())
+	defer sinkCancel()
+	sink := newAgentOutputSink(sinkCtx, root, send)
+
+	inj := &recordingInjector{}
+	d := NewSandboxDriver(root, time.Second)
+	d.SetOutputSink(sink)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d.Ensure(ctx, task, inj)
+	defer d.StopAll()
+
+	deadline := time.After(3 * time.Second)
+	for {
+		select {
+		case msg := <-got:
+			if strings.Contains(msg.text, sendErr.Error()) {
+				if inj.count() != 0 {
+					t.Fatalf("driver injected %d job(s) while the gate could not even be answered", inj.count())
+				}
+				return
+			}
+		case <-deadline:
+			t.Fatal("send-keys failure on the managed-settings gate was never surfaced to the agent channel")
 		}
 	}
 }
@@ -551,5 +753,27 @@ func TestDriverErrorThrottleDeduplicatesAndCaps(t *testing.T) {
 	}
 	if th2.allow("e60", now) {
 		t.Fatal("the 61st line in one minute must be suppressed")
+	}
+}
+
+// review Minor 2: allow must be a ROLLING one-minute window, not a tumbling
+// one. A tumbling window (fixed clock-minute buckets) resets wholesale at the
+// minute boundary, so 60 distinct errors right before the boundary plus 60
+// more right after add up to 120 lines inside one real 60-second span — the
+// cap it claims to enforce would be meaningless.
+func TestDriverErrorThrottleIsRollingNotTumbling(t *testing.T) {
+	th := newDriverErrorThrottle()
+	base := time.Now()
+	// 60 個各不相同的錯誤集中在視窗尾端（t=59s）。
+	for i := 0; i < 60; i++ {
+		if !th.allow(fmt.Sprintf("a%d", i), base.Add(59*time.Second)) {
+			t.Fatalf("distinct error a%d at t=59s must be emitted", i)
+		}
+	}
+	// t=61s 距離 t=59s 只過了 2 秒，兩批理應同屬「最近 60 秒」——tumbling
+	// window 會在 t=60s 邊界整批重置，讓這裡又能塞滿 60 個；rolling window
+	// 不能。
+	if th.allow("b0", base.Add(61*time.Second)) {
+		t.Fatal("a rolling one-minute window must still count the t=59s batch at t=61s")
 	}
 }

@@ -2,6 +2,8 @@ package channelagent
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"strings"
@@ -134,17 +136,39 @@ func (d *SandboxDriver) loop(ctx context.Context, task A2ATask, inj Injector) {
 	channel := d.bindOutputChannel(task)
 	channel.SendLine(task.ContextID, "🟢 driver started")
 	defer channel.SendLine(task.ContextID, "🔴 driver stopped")
-	// lastConfirmHash debounces the auto-answer: it's the hash of the last
-	// dialog this loop actually answered, so a dialog that hasn't dismissed
+	// lastAnsweredHash debounces every auto-answer path (confirm dialog,
+	// managed-settings gate, login-continue gate): it's the hash of the last
+	// screen this loop actually answered, so a screen that hasn't dismissed
 	// yet by the next capture (pane not redrawn) is not re-typed into — a
-	// second "1"+Enter landing after the real dismissal would submit as a
-	// stray prompt to a live sandbox. See autoAnswerSandboxConfirm.
-	var lastConfirmHash string
+	// second "1"/"Enter" landing after the real dismissal would submit as a
+	// stray prompt to a live sandbox. Reset to "" the moment the tick's
+	// classification stops matching whatever produced the stored hash, so a
+	// genuinely new occurrence (even with identical text) is still answered.
+	// See autoAnswerSandboxConfirm and gateHash.
+	var lastAnsweredHash string
+	// loginStrikes counts CONSECUTIVE ticks classified as a genuine login
+	// failure (i.e. ScreenLogin but neither of the two known, answerable
+	// post-login gates). A real logout persists tick over tick; a sandbox
+	// grepping/reading screen.go or relogin.go (or displaying a diff that
+	// quotes their literal phrases) renders those same substrings in its own
+	// pane for one capture and then moves on — see loginFailureStrikes.
+	var loginStrikes int
 	// throttle bounds how many "⚠️ <err>" lines this loop can push to the
 	// agent channel: a sandbox stuck failing every tick has no other backoff,
 	// and without this a two-hour hang can push ~7200 identical lines before
 	// the sweep finally kills it. See driverErrorThrottle.
 	throttle := newDriverErrorThrottle()
+	// reportErr is the single place that turns an in-loop error into visible
+	// output — stderr always, the agent channel when the throttle allows it.
+	// Every keystroke-sending site below routes its error here instead of
+	// discarding it: a silently-failing send-keys (tmux gone, session dead)
+	// must not reproduce the exact silent hang this task exists to remove.
+	reportErr := func(err error) {
+		fmt.Fprintf(os.Stderr, "a2a driver %s: %v\n", session, err)
+		if throttle.allow(err.Error(), time.Now()) {
+			channel.SendLine(task.ContextID, "⚠️ "+err.Error())
+		}
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -171,17 +195,10 @@ func (d *SandboxDriver) loop(ctx context.Context, task A2ATask, inj Injector) {
 		switch {
 		case pane == "":
 			// 抓不到畫面（session 還沒起來 / tmux 不可用）：交給 RunWorkerOnce
-			// 的 errSessionBusy 路徑處理，不要在這裡猜。
-		case paneAwaitingManagedSettings(low):
-			// screen.go:180。這個閘被 classifyScreen 判為 ScreenLogin，而
-			// supervisor.go 的登入 watchdog 只跑 binding 迴圈 —— 沙盒得自己
-			// 處理。SelectTrustSettings 就是 watchdog 用的同一個 helper。
-			_ = TmuxInjector{Session: session}.SelectTrustSettings(ctx)
-			skip = true
-		case paneAwaitingLoginContinue(low):
-			// screen.go:174。同上，送一個 Enter 推進去。
-			_ = TmuxInjector{Session: session}.PressEnter(ctx)
-			skip = true
+			// 的 errSessionBusy 路徑處理，不要在這裡猜；也不要把這次的空拍當
+			// 成任何登入狀態消失的證據。
+			lastAnsweredHash = ""
+			loginStrikes = 0
 		default:
 			switch classifyScreen(pane) {
 			case ScreenConfirm:
@@ -199,16 +216,77 @@ func (d *SandboxDriver) loop(ctx context.Context, task A2ATask, inj Injector) {
 				// still asks the human) is untouched: autoAnswerSandboxConfirm
 				// refuses any non-aa- session, and this call only ever runs
 				// from the sandbox driver loop, never from supervisor.go.
-				lastConfirmHash = autoAnswerSandboxConfirm(ctx, session, pane, lastConfirmHash)
+				h, err := autoAnswerSandboxConfirm(ctx, session, pane, lastAnsweredHash)
+				lastAnsweredHash = h
+				if err != nil {
+					reportErr(fmt.Errorf("auto-answer confirm dialog: %w", err))
+				}
 				skip = true
+				loginStrikes = 0
 			case ScreenLogin:
-				// 真的登出了。沙盒永遠不驅動登入流程：那是 operator 的事，一個
-				// 沙盒去操作 /login 會動到全機共用的憑證。任務標 failed 並停掉
-				// 本 driver — worktree 保留供 forensics。
-				markSandboxLoginFailure(d.root, task, channel)
-				return
+				// screen.go collapses THREE different situations into
+				// ScreenLogin: two known, safe-to-answer post-login gates
+				// (managed settings / login continue, screen.go:55-57), and a
+				// genuine logout (screen.go:38's conclusive phrases, matched
+				// ANYWHERE in the pane — including a healthy sandbox's own
+				// grep/Read output while it works on THIS repo's screen.go or
+				// relogin.go, or a diff that quotes them). The conclusive
+				// phrases take priority over the gate match — mirroring
+				// classifyScreen's own order, where the phrase check
+				// (screen.go:38) runs before the gate check (screen.go:55) —
+				// so a pane that happens to carry both never gets stuck
+				// re-answering a gate it will never actually need to answer
+				// again. See loginConclusivePhrases.
+				switch {
+				case !paneHasConclusiveLoginPhrase(low) && paneAwaitingManagedSettings(low):
+					// screen.go:180。SelectTrustSettings 是 supervisor.go 的
+					// 登入 watchdog 用的同一個 helper；沙盒沒有人可以問，得自
+					// 己回這個閘。
+					h := gateHash("managedSettings", low)
+					if h != lastAnsweredHash {
+						if err := guardedKeystrokes(session, func() error {
+							return TmuxInjector{Session: session}.SelectTrustSettings(ctx)
+						}); err != nil {
+							reportErr(fmt.Errorf("answer managed-settings gate: %w", err))
+						} else {
+							lastAnsweredHash = h
+						}
+					}
+					skip = true
+					loginStrikes = 0
+				case !paneHasConclusiveLoginPhrase(low) && paneAwaitingLoginContinue(low):
+					// screen.go:174。同上，送一個 Enter 推進去。
+					h := gateHash("loginContinue", low)
+					if h != lastAnsweredHash {
+						if err := guardedKeystrokes(session, func() error {
+							return TmuxInjector{Session: session}.PressEnter(ctx)
+						}); err != nil {
+							reportErr(fmt.Errorf("answer login-continue gate: %w", err))
+						} else {
+							lastAnsweredHash = h
+						}
+					}
+					skip = true
+					loginStrikes = 0
+				default:
+					// 確鑿字串（真的登出，或至少不是這兩個已知安全的閘），或
+					// classifyScreen 其他子情況（select-login-method / paste
+					// code / URL / transient「請執行 /login」）。沙盒永遠不
+					// 驅動登入流程：那是 operator 的事，一個沙盒去操作 /login
+					// 會動到全機共用的憑證。但這裡不能單拍就判定——同一段話
+					// 只要連續 loginFailureStrikes 拍都還在，才真的像是登出
+					// 而不是一次性的 grep 命中；worktree 保留供 forensics。
+					lastAnsweredHash = ""
+					loginStrikes++
+					if loginStrikes >= loginFailureStrikes {
+						markSandboxLoginFailure(d.root, task, channel)
+						return
+					}
+					skip = true
+				}
 			default:
-				lastConfirmHash = ""
+				lastAnsweredHash = ""
+				loginStrikes = 0
 			}
 		}
 		// 命中任一畫面分支就 skip 本輪 RunWorkerOnce —— 這是這條修正真正的
@@ -219,17 +297,14 @@ func (d *SandboxDriver) loop(ctx context.Context, task A2ATask, inj Injector) {
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(time.Second):
+			case <-time.After(driverPollInterval):
 			}
 			continue
 		}
 
 		processed, err := RunWorkerOnce(ctx, sandbox, inj, d.timeout)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "a2a driver %s: %v\n", session, err)
-			if throttle.allow(err.Error(), time.Now()) {
-				channel.SendLine(task.ContextID, "⚠️ "+err.Error())
-			}
+			reportErr(err)
 		}
 		// Stream the sandbox's transcript activity (thinking/tool-use) to its
 		// agent channel — the "what is this sandbox actually doing" visibility
@@ -246,7 +321,7 @@ func (d *SandboxDriver) loop(ctx context.Context, task A2ATask, inj Injector) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(time.Second):
+		case <-time.After(driverPollInterval):
 		}
 	}
 }
@@ -271,13 +346,17 @@ func markSandboxLoginFailure(root string, task A2ATask, channel AgentChannel) {
 }
 
 // driverErrorThrottle 讓一個卡住的沙盒不會把 agent 頻道灌爆：同一段錯誤文字
-// 60 秒內最多一行，且每個 session 每分鐘最多 60 行。沒有它時，一個 session
-// 消失的沙盒會在兩小時硬逾時前推出約 7200 則（a2a_driver.go 原本的錯誤路徑
-// 無去重、無退避、無次數上限）。
+// 60 秒內最多一行，且每個 session 在任何連續 60 秒的滾動視窗內最多 60 行。
+// 沒有它時，一個 session 消失的沙盒會在兩小時硬逾時前推出約 7200 則
+// （a2a_driver.go 原本的錯誤路徑無去重、無退避、無次數上限）。
+//
+// emitted 是真的「滾動」視窗（每次呼叫都把 60 秒前的時間戳丟掉再判斷），不是
+// tumbling window：tumbling window 用固定時間格（例如「這一分鐘」）算數，會在
+// 格與格的邊界重置，讓 t=59s 塞滿 60 行、t=61s 又能再塞 60 行——同一段 60 秒
+// 裡實際跑出 120 行，量能上限形同虛設。
 type driverErrorThrottle struct {
 	lastSeen map[string]time.Time
-	windowAt time.Time
-	inWindow int
+	emitted  []time.Time
 }
 
 func newDriverErrorThrottle() *driverErrorThrottle {
@@ -285,10 +364,15 @@ func newDriverErrorThrottle() *driverErrorThrottle {
 }
 
 func (t *driverErrorThrottle) allow(msg string, now time.Time) bool {
-	if now.Sub(t.windowAt) >= time.Minute {
-		t.windowAt, t.inWindow = now, 0
+	cutoff := now.Add(-time.Minute)
+	i := 0
+	for i < len(t.emitted) && t.emitted[i].Before(cutoff) {
+		i++
 	}
-	if t.inWindow >= 60 {
+	if i > 0 {
+		t.emitted = t.emitted[i:]
+	}
+	if len(t.emitted) >= 60 {
 		return false
 	}
 	if last, ok := t.lastSeen[msg]; ok && now.Sub(last) < time.Minute {
@@ -300,8 +384,79 @@ func (t *driverErrorThrottle) allow(msg string, now time.Time) bool {
 		t.lastSeen = map[string]time.Time{}
 	}
 	t.lastSeen[msg] = now
-	t.inWindow++
+	t.emitted = append(t.emitted, now)
 	return true
+}
+
+// driverPollInterval is how long loop sleeps between ticks after a skipped or
+// idle iteration. A package var (like injectSubmitDelay/injectVerifyDelay in
+// adapters.go) purely so tests can speed it up without changing behaviour —
+// production always runs at the real time.Second default.
+var driverPollInterval = time.Second
+
+// loginFailureStrikes is how many CONSECUTIVE ticks must classify a pane as a
+// genuine login failure (ScreenLogin, neither known post-login gate) before
+// the task is actually failed. A real logout persists tick over tick — the
+// pane keeps showing it until an operator intervenes. A healthy sandbox that
+// greps/reads screen.go or relogin.go, or renders a diff quoting their
+// literal phrases, renders those substrings for exactly the one capture that
+// catches it mid-tool-call; the next capture has moved on to the tool's
+// result or the next turn. Requiring persistence across multiple captures
+// (rather than a boot-window timer) catches both cases correctly regardless
+// of WHEN in the task's lifetime the phrase appears — a boot-only grace would
+// not protect a mid-task grep hit, which is exactly the failure mode this
+// guards against.
+const loginFailureStrikes = 3
+
+// loginConclusivePhrases mirrors screen.go:38's list. classifyScreen treats
+// any of these as conclusive proof of a genuine logout no matter where in the
+// pane they appear — that is the root cause of the false positive this driver
+// must not reproduce for its OWN "is this the known safe gate, or a real
+// failure" decision. screen.go is out of scope for this task (its
+// classification is relied on elsewhere, e.g. supervisor.go's login
+// watchdog), so the phrases are re-checked here rather than exported from
+// there. Keep in sync with screen.go:38 if that list ever changes.
+var loginConclusivePhrases = []string{
+	"invalid authentication credentials", "not logged in", "/login to authenticate",
+}
+
+// paneHasConclusiveLoginPhrase reports whether low (ANSI-stripped, lowercased)
+// contains one of loginConclusivePhrases. Used to give the conclusive-phrase
+// signal priority over the two known post-login gates — mirroring
+// classifyScreen's own order (the phrase check runs before the gate check) —
+// so a pane that happens to carry both is treated as a failure candidate, not
+// re-answered as a gate forever.
+func paneHasConclusiveLoginPhrase(low string) bool {
+	for _, sig := range loginConclusivePhrases {
+		if strings.Contains(low, sig) {
+			return true
+		}
+	}
+	return false
+}
+
+// gateHash produces a short debounce key for one of the two known
+// screen-and-answer gates (managed settings / login continue) — the loop
+// equivalent of confirmDialog.hash() for the confirm-dialog path. kind keeps
+// the two gates from ever comparing equal to each other by coincidence.
+func gateHash(kind, low string) string {
+	h := sha1.Sum([]byte(kind + "\x00" + low))
+	return hex.EncodeToString(h[:8])
+}
+
+// guardedKeystrokes re-checks the aa- prefix immediately before send actually
+// runs. Ensure's check (a2a_driver.go:97) decides whether to start driving a
+// session at all; this is the DIFFERENT, narrower guarantee that every site
+// which types into a live pane carries its own defense-in-depth — the same
+// property autoAnswerSandboxConfirm already had for the confirm-dialog path.
+// The error is returned, never swallowed: the caller routes it through
+// reportErr so a refusal (which should be structurally unreachable in
+// production, since loop only ever runs for aa- sessions) is loud, not silent.
+func guardedKeystrokes(session string, send func() error) error {
+	if !strings.HasPrefix(session, "aa-") {
+		return fmt.Errorf("refusing to auto-answer non-aa- session %q", session)
+	}
+	return send()
 }
 
 // autoAnswerSandboxConfirm 依 loop 已經抓好的 pane 判斷是否停在 Claude Code
@@ -329,23 +484,31 @@ func (t *driverErrorThrottle) allow(msg string, now time.Time) bool {
 // submitted as a prompt once the dialog actually dismisses. Reset to "" the
 // moment the pane stops showing a confirm dialog at all, so a genuinely new
 // dialog (even one with identical text) is still answered.
-func autoAnswerSandboxConfirm(ctx context.Context, session, pane, lastHash string) string {
+//
+// The returned error is the keystroke-send failure, if any — never swallowed
+// internally; the caller (loop) surfaces it via reportErr. On error the
+// returned hash is UNCHANGED (lastHash echoed back), matching guardedKeystrokes'
+// contract for the other two gate sites: a failed send must not be recorded
+// as "already answered", or the loop would never retry it.
+func autoAnswerSandboxConfirm(ctx context.Context, session, pane, lastHash string) (string, error) {
 	if !strings.HasPrefix(session, "aa-") {
-		return ""
+		return "", nil
 	}
 	if pane == "" || classifyScreen(pane) != ScreenConfirm {
-		return ""
+		return "", nil
 	}
 	dlg, ok := parseConfirmDialog(pane)
 	if !ok {
-		return ""
+		return "", nil
 	}
 	h := dlg.hash()
 	if h == lastHash {
-		return lastHash // already answered this exact dialog; pane likely hasn't redrawn yet
+		return lastHash, nil // already answered this exact dialog; pane likely hasn't redrawn yet
 	}
-	_ = sendConfirmChoice(ctx, session, 1)
-	return h
+	if err := guardedKeystrokes(session, func() error { return sendConfirmChoice(ctx, session, 1) }); err != nil {
+		return lastHash, err
+	}
+	return h, nil
 }
 
 // Stop ends the driver for one sandbox and BLOCKS until its goroutine has

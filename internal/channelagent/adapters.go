@@ -262,11 +262,27 @@ func (i TmuxInjector) PressEnter(ctx context.Context) error {
 // settings/hooks approval gate that Claude shows on boot after login.
 // (managedSettingsTruster capability.) The ❯ cursor already defaults to option
 // 1, so send 1 then Enter to be explicit.
+//
+// The settle sleep is ctx-aware (unlike the sibling helpers' plain
+// time.Sleep(injectSubmitDelay)): this is the one call in the family that now
+// also runs inside SandboxDriver.loop (a2a_driver.go), and Stop/StopAll block
+// on the loop goroutine actually exiting — a plain Sleep here would delay
+// shutdown by up to injectSubmitDelay (1.2s) per sandbox for no benefit once
+// the caller has already given up. Verified safe for the OTHER caller
+// (supervisor.go's handleLoginScreen): it never re-checks the pane within the
+// same tick after this call returns, so returning a beat early on ctx
+// cancellation changes nothing observable there — that binding's row is
+// skipped for the rest of the cycle regardless, and picked up again next
+// cycle by the same mechanism.
 func (i TmuxInjector) SelectTrustSettings(ctx context.Context) error {
 	if err := runExternalCommand(ctx, "tmux", "send-keys", "-t", i.Session, "-l", "1"); err != nil {
 		return err
 	}
-	time.Sleep(injectSubmitDelay)
+	select {
+	case <-time.After(injectSubmitDelay):
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 	return runExternalCommand(ctx, "tmux", "send-keys", "-t", i.Session, "Enter")
 }
 

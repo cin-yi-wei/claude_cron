@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestTmuxInjectorAutoStartsMissingSession(t *testing.T) {
@@ -115,6 +116,62 @@ func TestInjectProceedsWhenIdle(t *testing.T) {
 	}
 	if !enterSent {
 		t.Fatal("idle inject should submit with Enter")
+	}
+}
+
+// review Minor 3: SelectTrustSettings's settle sleep must be ctx-aware so
+// SandboxDriver.Stop/StopAll (which now call it from a2a_driver.go's loop and
+// block on the goroutine actually exiting) aren't delayed by the full
+// injectSubmitDelay once the caller has already given up. Verified safe for
+// the other caller, supervisor.go's handleLoginScreen, via code inspection:
+// it never re-checks the pane within the same tick after this call returns.
+func TestSelectTrustSettingsIsCtxAware(t *testing.T) {
+	oldRun := runExternalCommand
+	defer func() { runExternalCommand = oldRun }()
+
+	var calls []string
+	runExternalCommand = func(_ context.Context, _ string, args ...string) error {
+		calls = append(calls, args[len(args)-1])
+		return nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // 模擬 Stop/StopAll 正在等這個呼叫回來時取消 ctx
+
+	start := time.Now()
+	err := TmuxInjector{Session: "aa-x"}.SelectTrustSettings(ctx)
+	if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
+		t.Fatalf("SelectTrustSettings took %v after ctx cancellation, want a near-instant return (injectSubmitDelay is %v)", elapsed, injectSubmitDelay)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if len(calls) != 1 || calls[0] != "1" {
+		t.Fatalf("calls = %#v, want only the initial \"1\" keystroke sent before the cancelled sleep", calls)
+	}
+}
+
+// The ordinary (non-cancelled) path must be unaffected: both keystrokes still
+// go out in order, and the settle delay still elapses (this is what the OTHER
+// caller, supervisor.go's cc- login watchdog, still relies on).
+func TestSelectTrustSettingsStillSendsBothKeystrokesWhenNotCancelled(t *testing.T) {
+	oldRun := runExternalCommand
+	defer func() { runExternalCommand = oldRun }()
+	oldDelay := injectSubmitDelay
+	injectSubmitDelay = 5 * time.Millisecond
+	defer func() { injectSubmitDelay = oldDelay }()
+
+	var calls []string
+	runExternalCommand = func(_ context.Context, _ string, args ...string) error {
+		calls = append(calls, args[len(args)-1])
+		return nil
+	}
+
+	if err := (TmuxInjector{Session: "aa-x"}).SelectTrustSettings(context.Background()); err != nil {
+		t.Fatalf("SelectTrustSettings: %v", err)
+	}
+	if len(calls) != 2 || calls[0] != "1" || calls[1] != "Enter" {
+		t.Fatalf("calls = %#v, want [1 Enter]", calls)
 	}
 }
 
