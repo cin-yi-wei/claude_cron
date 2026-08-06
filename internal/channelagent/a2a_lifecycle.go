@@ -187,16 +187,7 @@ type reclaimCandidate struct {
 // cleared for it. reclaimed is independent of whether step 3's SaveTasks
 // call itself succeeds; if it doesn't, the next sweep simply retries an
 // already-removed path, which os.RemoveAll and RemoveWorktree both tolerate.
-// SandboxStopper is a placeholder for the process-liveness hook task 7 wires
-// in (checking whether a session's tmux/claude process is actually still
-// alive, independent of the timestamp-based checks below). SweepTimeouts
-// accepts it as its 5th parameter starting with this task so the signature
-// does not need to change again later, but does not call it yet — nil is a
-// valid, no-op value and every check in this function today is unaffected by
-// its presence.
-type SandboxStopper interface{}
-
-func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time.Time, stopper SandboxStopper) (int, int, error) {
+func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time.Time) (int, int, error) {
 	canceled, reclaimed := 0, 0
 	// Sessions to stop are collected under the lock but stopped after it is
 	// released: sm.Stop shells out to tmux, and nothing that touches a
@@ -233,6 +224,36 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 				if !CanTransition(t.State, TaskCanceled) {
 					continue
 				}
+
+				// 派送中崩潰:dispatching 只受 DispatchStaleAfter 管,絕不落進
+				// 下面 StartedAt/HardTimeout 那條路 —— StartedAt 是最初提交
+				// (排隊)的時間,一個排隊很久才被 DrainQueue 撿走的任務,從
+				// 撿走那一刻才開始算「正在開機」;拿排隊等了多久去跟
+				// HardTimeout 比,只會把剛認領、還在合法 90 秒開機窗口內的
+				// 任務錯殺(review round 2, minor 1)。標 failed 不是
+				// TaskCanceled:這不是操作者取消,而是我們自己的執行體死掉
+				// 了,失敗歸類為 failed 才對得上其他派送失敗的分類。
+				if t.State == TaskDispatching {
+					d, dok := parseRFC3339(t.DispatchedAt)
+					if !dok || now.Sub(d) >= DispatchStaleAfter {
+						toStop = append(toStop, t.Session)
+						t.State = TaskFailed
+						detail := "dispatch stalled (no sandbox came up)"
+						// 保留卡住前就已經留在 Detail 裡的線索,跟下面
+						// TaskCanceled 那條路一樣的理由(task 4):不能讓
+						// sweep 自己的 reason 蓋掉它(review round 2, minor
+						// 2)。
+						if t.Detail != "" {
+							detail = t.Detail + "; " + detail
+						}
+						t.Detail = detail
+						t.CompletedAt = now.UTC().Format(time.RFC3339)
+						tasks.Tasks[i] = t
+						changed = true
+					}
+					continue
+				}
+
 				// A missing or corrupt StartedAt must NOT pin this task's
 				// sandbox forever: HardTimeout exists precisely as the backstop
 				// against a wedged sandbox, and a task with unreadable state is
@@ -242,23 +263,6 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 				// cancel apart from an ordinary hard timeout.
 				var reason string
 				started, ok := parseRFC3339(t.StartedAt)
-
-				// 派送中崩潰:這一列停在 dispatching 超過 DispatchStaleAfter,
-				// 表示起沙盒的那個行程沒了。標 failed 把槽釋放出來 —— 不是
-				// TaskCanceled,因為這不是操作者取消,而是我們自己的執行體
-				// 死掉了,失敗歸類為 failed 才對得上其他派送失敗的分類。
-				if t.State == TaskDispatching {
-					if d, dok := parseRFC3339(t.DispatchedAt); !dok || now.Sub(d) >= DispatchStaleAfter {
-						toStop = append(toStop, t.Session)
-						t.State = TaskFailed
-						t.Detail = "dispatch stalled (no sandbox came up)"
-						t.CompletedAt = now.UTC().Format(time.RFC3339)
-						tasks.Tasks[i] = t
-						changed = true
-						continue
-					}
-				}
-
 				switch {
 				case !ok:
 					reason = "start time unreadable (missing or corrupt StartedAt); canceled as a hard-timeout backstop"

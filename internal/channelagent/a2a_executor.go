@@ -242,7 +242,8 @@ func (e *SandboxExecutor) Start(ctx context.Context, task A2ATask, prompt string
 		orphanState TaskState
 	)
 	err = WithTasks(e.Root, func(tasks *TaskStore) error {
-		if cur, ok := tasks.ByContext(task.ContextID); ok && isTerminal(cur.State) {
+		cur, ok := tasks.ByContext(task.ContextID)
+		if ok && isTerminal(cur.State) {
 			// The task reached a terminal state (most likely canceled) while
 			// its session was starting: EnsureWorkspace/Start/Inject already
 			// succeeded, so a real tmux session is now running that this
@@ -252,11 +253,24 @@ func (e *SandboxExecutor) Start(ctx context.Context, task A2ATask, prompt string
 			orphanState = cur.State
 			return nil
 		}
-		if cur, ok := tasks.ByContext(task.ContextID); ok && !CanTransition(cur.State, TaskWorking) {
+		if ok && !CanTransition(cur.State, TaskWorking) {
 			log.Printf("a2a: session %s is running but task %s is in state %s (not submitted); leaving its state alone", task.Session, task.ContextID, cur.State)
 			return nil
 		}
 		task.State = TaskWorking
+		if ok {
+			// task 6 review round 2: task is Start's OWN parameter — a copy
+			// taken when this dispatch was first claimed, carrying whatever
+			// Prompt existed back then. A follow-up (a2a_server.go's
+			// message/send follow-up path) can land on this very row while
+			// this dispatch is still booting and update Prompt to record the
+			// caller's latest text. Blindly Upserting task here would
+			// silently regress Prompt back to that stale claim-time value,
+			// discarding what the follow-up just recorded. The store's
+			// current Prompt is always the latest one actually observed;
+			// keep it.
+			task.Prompt = cur.Prompt
+		}
 		tasks.Upsert(task)
 		return nil
 	})
@@ -276,4 +290,28 @@ func (e *SandboxExecutor) Start(ctx context.Context, task A2ATask, prompt string
 		}
 	}
 	return nil
+}
+
+// DeliverFollowUp injects prompt directly into an already-dispatched task's
+// sandbox inbox — no EnsureWorkspace, no TrustFolder, no policy rewrite, no
+// Sessions.Start. handleRPC calls this ONLY for a task it found already in
+// TaskDispatching or TaskWorking (a genuine follow-up, never a fresh
+// dispatch): the sandbox already exists (working) or is already coming up
+// (dispatching) from a dispatch some other call already owns, so repeating
+// any of Start's setup steps here would race that in-flight dispatch on the
+// same worktree/session — exactly the double EnsureWorkspace/Sessions.Start
+// race task 6 review round 2 found. This never touches task.State: that
+// belongs entirely to whichever call is actually running the dispatch this
+// message is following up on.
+func (e *SandboxExecutor) DeliverFollowUp(ctx context.Context, task A2ATask, prompt string) error {
+	sandboxRoot := SandboxRoot(e.Root, task.Session)
+	msg := SourceMessage{
+		Platform:  "a2a",
+		ChannelID: task.ContextID,
+		MessageID: nextInjectedMessageID(task.Session),
+		AuthorID:  task.CallerID,
+		CreatedAt: time.Now().UTC().Format(time.RFC3339),
+		Content:   prompt,
+	}
+	return e.Sessions.Inject(ctx, sandboxRoot, msg)
 }

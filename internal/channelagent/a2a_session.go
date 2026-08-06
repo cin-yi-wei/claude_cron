@@ -98,6 +98,16 @@ type FakeSessionManager struct {
 	// in place by the time a real tmux session would come up — the sandbox
 	// policy in particular.
 	OnStart func(session string)
+	// EnsureWorkspaceHold and EnsureWorkspaceEntered let a test hold a
+	// dispatch open at a precise, deterministic point instead of racing on
+	// real goroutine scheduling timing (task 6 review round 2, minor 4):
+	// EnsureWorkspace records its call, closes EnsureWorkspaceEntered (if
+	// set) so a waiting test knows the dispatch is now genuinely in flight,
+	// then blocks on EnsureWorkspaceHold (if set) until it is closed. This
+	// mirrors production's up-to-90s worktree-add + tmux-boot window without
+	// an actual sleep.
+	EnsureWorkspaceHold    chan struct{}
+	EnsureWorkspaceEntered chan struct{}
 	// mu 序列化每個方法對上面那些切片的存取。task 6 之前所有測試都是單一
 	// goroutine 呼叫 fake,不需要鎖;task 6 的併發測試 (N 條 goroutine 各自
 	// message/send、或 handler 與 DrainQueue 並發) 會從多條 goroutine 同時
@@ -109,11 +119,23 @@ type FakeSessionManager struct {
 
 func (f *FakeSessionManager) EnsureWorkspace(_ context.Context, _, _, worktree string) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	if f.FailOn == "workspace" {
+		f.mu.Unlock()
 		return errors.New("fake workspace failure")
 	}
 	f.Workspaces = append(f.Workspaces, worktree)
+	entered := f.EnsureWorkspaceEntered
+	hold := f.EnsureWorkspaceHold
+	f.mu.Unlock()
+	// entered/hold 必須在放掉 f.mu 之後才處理:一旦持有 hold 阻塞,若還握著
+	// mu,任何併發呼叫 fake 其他方法(包括同一次派送稍後可能用到的方法)都會
+	// 卡死,不是單純變慢而已。
+	if entered != nil {
+		close(entered)
+	}
+	if hold != nil {
+		<-hold
+	}
 	return nil
 }
 

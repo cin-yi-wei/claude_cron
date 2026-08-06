@@ -711,35 +711,64 @@ func TestSameContextIDCannotSwitchAgent(t *testing.T) {
 
 // 規格第五節測試 1：handler 與 DrainQueue 同時對同一個 contextId 動作，只能
 // 有一則 prompt 真的落進沙盒。
+//
+// review round 2, minor 4: 原本靠「另一條 goroutine 跑 20 次 1ms 間隔的
+// DrainQueue」去賭中派送視窗 —— production 派送窗口最長 90 秒，而
+// FakeSessionManager.Start 微秒級就回來，這個賭法只在修好前的程式碼上*機率
+// 性*失敗，不是結構性保證。改用 EnsureWorkspaceHold/Entered 把第一次派送
+// 卡死在 EnsureWorkspace 裡，讓「DrainQueue 這時一定會看到 dispatching」變
+// 成確定的事，不是碰運氣。
 func TestHandlerAndDrainQueueNeverDoubleDispatch(t *testing.T) {
 	s, root := newTestA2AServer(t)
 	fake := &FakeSessionManager{}
+	hold := make(chan struct{})
+	entered := make(chan struct{})
+	fake.EnsureWorkspaceHold = hold
+	fake.EnsureWorkspaceEntered = entered
 	ex := NewSandboxExecutor(root, fake)
 	s.Executor = ex
 
 	var wg sync.WaitGroup
-	wg.Add(2)
+	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		postRPC(t, s.Handler(), "secret-1",
 			`{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"agent":"codereview","contextId":"c1","text":"go"}}`)
 	}()
+
+	<-entered // 派送已經卡在 EnsureWorkspace 裡，row 現在一定是 dispatching。
+
+	var wg2 sync.WaitGroup
+	wg2.Add(1)
 	go func() {
-		defer wg.Done()
+		defer wg2.Done()
 		for i := 0; i < 20; i++ {
 			_, _ = DrainQueue(context.Background(), root, ex)
-			time.Sleep(time.Millisecond)
 		}
 	}()
+	wg2.Wait()
+
+	close(hold) // 放開原本那次派送，讓它跑完。
 	wg.Wait()
 
 	if n := len(fake.Injected); n != 1 {
 		t.Fatalf("injected %d prompts for one contextId; the delegated work would run %d times", n, n)
 	}
+	if n := len(fake.Workspaces); n != 1 {
+		t.Fatalf("EnsureWorkspace called %d times; DrainQueue must never repeat a dispatch already in flight", n)
+	}
+	if n := len(fake.Started); n != 1 {
+		t.Fatalf("session-start step ran %d times; DrainQueue must never Start a row that is already dispatching", n)
+	}
 }
 
 // 規格第五節測試 2：N 條 goroutine 送 N 個不同 contextId，併發上限必須是硬
 // 上限而不是建議值。
+//
+// review round 2, minor 4: 原本只斷言「不超過上限」，一個什麼都沒派送出去
+// 的建置（bug 讓每個請求都誤判成 queued）也會通過這個斷言。40 個不同
+// contextId、cap 是 8，且 fake 從不失敗，派送出去的數量是確定的 8，不是
+// 「至多 8」。
 func TestConcurrentSubmitsRespectTheSandboxCap(t *testing.T) {
 	s, root := newTestA2AServer(t)
 	fake := &FakeSessionManager{}
@@ -757,7 +786,145 @@ func TestConcurrentSubmitsRespectTheSandboxCap(t *testing.T) {
 	}
 	wg.Wait()
 
-	if got := len(fake.Started); got > MaxConcurrentSandboxes {
-		t.Fatalf("started %d sandboxes, cap is %d", got, MaxConcurrentSandboxes)
+	if got := len(fake.Started); got != MaxConcurrentSandboxes {
+		t.Fatalf("started %d sandboxes, want exactly the cap %d (fake never fails, so all headroom must be used)", got, MaxConcurrentSandboxes)
+	}
+}
+
+// Important 1（review round 2）：DrainQueue 認領 c1 並翻成 dispatching 之後，
+// 它的 Start 還卡在 EnsureWorkspace 裡（production 這裡最長 90 秒）。同一個
+// caller 這時對 c1 送出後續訊息。這則後續訊息絕不能自己再認領一次、再呼叫
+// 一次 Start —— 那會跟 DrainQueue 正在跑的 EnsureWorkspace/Sessions.Start
+// 搶同一個 worktree/session，而且如果後續訊息自己的 Start 之後失敗（git ref
+// lock、inject 錯誤），markFailed 會把這一列標成 failed，而 DrainQueue 那邊
+// 的 session 其實還活著。用 EnsureWorkspaceHold 把 DrainQueue 的派送卡在
+// EnsureWorkspace 裡，保證後續訊息一定會在派送真的還在飛的時候送達，不是
+// 賭時間。
+func TestFollowUpDuringInFlightDrainQueueDispatchDoesNotDoubleDispatch(t *testing.T) {
+	s, root := newTestA2AServer(t)
+	fake := &FakeSessionManager{}
+	hold := make(chan struct{})
+	entered := make(chan struct{})
+	fake.EnsureWorkspaceHold = hold
+	fake.EnsureWorkspaceEntered = entered
+	ex := NewSandboxExecutor(root, fake)
+	s.Executor = ex
+
+	// 讓任務一開始就是 submitted 且沒有人碰過它，好讓 DrainQueue（不是
+	// handler）是唯一認領並派送它的一方。
+	var seed TaskStore
+	seed.Upsert(A2ATask{
+		ContextID: "c1", Agent: "codereview", CallerID: "peer-a",
+		Session: SessionNameFor("codereview", "c1"), State: TaskSubmitted,
+		Prompt: "first", StartedAt: time.Now().UTC().Format(time.RFC3339),
+		Level: GrantReadOnly,
+	})
+	if err := SaveTasks(root, seed); err != nil {
+		t.Fatalf("SaveTasks: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, _ = DrainQueue(context.Background(), root, ex)
+	}()
+
+	<-entered // DrainQueue 的 Start 現在真的卡在 EnsureWorkspace 裡。
+
+	rec := postRPC(t, s.Handler(), "secret-1",
+		`{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"agent":"codereview","contextId":"c1","text":"follow up"}}`)
+	var resp RPCResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	if resp.Error != nil {
+		t.Fatalf("follow-up against an in-flight dispatch must succeed, got %#v", resp.Error)
+	}
+
+	close(hold) // 放開 DrainQueue 的派送，讓它跑完。
+	wg.Wait()
+
+	if n := len(fake.Workspaces); n != 1 {
+		t.Fatalf("EnsureWorkspace called %d times; the follow-up must not repeat DrainQueue's in-flight dispatch", n)
+	}
+	if n := len(fake.Started); n != 1 {
+		t.Fatalf("session-start ran %d times; the follow-up must never call Start again", n)
+	}
+
+	tasks, _ := LoadTasks(root)
+	tk, _ := tasks.ByContext("c1")
+	if tk.State != TaskWorking {
+		t.Fatalf("state = %s, want working (DrainQueue's dispatch, not the follow-up, owns this row's lifecycle)", tk.State)
+	}
+	if tk.Prompt != "follow up" {
+		t.Fatalf("prompt = %q, want the follow-up's text recorded", tk.Prompt)
+	}
+}
+
+// Important 2（review round 2）：8 個沙盒全滿時對其中一個活著的 working row
+// 送後續訊息。舊程式碼在容量檢查算出 false 之後，仍然無條件 Upsert 一個全新
+// 的（State=submitted、Worktree/Branch 全空的）task 蓋掉這個活著的 row ——
+// RunningCount 從 8 跌到 7、活著的 worktree 立刻失去唯一參照（SweepTimeouts
+// 只回收 Worktree 非空的 row），下一個請求就能在滿載時再啟動第 9 個沙盒。
+func TestFollowUpOnWorkingRowNeverRegressesCapacityEvenWhenFull(t *testing.T) {
+	s, root := newTestA2AServer(t)
+	stub := s.Executor.(*StubExecutor)
+
+	var seed TaskStore
+	for i := 0; i < MaxConcurrentSandboxes; i++ {
+		id := fmt.Sprintf("live%02d", i)
+		seed.Upsert(A2ATask{
+			ContextID: id, Agent: "codereview", CallerID: "peer-a",
+			Session:   SessionNameFor("codereview", id),
+			State:     TaskWorking,
+			Worktree:  "/p/x-" + id,
+			Branch:    "aa/" + id,
+			StartedAt: time.Now().UTC().Format(time.RFC3339),
+		})
+	}
+	if err := SaveTasks(root, seed); err != nil {
+		t.Fatalf("SaveTasks: %v", err)
+	}
+
+	rec := postRPC(t, s.Handler(), "secret-1",
+		`{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"agent":"codereview","contextId":"live00","text":"follow up"}}`)
+	var resp RPCResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	if resp.Error != nil {
+		t.Fatalf("follow-up on a live row must succeed even at full capacity, got %#v", resp.Error)
+	}
+	if stub.Calls != 0 {
+		t.Fatalf("Executor.Start called %d times; a follow-up must never re-dispatch", stub.Calls)
+	}
+
+	tasks, _ := LoadTasks(root)
+	live0, ok := tasks.ByContext("live00")
+	if !ok {
+		t.Fatal("live00 task disappeared")
+	}
+	if live0.State != TaskWorking {
+		t.Fatalf("state = %s, want working (must not regress to submitted)", live0.State)
+	}
+	if live0.Worktree != "/p/x-live00" || live0.Branch != "aa/live00" {
+		t.Fatalf("identity clobbered: worktree=%q branch=%q", live0.Worktree, live0.Branch)
+	}
+	if live0.Prompt != "follow up" {
+		t.Fatalf("prompt = %q, want the follow-up's text recorded", live0.Prompt)
+	}
+	if got := tasks.RunningCount(); got != MaxConcurrentSandboxes {
+		t.Fatalf("RunningCount = %d, want unchanged %d — a follow-up must never free or cost a capacity slot", got, MaxConcurrentSandboxes)
+	}
+
+	// 緊接著送一個全新的 contextId：cap 真的還是滿的，證明剛才那則後續訊息
+	// 沒有偷偷放出一個名額。
+	rec = postRPC(t, s.Handler(), "secret-1",
+		`{"jsonrpc":"2.0","id":2,"method":"message/send","params":{"agent":"codereview","contextId":"brandnew","text":"go"}}`)
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	if resp.Error != nil {
+		t.Fatalf("new context send failed: %#v", resp.Error)
+	}
+	tasks, _ = LoadTasks(root)
+	nw, ok := tasks.ByContext("brandnew")
+	if !ok || nw.State != TaskSubmitted {
+		t.Fatalf("new context state = %#v, want queued (submitted) since the cap is still genuinely full", nw)
 	}
 }

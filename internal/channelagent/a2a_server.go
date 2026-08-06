@@ -19,6 +19,23 @@ type TaskExecutor interface {
 	Start(ctx context.Context, task A2ATask, prompt string) error
 }
 
+// FollowUpDeliverer is an OPTIONAL capability of a TaskExecutor: delivering a
+// message into a task that is ALREADY TaskDispatching or TaskWorking,
+// without repeating any part of a fresh dispatch (no EnsureWorkspace, no
+// TrustFolder, no policy write, no Sessions.Start — the sandbox already
+// exists or is already coming up). handleRPC's message/send follow-up path
+// type-asserts for this rather than putting it on TaskExecutor itself, so
+// executors that don't model a real sandbox (StubExecutor, test doubles like
+// failingExecutor) aren't forced to implement it. A follow-up against one of
+// those is still fully safe either way — the row is never re-claimed,
+// regressed or re-Started, regardless of whether this interface is
+// satisfied — it just isn't actually delivered anywhere real, which matches
+// what those doubles model in the first place. SandboxExecutor implements
+// it (a2a_executor.go).
+type FollowUpDeliverer interface {
+	DeliverFollowUp(ctx context.Context, task A2ATask, prompt string) error
+}
+
 // StubExecutor records calls and does nothing else.
 type StubExecutor struct {
 	Calls      int
@@ -262,15 +279,46 @@ func (s *A2AServer) handleRPC(w http.ResponseWriter, r *http.Request) {
 	// caller MAY legitimately resubmit a finished contextId — just not
 	// against a different agent.
 	//
-	// The load, ownership/agent check, capacity check and upsert all happen
-	// inside one WithTasks call so a concurrent request can never interleave
-	// between the check and the write. That is what makes the capacity claim
-	// atomic (I2): hasCapacity is read and the claim (submitted ->
-	// dispatching) is written in the very same locked section, so this row
-	// counts against RunningCount from the instant any other request could
-	// possibly observe it — a check in one locked section and a mark in
-	// another would reopen the same race in a new shape.
+	// The load, ownership/agent check, live-row check, capacity check and
+	// upsert all happen inside one WithTasks call so a concurrent request can
+	// never interleave between the check and the write. That is what makes
+	// the capacity claim atomic (I2): hasCapacity is read and the claim
+	// (submitted -> dispatching) is written in the very same locked section,
+	// so this row counts against RunningCount from the instant any other
+	// request could possibly observe it — a check in one locked section and
+	// a mark in another would reopen the same race in a new shape.
+	//
+	// A send against a contextId whose row is ALREADY TaskDispatching or
+	// TaskWorking is a follow-up, not a new dispatch — some other call (this
+	// same caller's earlier request, or DrainQueue) already owns that row's
+	// dispatch and may still be inside EnsureWorkspace/Sessions.Start. Two
+	// distinct bugs follow from treating it as a fresh dispatch instead
+	// (review round 2, important 1 and 2): (a) re-claiming and re-Starting it
+	// races the in-flight EnsureWorkspace/Sessions.Start on the same
+	// worktree/session, and if the loser's Start then fails (a git ref lock,
+	// an inject error), markFailed marks the row failed while the winner's
+	// session is still live; (b) when capacity happens to be full at that
+	// moment, Upsert-ing a fresh TaskSubmitted row over a live TaskWorking
+	// one regresses its state and wipes its Worktree/Branch — RunningCount
+	// silently drops, a 9th sandbox can start over cap, and the live
+	// worktree loses its only reference (SweepTimeouts skips rows with an
+	// empty Worktree). A follow-up must therefore never be claimed, never
+	// take a capacity slot, and never overwrite the row's identity — it only
+	// updates Prompt (so a query reflects what was last said) and leaves
+	// State/Worktree/Branch/Session/StartedAt/DispatchedAt exactly as they
+	// are. Actually delivering the follow-up into the sandbox's inbox
+	// (Inject touches the filesystem) happens OUTSIDE this lock, in the
+	// isFollowUp branch below — WithTasks forbids that here.
+	//
+	// A row that is TaskSubmitted (still queued, not yet claimed by anyone)
+	// or terminal (finished) is NOT a live in-flight dispatch, so it falls
+	// through to the ordinary new-dispatch path unchanged: a terminal
+	// contextId may be legitimately reused by its same caller/agent (see the
+	// ownership/agent checks above), and a still-queued one simply gets its
+	// queued row replaced by this request's own (possibly now-claimable) one.
 	var hasCapacity bool
+	var isFollowUp bool
+	var followUpTask A2ATask
 	err = WithTasks(s.Root, func(tasks *TaskStore) error {
 		if existing, ok := tasks.ByContext(p.ContextID); ok {
 			if existing.CallerID != caller.CallerID {
@@ -278,6 +326,14 @@ func (s *A2AServer) handleRPC(w http.ResponseWriter, r *http.Request) {
 			}
 			if existing.Agent != "" && existing.Agent != task.Agent {
 				return errContextAgentSwitch
+			}
+			if existing.State == TaskDispatching || existing.State == TaskWorking {
+				merged := existing
+				merged.Prompt = task.Prompt
+				tasks.Upsert(merged)
+				isFollowUp = true
+				followUpTask = merged
+				return nil
 			}
 		}
 		// 容量在 upsert 之「前」算，翻成 dispatching 在同一個 critical
@@ -321,6 +377,37 @@ func (s *A2AServer) handleRPC(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeRPC(w, RPCFail(req.ID, RPCInternalError, "cannot persist task"))
+		return
+	}
+
+	if isFollowUp {
+		// Outside the lock: best-effort delivery into the already-live
+		// sandbox's inbox. This never calls Executor.Start and never touches
+		// task.State — that lifecycle belongs entirely to whichever call is
+		// actually running this row's dispatch.
+		if fd, ok := s.Executor.(FollowUpDeliverer); ok {
+			if derr := fd.DeliverFollowUp(s.dispatchCtx(), followUpTask, p.Text); derr != nil {
+				// 交付失敗不能讓任務狀態退回、也不能觸發重新派送 —— 沙盒本身
+				// 還活著,只是這一句沒送到,跟「派送失敗」是完全不同性質的
+				// 錯誤(那套邏輯的前提是沙盒根本沒起來)。只記 log,讓呼叫方
+				// 之後可以再送一次。
+				log.Printf("a2a: follow-up delivery failed for contextId %s (agent=%s): %v", followUpTask.ContextID, followUpTask.Agent, derr)
+			}
+		}
+		_ = AppendAudit(s.Root, AuditEntry{
+			At:        time.Now().UTC().Format(time.RFC3339),
+			CallerID:  caller.CallerID,
+			Agent:     agent.Name,
+			ContextID: followUpTask.ContextID,
+			TaskID:    followUpTask.TaskID,
+			Summary:   p.Text,
+			Outcome:   "follow_up",
+		})
+		writeRPC(w, RPCOK(req.ID, map[string]any{
+			"contextId": followUpTask.ContextID,
+			"taskId":    followUpTask.TaskID,
+			"state":     string(followUpTask.State),
+		}))
 		return
 	}
 

@@ -131,7 +131,7 @@ func TestSweepDoesNotCancelBeforeHardTimeout(t *testing.T) {
 	_ = SaveTasks(root, s)
 
 	fake := &FakeSessionManager{}
-	canceled, _, err := SweepTimeouts(context.Background(), root, fake, now, nil)
+	canceled, _, err := SweepTimeouts(context.Background(), root, fake, now)
 	if err != nil {
 		t.Fatalf("SweepTimeouts: %v", err)
 	}
@@ -156,7 +156,7 @@ func TestSweepCancelsAfterHardTimeout(t *testing.T) {
 	_ = SaveTasks(root, s)
 
 	fake := &FakeSessionManager{}
-	canceled, _, err := SweepTimeouts(context.Background(), root, fake, now, nil)
+	canceled, _, err := SweepTimeouts(context.Background(), root, fake, now)
 	if err != nil {
 		t.Fatalf("SweepTimeouts: %v", err)
 	}
@@ -195,7 +195,7 @@ func TestSweepPreservesPriorDetailOnHardTimeout(t *testing.T) {
 	_ = SaveTasks(root, s)
 
 	fake := &FakeSessionManager{}
-	canceled, _, err := SweepTimeouts(context.Background(), root, fake, now, nil)
+	canceled, _, err := SweepTimeouts(context.Background(), root, fake, now)
 	if err != nil {
 		t.Fatalf("SweepTimeouts: %v", err)
 	}
@@ -231,7 +231,7 @@ func TestSweepReclaimsCompletedAfterRetention(t *testing.T) {
 	_ = SaveTasks(root, s)
 
 	fake := &FakeSessionManager{}
-	_, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now, nil)
+	_, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now)
 	if err != nil {
 		t.Fatalf("SweepTimeouts: %v", err)
 	}
@@ -254,7 +254,7 @@ func TestSweepLeavesFailedSandboxForensics(t *testing.T) {
 	_ = SaveTasks(root, s)
 
 	fake := &FakeSessionManager{}
-	if _, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now, nil); err != nil || reclaimed != 0 {
+	if _, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now); err != nil || reclaimed != 0 {
 		t.Fatalf("failed sandboxes must be kept: reclaimed=%d err=%v", reclaimed, err)
 	}
 	if len(fake.Stopped) != 0 {
@@ -278,7 +278,7 @@ func TestSweepCancelsWorkingTaskWithEmptyStartedAt(t *testing.T) {
 	_ = SaveTasks(root, s)
 
 	fake := &FakeSessionManager{}
-	canceled, _, err := SweepTimeouts(context.Background(), root, fake, now, nil)
+	canceled, _, err := SweepTimeouts(context.Background(), root, fake, now)
 	if err != nil {
 		t.Fatalf("SweepTimeouts: %v", err)
 	}
@@ -311,7 +311,7 @@ func TestSweepCancelsWorkingTaskWithGarbageStartedAt(t *testing.T) {
 	_ = SaveTasks(root, s)
 
 	fake := &FakeSessionManager{}
-	canceled, _, err := SweepTimeouts(context.Background(), root, fake, now, nil)
+	canceled, _, err := SweepTimeouts(context.Background(), root, fake, now)
 	if err != nil {
 		t.Fatalf("SweepTimeouts: %v", err)
 	}
@@ -345,7 +345,7 @@ func TestSweepReclaimsCompletedTaskWithUnparseableCompletedAt(t *testing.T) {
 	_ = SaveTasks(root, s)
 
 	fake := &FakeSessionManager{}
-	_, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now, nil)
+	_, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now)
 	if err != nil {
 		t.Fatalf("SweepTimeouts: %v", err)
 	}
@@ -382,7 +382,7 @@ func TestSweepRemovesWorktreeOnReclaim(t *testing.T) {
 	}
 
 	fake := &FakeSessionManager{}
-	if _, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now, nil); err != nil || reclaimed != 1 {
+	if _, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now); err != nil || reclaimed != 1 {
 		t.Fatalf("reclaimed = %d err = %v", reclaimed, err)
 	}
 	if len(fake.Removed) != 1 || fake.Removed[0] != "/p/aa-a-c1" {
@@ -410,7 +410,7 @@ func TestSweepRetriesFailedRemoval(t *testing.T) {
 	_ = SaveTasks(root, s)
 
 	fake := &FakeSessionManager{FailOn: "remove"}
-	if _, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now, nil); err != nil || reclaimed != 0 {
+	if _, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now); err != nil || reclaimed != 0 {
 		t.Fatalf("first sweep: reclaimed = %d err = %v, want 0 (removal failed)", reclaimed, err)
 	}
 	got, _ := LoadTasks(root)
@@ -420,7 +420,7 @@ func TestSweepRetriesFailedRemoval(t *testing.T) {
 	}
 
 	fake.FailOn = ""
-	if _, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now, nil); err != nil || reclaimed != 1 {
+	if _, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now); err != nil || reclaimed != 1 {
 		t.Fatalf("retry sweep: reclaimed = %d err = %v, want 1", reclaimed, err)
 	}
 	if len(fake.Removed) != 1 || fake.Removed[0] != "/p/aa-a-c1" {
@@ -475,7 +475,7 @@ func TestSweepSkipsRowChangedDuringTeardown(t *testing.T) {
 		}
 	}
 
-	if _, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now, nil); err != nil || reclaimed != 0 {
+	if _, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now); err != nil || reclaimed != 0 {
 		t.Fatalf("reclaimed = %d err = %v, want 0 (the row now belongs to a different, live task)", reclaimed, err)
 	}
 	got, _ := LoadTasks(root)
@@ -502,7 +502,7 @@ func TestSweepReclaimsWorktreeOnHardTimeoutCancel(t *testing.T) {
 	_ = SaveTasks(root, s)
 
 	fake := &FakeSessionManager{}
-	canceled, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now, nil)
+	canceled, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now)
 	if err != nil {
 		t.Fatalf("SweepTimeouts: %v", err)
 	}
@@ -542,7 +542,7 @@ func TestSweepCapsRetainedFailedSandboxes(t *testing.T) {
 	_ = SaveTasks(root, s)
 
 	fake := &FakeSessionManager{}
-	if _, _, err := SweepTimeouts(context.Background(), root, fake, now, nil); err != nil {
+	if _, _, err := SweepTimeouts(context.Background(), root, fake, now); err != nil {
 		t.Fatalf("SweepTimeouts: %v", err)
 	}
 	if len(fake.Removed) != 5 {
@@ -566,7 +566,7 @@ func TestSweepKeepsFailedSandboxesUnderTheCap(t *testing.T) {
 	_ = SaveTasks(root, s)
 
 	fake := &FakeSessionManager{}
-	_, _, _ = SweepTimeouts(context.Background(), root, fake, now, nil)
+	_, _, _ = SweepTimeouts(context.Background(), root, fake, now)
 	if len(fake.Removed) != 0 {
 		t.Fatalf("a single old failed sandbox must be kept for forensics, got %#v", fake.Removed)
 	}
@@ -587,7 +587,7 @@ func TestSweepLeavesFailedSandboxForensicsEvenWithGarbageTimestamp(t *testing.T)
 	_ = SaveTasks(root, s)
 
 	fake := &FakeSessionManager{}
-	if _, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now, nil); err != nil || reclaimed != 0 {
+	if _, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now); err != nil || reclaimed != 0 {
 		t.Fatalf("failed sandboxes must be kept even with a corrupt timestamp: reclaimed=%d err=%v", reclaimed, err)
 	}
 	if len(fake.Stopped) != 0 {
@@ -613,7 +613,7 @@ func TestSweepFailsStaleDispatchingRows(t *testing.T) {
 	})
 	_ = SaveTasks(root, s)
 
-	if _, _, err := SweepTimeouts(context.Background(), root, &FakeSessionManager{}, now, nil); err != nil {
+	if _, _, err := SweepTimeouts(context.Background(), root, &FakeSessionManager{}, now); err != nil {
 		t.Fatalf("SweepTimeouts: %v", err)
 	}
 	got, _ := LoadTasks(root)
@@ -624,5 +624,81 @@ func TestSweepFailsStaleDispatchingRows(t *testing.T) {
 	}
 	if c2.State != TaskDispatching {
 		t.Fatalf("fresh dispatching row = %q, want it left alone", c2.State)
+	}
+}
+
+// TestSweepDoesNotHardTimeoutFreshlyClaimedDispatchingRow guards review
+// round 2, minor 1: a task can legitimately sit in TaskSubmitted for a long
+// time (queued behind a full cap) before DrainQueue ever claims it. Its
+// StartedAt is the ORIGINAL submission time, not the claim time — so once
+// claimed, that StartedAt can already be close to or past HardTimeout even
+// though DispatchedAt (the claim) is seconds old and it is still well inside
+// its legal ~90s boot window. Falling through to the StartedAt/HardTimeout
+// check (as the first draft of this fix did) would cancel a task that just
+// started dispatching, purely because it waited a long time in queue first.
+func TestSweepDoesNotHardTimeoutFreshlyClaimedDispatchingRow(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	var s TaskStore
+	s.Upsert(A2ATask{
+		ContextID: "c1", Agent: "a", Session: "aa-a-c1", State: TaskDispatching,
+		// Queued for nearly 2 hours before finally being claimed — on its own
+		// this StartedAt is already past HardTimeout.
+		StartedAt: now.Add(-125 * time.Minute).Format(time.RFC3339),
+		// ...but the claim itself is fresh and well inside DispatchStaleAfter.
+		DispatchedAt: now.Format(time.RFC3339),
+	})
+	_ = SaveTasks(root, s)
+
+	fake := &FakeSessionManager{}
+	// Sweep runs a couple of minutes after the claim — still nowhere near
+	// DispatchStaleAfter (5m), and the row's StartedAt is now more than
+	// HardTimeout (2h) in the past, which is exactly the condition that must
+	// NOT cancel a dispatching row.
+	sweepAt := now.Add(2 * time.Minute)
+	if _, _, err := SweepTimeouts(context.Background(), root, fake, sweepAt); err != nil {
+		t.Fatalf("SweepTimeouts: %v", err)
+	}
+	got, _ := LoadTasks(root)
+	tk, _ := got.ByContext("c1")
+	if tk.State != TaskDispatching {
+		t.Fatalf("state = %s, want dispatching (a fresh claim must never be hard-timed-out on its ORIGINAL queued StartedAt)", tk.State)
+	}
+	if len(fake.Stopped) != 0 {
+		t.Fatalf("session stopped despite a live, freshly-claimed dispatch: %#v", fake.Stopped)
+	}
+}
+
+// TestSweepPreservesPriorDetailOnStaleDispatch mirrors
+// TestSweepPreservesPriorDetailOnHardTimeout for the dispatching-stale path
+// (review round 2, minor 2): the stale-dispatch branch must prepend, not
+// discard, whatever Detail the row already carried.
+func TestSweepPreservesPriorDetailOnStaleDispatch(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	const earlierNote = "預先信任 worktree 失敗,沙盒仍會啟動但可能卡在資料夾信任對話框: fake trust failure"
+	var s TaskStore
+	s.Upsert(A2ATask{
+		ContextID: "c1", Agent: "a", Session: "aa-a-c1", State: TaskDispatching,
+		StartedAt:    now.Add(-1 * time.Minute).Format(time.RFC3339),
+		DispatchedAt: now.Add(-DispatchStaleAfter - time.Minute).Format(time.RFC3339),
+		Detail:       earlierNote,
+	})
+	_ = SaveTasks(root, s)
+
+	fake := &FakeSessionManager{}
+	if _, _, err := SweepTimeouts(context.Background(), root, fake, now); err != nil {
+		t.Fatalf("SweepTimeouts: %v", err)
+	}
+	got, _ := LoadTasks(root)
+	tk, _ := got.ByContext("c1")
+	if tk.State != TaskFailed {
+		t.Fatalf("state = %s, want failed", tk.State)
+	}
+	if !strings.Contains(tk.Detail, earlierNote) {
+		t.Fatalf("Detail = %q, must still contain the earlier note %q", tk.Detail, earlierNote)
+	}
+	if !strings.Contains(tk.Detail, "dispatch stalled") {
+		t.Fatalf("Detail = %q, must still contain the sweep's own reason too", tk.Detail)
 	}
 }
