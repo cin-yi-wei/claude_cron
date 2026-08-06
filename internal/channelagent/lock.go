@@ -43,6 +43,11 @@ type FileLock struct {
 // holder pid is still reclaimed instantly below. Overridable in tests.
 var staleLockTimeout = 8 * time.Minute
 
+// lockWriteGrace 是「檔案已建立但 PID 還沒寫進去」的容許窗口。AcquireLock 先
+// O_EXCL 建檔、再寫 PID，中間只隔幾個系統呼叫；這段期間別的行程讀到的是空檔。
+// 沒有這個窗口，那個空檔會被判成 corrupt 而被偷走，於是兩個行程同時持鎖。
+var lockWriteGrace = 5 * time.Second
+
 // AcquireLock creates an exclusive lock file at path. If the file already exists
 // it is stolen when the previous holder is gone — either its PID is no longer
 // alive, or the lock is older than staleLockTimeout (holder hung). Otherwise a
@@ -97,6 +102,16 @@ func lockIsStale(path string) (bool, string) {
 	}
 	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
 	if err != nil || pid <= 0 {
+		// 空的或還讀不出 PID，有兩種可能：真的壞掉，或者持有者剛剛才用
+		// O_EXCL 建好檔案、PID 還沒寫進去（AcquireLock 是先建檔再寫）。
+		// 後者一律當成可偷的話，兩個行程會同時拿到同一把鎖——這在共用的
+		// registry.lock 上就是兩個 serve 同時改 bindings.json。
+		//
+		// 分辨方式是年紀：寫 PID 只隔幾個系統呼叫，所以「很新又沒 PID」
+		// 幾乎必然是寫到一半，讓它過；夠舊還沒 PID 才是真的壞掉。
+		if time.Since(info.ModTime()) < lockWriteGrace {
+			return false, "held by a writer that has not recorded its pid yet"
+		}
 		return true, "corrupt pid"
 	}
 	if !processAlive(pid) {

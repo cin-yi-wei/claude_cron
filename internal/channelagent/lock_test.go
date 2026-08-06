@@ -1,6 +1,7 @@
 package channelagent
 
 import (
+	"os"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
@@ -209,4 +210,32 @@ func TestFileLockTouchResetsAge(t *testing.T) {
 
 func writeFileString(path, s string) error {
 	return AtomicWriteFile(path, []byte(s), 0o644)
+}
+
+// AcquireLock 先 O_EXCL 建檔、再寫 PID。中間那個瞬間別的行程讀到的是空檔，
+// 若一律判成 corrupt 就會把一個活著的持有者剛拿到的鎖偷走——共用的
+// registry.lock 上就是兩個 serve 同時改 bindings.json。
+func TestAcquireLockDoesNotStealAHolderMidWrite(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "x.lock")
+
+	// 模擬「已建立、PID 還沒寫」：空檔，mtime 是現在。
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if l, err := AcquireLock(path); err == nil {
+		_ = l.Release()
+		t.Fatal("stole a lock whose holder had not yet written its pid")
+	}
+
+	// 夠舊還是空的 → 真的壞掉，可以偷。
+	old := time.Now().Add(-2 * lockWriteGrace)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal(err)
+	}
+	l, err := AcquireLock(path)
+	if err != nil {
+		t.Fatalf("an aged empty lock must be stealable: %v", err)
+	}
+	_ = l.Release()
 }
