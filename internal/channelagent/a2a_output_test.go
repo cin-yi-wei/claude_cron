@@ -121,8 +121,15 @@ func TestAgentOutputSinkSendLineNeverBlocksOnSlowSend(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
 		t.Fatalf("SendLine blocked the caller: %d calls took %v", n, elapsed)
 	}
-	if atomic.LoadInt32(&calls) == 0 {
-		t.Fatal("the slow send was never even attempted once")
+	// 送出端是另一條 goroutine，SendLine 只入佇列不等它。直接斷言「已經送過
+	// 一次」是在賭排程順序：機器忙的時候 306 次非阻塞入佇列可以在送出端被排到
+	// 之前就全部跑完，測試會假失敗。改成有上限的等待——真的不通才會逾時。
+	deadline := time.Now().Add(2 * time.Second)
+	for atomic.LoadInt32(&calls) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the slow send was never even attempted once")
+		}
+		time.Sleep(time.Millisecond)
 	}
 
 	close(release)
