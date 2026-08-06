@@ -19,7 +19,7 @@ func newA2AAdmin(t *testing.T) (AdminHandler, string) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	return AdminHandler{Root: root, A2ASessions: &FakeSessionManager{}}, root
+	return AdminHandler{Root: root}, root
 }
 
 func adminReq(t *testing.T, h AdminHandler, method, path, body string) *httptest.ResponseRecorder {
@@ -117,10 +117,11 @@ func TestAdminA2ARevokeTerminatesInFlightWork(t *testing.T) {
 	})
 	_ = SaveTasks(root, tasks)
 
+	// stopper/fake 不再經 AdminHandler 接線（那條線已經拆掉，見
+	// terminateTasks 的說明）：revoke 本身不停任何東西，這兩個只在下面直接
+	// 呼叫 SweepTimeouts 模擬「下一輪 sweep」時才用到。
 	stopper := &recordingStopper{}
-	h.A2AStopper = stopper
 	fake := &FakeSessionManager{}
-	h.A2ASessions = fake
 
 	rec := adminReq(t, h, http.MethodPost, "/api/a2a/callers/peer-a/revoke", "")
 	if rec.Code != http.StatusOK {
@@ -190,12 +191,62 @@ func TestAdminA2ASetCallbackRejectsUnsafeDestination(t *testing.T) {
 	}
 }
 
+// final review 2026-08-06, test honesty: the /api/a2a/gate-log route
+// (a2a_admin.go, ReadGateLog(h.Root, session query param, a2aLimit)) had no
+// test at all — only its 404-when-disabled behaviour was covered. This
+// exercises the route's actual job: reading real entries back, honouring
+// ?session= and ?limit=, and note in the final report that this route has
+// no CLI or UI consumer as of this fix — that gap is out of scope here.
+func TestAdminA2AGateLogRoute(t *testing.T) {
+	h, root := newA2AAdmin(t)
+	entries := []GateLogEntry{
+		{At: "t1", Session: "aa-a-s1", Tool: "Bash", Outcome: "allowed"},
+		{At: "t2", Session: "aa-a-s1", Tool: "Read", Outcome: "allowed"},
+		{At: "t3", Session: "aa-a-s2", Tool: "Bash", Outcome: "denied_bash_rule"},
+	}
+	for _, e := range entries {
+		if err := AppendGateLog(root, e); err != nil {
+			t.Fatalf("AppendGateLog: %v", err)
+		}
+	}
+
+	rec := adminReq(t, h, http.MethodGet, "/api/a2a/gate-log", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("gate-log = %d %s", rec.Code, rec.Body.String())
+	}
+	var all []GateLogEntry
+	if err := json.Unmarshal(rec.Body.Bytes(), &all); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(all) != 3 {
+		t.Fatalf("gate-log (no filter) = %d entries, want 3: %#v", len(all), all)
+	}
+
+	rec = adminReq(t, h, http.MethodGet, "/api/a2a/gate-log?session=aa-a-s1", "")
+	var filtered []GateLogEntry
+	if err := json.Unmarshal(rec.Body.Bytes(), &filtered); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(filtered) != 2 {
+		t.Fatalf("gate-log?session=aa-a-s1 = %#v, want 2 entries", filtered)
+	}
+
+	rec = adminReq(t, h, http.MethodGet, "/api/a2a/gate-log?limit=1", "")
+	var limited []GateLogEntry
+	if err := json.Unmarshal(rec.Body.Bytes(), &limited); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(limited) != 1 || limited[0].At != "t3" {
+		t.Fatalf("gate-log?limit=1 = %#v, want only the last entry (t3)", limited)
+	}
+}
+
 // cfg.A2A.Enabled == false 時 /api/a2a/* 一律 404。
 func TestAdminA2AIs404WhenDisabled(t *testing.T) {
 	root := t.TempDir()
 	_ = AtomicWriteJSON(ConfigPath(root), map[string]any{"a2a": map[string]any{"enabled": false}})
 	h := AdminHandler{Root: root}
-	for _, p := range []string{"/api/a2a/agents", "/api/a2a/callers", "/api/a2a/tasks", "/api/a2a/audit"} {
+	for _, p := range []string{"/api/a2a/agents", "/api/a2a/callers", "/api/a2a/tasks", "/api/a2a/audit", "/api/a2a/gate-log"} {
 		if rec := adminReq(t, h, http.MethodGet, p, ""); rec.Code != http.StatusNotFound {
 			t.Errorf("%s = %d, want 404 while a2a is disabled", p, rec.Code)
 		}

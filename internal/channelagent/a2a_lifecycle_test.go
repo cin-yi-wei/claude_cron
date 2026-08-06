@@ -151,13 +151,23 @@ func TestDrainQueueRecoversWhenOnlyQueuedTasksExist(t *testing.T) {
 	}
 }
 
+// final review 2026-08-06, test honesty: the original version of this test
+// seeded no caller/agent at all, so the queued row was rejected by
+// drainRejectReason (unknown caller "") long before it could ever reach
+// ex.Start — the assertions (started=0, stub.Calls=0) held for that reason
+// alone. Deleting the 8-sandbox cap check from DrainQueue entirely would not
+// have failed this test. Seeding a genuinely approved caller/enabled agent
+// (so the queued row would be dispatchable if capacity allowed it) and
+// asserting the row stays TaskSubmitted (not rejected into TaskFailed) makes
+// the cap the only thing standing between this row and ex.Start.
 func TestDrainQueueStopsAtCapacity(t *testing.T) {
 	root := t.TempDir()
+	seedApprovedCallerAndEnabledAgent(t, root, "peer", "a")
 	var s TaskStore
 	for i := 0; i < MaxConcurrentSandboxes; i++ {
 		s.Upsert(A2ATask{ContextID: string(rune('a' + i)), Agent: "a", State: TaskWorking})
 	}
-	s.Upsert(A2ATask{ContextID: "queued", Agent: "a", State: TaskSubmitted})
+	s.Upsert(A2ATask{ContextID: "queued", Agent: "a", CallerID: "peer", State: TaskSubmitted})
 	_ = SaveTasks(root, s)
 
 	stub := &StubExecutor{}
@@ -167,6 +177,14 @@ func TestDrainQueueStopsAtCapacity(t *testing.T) {
 	}
 	if n != 0 || stub.Calls != 0 {
 		t.Fatalf("must not start work when full: started=%d calls=%d", n, stub.Calls)
+	}
+	tasks, err := LoadTasks(root)
+	if err != nil {
+		t.Fatalf("LoadTasks: %v", err)
+	}
+	tk, ok := tasks.ByContext("queued")
+	if !ok || tk.State != TaskSubmitted {
+		t.Fatalf("queued task = %#v, want still submitted — it must be deferred by capacity, not rejected for an unrelated reason", tk)
 	}
 }
 

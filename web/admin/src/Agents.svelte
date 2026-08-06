@@ -150,11 +150,26 @@
   let approveTarget = $state(''); // caller_id being approved, '' = dialog closed
   let approveCaps = $state('');
 
-  function openApprove(id) { approveTarget = id; approveCaps = ''; }
+  // openApprove 同時服務「核准」與「修改已核准呼叫方的能力」——後端
+  // /approve 本身就是可重複呼叫的：再次呼叫只是覆寫 GrantedCapabilities，
+  // 狀態已經是 approved 的話維持 approved（a2a_callers.go 的 Approve 本來
+  // 就是這樣寫的，不需要新路由）。existingCaps 帶進來預先填好輸入框，修改
+  // 時不必先看純文字才回想起原本授權了什麼、也不會不小心用空字串蓋掉。
+  function openApprove(id, existingCaps) {
+    approveTarget = id;
+    approveCaps = (existingCaps || []).join(', ');
+  }
   function cancelApprove() { approveTarget = ''; }
   async function confirmApprove() {
     const id = approveTarget;
     const caps = parseCaps(approveCaps);
+    // 空清單不是「不限」，是「這個呼叫方之後每一次呼叫都被拒絕」——這正是
+    // 這裡要修的那個 bug 的根源（操作者以為留空比較寬鬆）。跟拉高授權等級
+    // 一樣，唯一會讓呼叫方失去存取能力/擴大風險的動作才需要二次確認；縮小
+    // 授權（填有東西）不擋。
+    if (caps.length === 0 && !confirm(t('agents.confirmNoCaps', { id }))) {
+      return; // 對話框留著開，操作者可以直接改再送
+    }
     approveTarget = '';
     err = ''; msg = '';
     try {
@@ -287,7 +302,8 @@
       <table>
         <thead><tr>
           <th>{t('agents.col.caller')}</th><th>{t('agents.col.status')}</th>
-          <th>{t('agents.col.level')}</th><th>{t('agents.col.credential')}</th>
+          <th>{t('agents.col.level')}</th><th>{t('agents.col.caps')}</th>
+          <th>{t('agents.col.credential')}</th>
           <th>{t('agents.col.callback')}</th><th></th>
         </tr></thead>
         <tbody>
@@ -300,11 +316,20 @@
                   {#each ['readonly', 'develop', 'full'] as l}<option value={l}>{l}</option>{/each}
                 </select>
               </td>
+              <td>
+                {#if c.status === 'approved' && (c.granted_capabilities || []).length === 0}
+                  <span class="bad">{t('agents.caller.noCaps')}</span>
+                {:else}
+                  {(c.granted_capabilities || []).join(', ') || '—'}
+                {/if}
+              </td>
               <td>{c.has_credential ? '✅' : '—'}</td>
               <td>{c.has_callback ? '✅' : '—'}</td>
               <td class="actions">
-                {#if c.status === 'pending'}
-                  <button class="mini secondary" onclick={() => openApprove(c.caller_id)}>{t('agents.action.approve')}</button>
+                {#if c.status !== 'revoked'}
+                  <button class="mini secondary" onclick={() => openApprove(c.caller_id, c.granted_capabilities)}>
+                    {c.status === 'pending' ? t('agents.action.approve') : t('agents.action.editCaps')}
+                  </button>
                 {/if}
                 {#if c.status !== 'revoked'}
                   <button class="mini contrast outline" onclick={() => revokeCaller(c.caller_id)}>{t('agents.action.revoke')}</button>
@@ -313,7 +338,7 @@
             </tr>
           {/each}
           {#if callers.length === 0}
-            <tr><td colspan="6"><em class="muted">{t('common.none')}</em></td></tr>
+            <tr><td colspan="7"><em class="muted">{t('common.none')}</em></td></tr>
           {/if}
         </tbody>
       </table>

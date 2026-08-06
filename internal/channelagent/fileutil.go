@@ -60,6 +60,30 @@ func AtomicWriteJSONMode(path string, v any, mode os.FileMode) error {
 	return AtomicWriteFile(path, payload, mode)
 }
 
+// AtomicWriteFile 是 A2A 動機下重寫的版本（把固定的 <path>.tmp 改成
+// os.CreateTemp 產生的獨一無二暫存檔名，見下方註解），但這個函式本身不在
+// cfg.A2A.Enabled 底下——它是 AtomicWriteJSON/AtomicWriteJSONMode 共用的
+// 底層實作，activity.json / state / bindings.json 等每一個 cc- binding 的
+// 熱寫入路徑全部經過它，關掉 A2A 也繞不開這裡。
+//
+// 確認過（不是照審查者的話直接相信）：這個改動在這台機器目前的 umask 下對
+// cc- binding 是無害的，理由跟 umask 本身完全無關——
+//  1. os.CreateTemp 一律以 0600 建立暫存檔，且這個呼叫**不傳** mode 參數
+//     給它（Go 文件明載：CreateTemp 永遠是 0600，忽略呼叫端想要的權限）。
+//     0600 對 group/other 已經是零位，umask 只會「進一步清掉」創建時的位
+//     元，不會「加回」被 umask 清掉的位元——所以不管這台機器的 umask 是
+//     022、002 還是更嚴格的 077，算出來的結果都還是 0600，umask 在這一步
+//     完全不影響結果。
+//  2. 真正決定「發布出去的檔案」最終權限的是下面 file.Chmod(mode) 這一
+//     行——chmod(2) 是絕對設值，跟 umask（只影響 open/creat 的建立時預設
+//     權限）無關。所以不管 umask 是什麼，rename 之前 Chmod 已經把權限改成
+//     呼叫端要求的那個值；umask 唯一可能影響的窗口（CreateTemp 到 Chmod
+//     之間，暫存檔還是 0600）永遠比任何呼叫端要求的 mode（0644 或 0600）
+//     更嚴格或相等，絕不會讓暫存檔在這段窗口內比最終權限更寬鬆。
+//  3. 結論：umask 在這條路徑上唯一能影響的是 os.MkdirAll(dir, 0o755) 建立
+//     新目錄時的權限（這行本身不是這次重寫新加的），跟這次重寫要修的並發
+//     覆寫問題（獨一無二暫存檔名）完全無關；此函式改動的核心行為（暫存檔
+//     命名、Chmod、Sync、Rename）在任何合理 umask 下都不變。
 func AtomicWriteFile(path string, payload []byte, mode os.FileMode) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {

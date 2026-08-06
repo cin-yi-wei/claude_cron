@@ -330,6 +330,18 @@ func (d *SandboxDriver) loop(ctx context.Context, task A2ATask, inj Injector) {
 
 		processed, err := RunWorkerOnce(ctx, sandbox, inj, d.timeout)
 		if err != nil {
+			// 一個 dropped job（worker.go 已經把它搬進 inbox/failed、不會再重
+			// 試）跟「session 消失」是不同性質的失敗：沙盒很可能還活著，只是
+			// 這一句沒有產生可用結果。不該套下面那套「連續 3 次失敗才確認存
+			// 活」的機制——那套機制是為了讓一個消失的 session 不必每秒失敗
+			// 直到兩小時硬逾時，但一個 dropped job 這一刻就已經確定失敗了，
+			// 沒有理由等。final review 2026-08-06, Important 4：修之前這裡完
+			// 全不碰任務列，任務停在 working 直到兩小時硬逾時，sweep 才報一
+			// 個通用（而且錯誤）的原因。
+			if reason, ok := DroppedJobReason(err); ok {
+				markSandboxJobDropped(d.root, task, channel, reason)
+				return
+			}
 			consecutiveErrors++
 			reportErr(err)
 			// 連續 3 次失敗就確認一次沙盒是否還在。不在就停止驅動，把判定交給
@@ -383,6 +395,27 @@ func markSandboxLoginFailure(root string, task A2ATask, channel AgentChannel) {
 		return nil
 	})
 	channel.SendLine(task.ContextID, "🔴 "+detail)
+}
+
+// markSandboxJobDropped 把任務標成 failed，Detail 記錄 worker.go 判定的真正
+// 原因（reason 是固定安全字串，見 DroppedJobReason；不含任何 err 內容）。
+// 用 appendDetail 疊加而非覆寫——terminal 轉換一律疊加既有 Detail，不蓋掉
+// 前面留下的線索（同一個不變量見 a2a_lifecycle.go 的 appendDetail）。
+// worktree 保留供 forensics，回收交給下一趟 sweep，跟 markSandboxLoginFailure
+// 同一個道理。
+func markSandboxJobDropped(root string, task A2ATask, channel AgentChannel, reason string) {
+	_ = WithTasks(root, func(tasks *TaskStore) error {
+		cur, ok := tasks.ByContext(task.ContextID)
+		if !ok || !CanTransition(cur.State, TaskFailed) {
+			return nil
+		}
+		cur.State = TaskFailed
+		cur.Detail, cur.DetailSafe = appendDetail(cur.Detail, cur.DetailSafe, reason, true)
+		cur.CompletedAt = time.Now().UTC().Format(time.RFC3339)
+		tasks.Upsert(cur)
+		return nil
+	})
+	channel.SendLine(task.ContextID, "🔴 "+reason)
 }
 
 // driverErrorThrottle 讓一個卡住的沙盒不會把 agent 頻道灌爆：同一段錯誤文字

@@ -72,11 +72,6 @@ type AdminHandler struct {
 	// is read at serve startup). In production it triggers `systemctl --user
 	// restart` asynchronously; nil = no auto-restart (a manual restart is needed).
 	RestartServe func()
-	// A2ASessions / A2AStopper 讓撤銷停得掉真的 tmux session 與真的 driver
-	// goroutine。nil 時退回 SetA2ARuntime 設定的行程層級值（見 a2a_admin.go）；
-	// 兩者皆 nil 時終止流程只改帳、不停東西（測試用）。
-	A2ASessions SessionManager
-	A2AStopper  SandboxStopper
 }
 
 func (h AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {

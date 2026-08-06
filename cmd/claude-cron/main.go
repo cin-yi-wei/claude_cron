@@ -301,10 +301,6 @@ func run(args []string, stdout, stderr io.Writer) int {
 		// starts no extra goroutine at all — byte-for-byte unchanged behaviour.
 		if !*once && cfg.A2A.Enabled {
 			driver := agent.NewSandboxDriver(*root, timeout)
-			// 讓 admin API 的撤銷停得掉真的 driver goroutine 與真的 tmux
-			// session。整段都在 cfg.A2A.Enabled 底下，關掉時 admin 完全不知道
-			// 有這回事。
-			agent.SetA2ARuntime(agent.TmuxSessionManager{}, driver)
 			// AgentOutputSink streams each sandbox's transcript activity (plus
 			// lifecycle/error lines) to its agent's Discord channel — output-only
 			// visibility, never an input path (see a2a_channel.go). Tied to
@@ -325,25 +321,16 @@ func run(args []string, stdout, stderr io.Writer) int {
 						return
 					case <-t.C:
 					}
-					// Order matters: collect frees capacity that sweep/drain then
-					// act on in the same cycle. Any failure is logged and does not
-					// abort this cycle or touch the cc- bindings' own processing.
-					if _, err := agent.CollectResults(*root, time.Now()); err != nil {
-						fmt.Fprintf(stdout, "a2a collect: %v\n", err)
-					}
-					if _, _, err := agent.SweepTimeouts(supCtx, *root, agent.TmuxSessionManager{}, time.Now(), driver); err != nil {
-						fmt.Fprintf(stdout, "a2a sweep: %v\n", err)
-					}
-					if _, err := agent.DrainQueue(supCtx, *root, ex); err != nil {
-						fmt.Fprintf(stdout, "a2a drain: %v\n", err)
-					}
-					agent.EnsureSandboxDrivers(supCtx, *root, driver)
-					// callback 的唯一觸發點。collect / sweep 之後才掃，於是這一
-					// 輪剛進入終止狀態的 row 也會被撿到。
-					agent.EnqueueTerminalCallbacks(*root, cb)
-					if _, err := agent.PruneTasks(*root, time.Now()); err != nil {
-						fmt.Fprintf(stdout, "a2a prune: %v\n", err)
-					}
+					// Order matters (collect frees capacity that sweep/drain then
+					// act on in the same cycle) — see RunA2ACycleOnce's doc for
+					// the full ordering rationale. Any stage failure is logged
+					// and does not abort this cycle or touch the cc- bindings'
+					// own processing. This is a single call, not six inline
+					// ones, precisely so the whole cycle's wiring is exercised
+					// by ONE test (TestA2ACycleRunsAllStages) instead of being
+					// invisible to every test the way it was before (final
+					// review 2026-08-06).
+					agent.RunA2ACycleOnce(supCtx, *root, time.Now(), agent.TmuxSessionManager{}, ex, driver, cb, stdout)
 				}
 			}()
 		}

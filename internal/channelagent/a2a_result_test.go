@@ -74,11 +74,20 @@ func TestCollectResultsIgnoresTaskWithoutResult(t *testing.T) {
 	}
 }
 
+// final review 2026-08-06, test honesty: the original fixture had no
+// LastMessageID, so pendingResultFile's resultBelongsToTask guard (task.
+// LastMessageID == "" -> never match) already rejects the stale result file
+// on its own — CanTransition's terminal-state guard (the thing this test
+// claims to pin) is never actually reached by stage 1's scan. Setting
+// LastMessageID to the same ID the fixture's result file is built from makes
+// resultBelongsToTask WOULD match if the terminal check were removed, so the
+// terminal skip is now the only thing standing between this row and a wrong
+// completion.
 func TestCollectResultsSkipsTerminalTasks(t *testing.T) {
 	root := t.TempDir()
 	session := SessionNameFor("codereview", "c1")
 	var tasks TaskStore
-	tasks.Upsert(A2ATask{ContextID: "c1", Agent: "codereview", Session: session, State: TaskCompleted, Detail: "original"})
+	tasks.Upsert(A2ATask{ContextID: "c1", Agent: "codereview", Session: session, State: TaskCompleted, Detail: "original", LastMessageID: resultMsgID})
 	_ = SaveTasks(root, tasks)
 	writeSandboxResult(t, root, session, "late result")
 	pendingPath := filepath.Join(pathIn(SandboxRoot(root, session), "outbox", "pending"), "r1.json")
@@ -163,11 +172,19 @@ func TestCollectResultsDoesNotResurrectOnContextReuse(t *testing.T) {
 	// the now-terminal record; the new task maps to the exact same session
 	// (and therefore the same SandboxRoot) because session names are
 	// deterministic.
+	//
+	// LastMessageID is deliberately set to the SAME resultMsgID the stale
+	// file (still sitting in outbox/pending IF the file-move fix regressed)
+	// is built from. Without this, resultBelongsToTask's own "LastMessageID
+	// == '' never matches" guard would reject the stale file all by itself,
+	// independent of whether the first CollectResults call actually moved
+	// it — masking the exact defect this test exists to pin (final review
+	// 2026-08-06, test honesty).
 	reused, err := LoadTasks(root)
 	if err != nil {
 		t.Fatalf("LoadTasks: %v", err)
 	}
-	reused.Upsert(A2ATask{ContextID: "c1", Agent: "codereview", Session: session, State: TaskWorking})
+	reused.Upsert(A2ATask{ContextID: "c1", Agent: "codereview", Session: session, State: TaskWorking, LastMessageID: resultMsgID})
 	if err := SaveTasks(root, reused); err != nil {
 		t.Fatalf("SaveTasks (reuse): %v", err)
 	}

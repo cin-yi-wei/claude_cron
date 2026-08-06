@@ -8,34 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"sync"
 )
-
-// a2aRuntime 讓 admin handler 拿得到 serve 行程裡的 driver 與 session manager
-// （撤銷必須停掉真的 goroutine 與真的 tmux session）。由 main.go 在
-// `if cfg.A2A.Enabled` 內呼叫 SetA2ARuntime 設定；沒設定時兩者為 nil，
-// terminateTasks 會跳過對應步驟。用 package var 而不是改 RunAdminServer 的
-// 簽章，是為了讓這段接線完全留在 A2A 的 kill switch 底下。
-var a2aRuntime = struct {
-	mu      sync.RWMutex
-	ss      SessionManager
-	stopper SandboxStopper
-}{}
-
-func SetA2ARuntime(sm SessionManager, stopper SandboxStopper) {
-	a2aRuntime.mu.Lock()
-	a2aRuntime.ss, a2aRuntime.stopper = sm, stopper
-	a2aRuntime.mu.Unlock()
-}
-
-func a2aRuntimeFor(h AdminHandler) (SessionManager, SandboxStopper) {
-	if h.A2ASessions != nil || h.A2AStopper != nil {
-		return h.A2ASessions, h.A2AStopper // 測試注入優先
-	}
-	a2aRuntime.mu.RLock()
-	defer a2aRuntime.mu.RUnlock()
-	return a2aRuntime.ss, a2aRuntime.stopper
-}
 
 // adminAgentDTO / adminCallerDTO：任何 GET 都不得回傳 credential 或
 // callback_token，改回 has_credential / has_callback。
@@ -114,8 +87,7 @@ func (h AdminHandler) serveA2A(w http.ResponseWriter, r *http.Request, rest stri
 			methodNotAllowed(w)
 			return
 		}
-		sm, stopper := a2aRuntimeFor(h)
-		if err := CancelTask(r.Context(), h.Root, name, sm, stopper); err != nil {
+		if err := CancelTask(h.Root, name); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -196,13 +168,12 @@ func (h AdminHandler) createA2AAgent(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h AdminHandler) a2aAgentAction(w http.ResponseWriter, r *http.Request, rest string) {
-	sm, stopper := a2aRuntimeFor(h)
 	if name, ok := strings.CutSuffix(rest, "/disable"); ok {
 		if r.Method != http.MethodPost {
 			methodNotAllowed(w)
 			return
 		}
-		n, err := DisableAgent(r.Context(), h.Root, name, sm, stopper)
+		n, err := DisableAgent(h.Root, name)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -242,7 +213,7 @@ func (h AdminHandler) a2aAgentAction(w http.ResponseWriter, r *http.Request, res
 	}
 	// 刪除前先停用：否則還在跑的沙盒會失去它的 agent 記錄，sweep 也就查不到
 	// ProjectDir 可以拿來回收 worktree。
-	if _, err := DisableAgent(r.Context(), h.Root, rest, sm, stopper); err != nil {
+	if _, err := DisableAgent(h.Root, rest); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -327,9 +298,8 @@ func (h AdminHandler) a2aCallerAction(w http.ResponseWriter, r *http.Request, re
 		methodNotAllowed(w)
 		return
 	}
-	sm, stopper := a2aRuntimeFor(h)
 	if id, ok := strings.CutSuffix(rest, "/revoke"); ok {
-		n, err := RevokeCaller(r.Context(), h.Root, id, sm, stopper)
+		n, err := RevokeCaller(h.Root, id)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return

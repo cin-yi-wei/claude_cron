@@ -571,3 +571,73 @@ func TestSandboxGateWritesGateLog(t *testing.T) {
 		t.Fatal("gate decisions must not be written into a2a-audit.jsonl")
 	}
 }
+
+// final review 2026-08-06, test honesty: ReadGateLog itself (as opposed to
+// AppendGateLog, exercised indirectly above via the real gate flow) had no
+// test at all — its session filter, limit/tail behaviour, and resilience to
+// a corrupt line were all unverified.
+func TestReadGateLogFiltersBySessionAndRespectsLimit(t *testing.T) {
+	root := t.TempDir()
+
+	// A fresh root with no gate log file must return (nil, nil), not an error.
+	got, err := ReadGateLog(root, "", 0)
+	if err != nil || got != nil {
+		t.Fatalf("ReadGateLog on a missing file = %#v, %v; want nil, nil", got, err)
+	}
+
+	entries := []GateLogEntry{
+		{At: "t1", Session: "aa-a-s1", Tool: "Bash", Outcome: "allowed"},
+		{At: "t2", Session: "aa-a-s1", Tool: "Read", Outcome: "allowed"},
+		{At: "t3", Session: "aa-a-s2", Tool: "Bash", Outcome: "denied_bash_rule"},
+	}
+	for _, e := range entries {
+		if err := AppendGateLog(root, e); err != nil {
+			t.Fatalf("AppendGateLog: %v", err)
+		}
+	}
+	// A malformed line (e.g. a half-written append from a crashed gate
+	// process) must not make the rest of the file unreadable — same
+	// resilience contract as ReadAudit.
+	f, err := os.OpenFile(GateLogPath(root), os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("open gate log for corruption: %v", err)
+	}
+	if _, err := f.WriteString("{not valid json\n"); err != nil {
+		t.Fatalf("write corrupt line: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	all, err := ReadGateLog(root, "", 0)
+	if err != nil {
+		t.Fatalf("ReadGateLog (no filter): %v", err)
+	}
+	if len(all) != 3 {
+		t.Fatalf("ReadGateLog (no filter) = %d entries, want 3 (corrupt line must be skipped, not fatal): %#v", len(all), all)
+	}
+
+	s1, err := ReadGateLog(root, "aa-a-s1", 0)
+	if err != nil {
+		t.Fatalf("ReadGateLog (session filter): %v", err)
+	}
+	if len(s1) != 2 || s1[0].Tool != "Bash" || s1[1].Tool != "Read" {
+		t.Fatalf("ReadGateLog(session=aa-a-s1) = %#v, want the 2 entries for that session in original order", s1)
+	}
+
+	s2, err := ReadGateLog(root, "aa-a-s2", 0)
+	if err != nil {
+		t.Fatalf("ReadGateLog (session filter 2): %v", err)
+	}
+	if len(s2) != 1 || s2[0].Outcome != "denied_bash_rule" {
+		t.Fatalf("ReadGateLog(session=aa-a-s2) = %#v, want exactly its 1 entry", s2)
+	}
+
+	tail, err := ReadGateLog(root, "", 1)
+	if err != nil {
+		t.Fatalf("ReadGateLog (limit): %v", err)
+	}
+	if len(tail) != 1 || tail[0].At != "t3" {
+		t.Fatalf("ReadGateLog(limit=1) = %#v, want only the last entry (t3)", tail)
+	}
+}

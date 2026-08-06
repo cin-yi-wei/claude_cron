@@ -1013,6 +1013,97 @@ func TestSandboxDriverKeepsDrivingWhenAliveDespiteConsecutiveFailures(t *testing
 	}
 }
 
+// malformedOutputInjector 模擬「沙盒確實回覆了，但格式不對」——worker.go
+// ValidateOutput 判定失敗，job 直接搬進 inbox/failed（不重試），跟
+// errSessionBusy/errStalled/glitch 的 requeue 路徑完全不同：這是真正的
+// dropped job。Inject 本身成功（訊息確實送達），只是後面驗證回覆時失敗。
+type malformedOutputInjector struct{}
+
+func (malformedOutputInjector) Inject(_ context.Context, job InputJob, outputPath string) error {
+	return AtomicWriteJSON(outputPath, OutputJob{
+		Schema: 999, JobID: job.JobID, RequestID: job.RequestID, InputHash: job.InputHash,
+		Send: true, Text: "reply with a schema the worker rejects",
+	})
+}
+
+// Important 4（final review 2026-08-06）：一個 dropped job（worker.go:207-217，
+// 直接進 inbox/failed、不重試）目前完全不會碰任務列——任務停在 working，要等
+// 兩小時硬逾時才由 sweep 報一個通用（而且錯誤）的原因。這裡驗證 driver 必須
+// 立刻把它標成 failed，且記下真正的、安全的原因，不必等 3 次連續失敗 +
+// 存活檢查那套給「session 消失」用的機制（這是不同的失敗類型：session
+// 明明還活著,只是這一句沒通過驗證）。
+func TestSandboxDriverMarksTaskFailedWhenJobIsDropped(t *testing.T) {
+	var sent []string
+	stubTmuxPane(t, "", &sent)
+	oldPoll := driverPollInterval
+	driverPollInterval = 10 * time.Millisecond
+	defer func() { driverPollInterval = oldPoll }()
+
+	root := t.TempDir()
+	agents := AgentStore{}
+	if err := agents.Add(Agent{Name: "pm", ChannelID: "chan-pm", Enabled: true}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if err := SaveAgents(root, agents); err != nil {
+		t.Fatalf("SaveAgents: %v", err)
+	}
+
+	task := A2ATask{
+		ContextID: "c1", Agent: "pm", Session: SessionNameFor("pm", "c1"),
+		State: TaskWorking, StartedAt: time.Now().UTC().Format(time.RFC3339),
+	}
+	sandbox := SandboxRoot(root, task.Session)
+	if err := Init(sandbox); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := IngestMessages(context.Background(), sandbox, []SourceMessage{{
+		Platform: "a2a", ChannelID: "c1", MessageID: "m1",
+		CreatedAt: time.Now().UTC().Format(time.RFC3339), Content: "do the thing",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	var seed TaskStore
+	seed.Upsert(task)
+	if err := SaveTasks(root, seed); err != nil {
+		t.Fatalf("SaveTasks: %v", err)
+	}
+
+	// alive 覆寫成 true 且不該被呼叫到：這條路徑必須比 3-連續失敗 + 存活檢查
+	// 更快命中，一次 dropped job 就該讓任務終止。
+	d := NewSandboxDriver(root, time.Second)
+	d.alive = func(context.Context, string) (bool, error) {
+		t.Error("liveness check must not be needed for a dropped-job failure")
+		return true, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d.Ensure(ctx, task, malformedOutputInjector{})
+	defer d.StopAll()
+
+	deadline := time.Now().Add(3 * time.Second)
+	var got A2ATask
+	for time.Now().Before(deadline) {
+		tasks, err := LoadTasks(root)
+		if err != nil {
+			t.Fatalf("LoadTasks: %v", err)
+		}
+		got, _ = tasks.ByContext("c1")
+		if got.State == TaskFailed {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got.State != TaskFailed {
+		t.Fatalf("state = %s, want failed promptly instead of sitting in working until the 2h hard timeout", got.State)
+	}
+	if got.Detail == "" {
+		t.Fatal("Detail is empty; the operator/caller must be told why this task actually failed")
+	}
+	if !got.DetailSafe {
+		t.Fatal("DetailSafe = false, want a fixed safe reason (this must not leak worker/host internals)")
+	}
+}
+
 // 一個卡住的沙盒每輪都會失敗；沒有去重與退避時最長兩小時可以往 agent 頻道
 // 推約 7200 則。
 func TestDriverErrorThrottleDeduplicatesAndCaps(t *testing.T) {

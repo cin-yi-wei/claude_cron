@@ -392,7 +392,24 @@ func BuildClaudePrompt(root string, job InputJob, outputPath string, imagePaths,
 	if len(textPaths) > 0 {
 		texts = "\n\n本則訊息附帶文字檔（平台把過長訊息轉存成檔案，例如 Slack 的 snippet），實際訊息正文在這些檔案裡，請用 Read 工具讀取其內容，當作使用者訊息的一部分一併處理：\n" + strings.Join(textPaths, "\n")
 	}
-	return fmt.Sprintf(`請讀取 %s/current_job.json。%s%s
+	// job.Source.Platform 只由伺服器端設定（a2a_executor.go 建立 SourceMessage
+	// 時寫死 "a2a"；呼叫方的請求內容從不流進這個欄位），cc- binding 的訊息一律
+	// 來自真正的平台（discord/slack/telegram/...），永遠不會是 "a2a"——這段
+	// if 對 cc- 完全是死代碼，字面一個字都不會出現在它們的提示詞裡。
+	//
+	// final review 2026-08-06, Important 2：a2a_server.go 一律把 task.Branch
+	// 回給呼叫方當作「你的工作在這個分支」，但這份提示詞（在這段加之前）從沒
+	// 教過沙盒要 commit —— sweep 會在任務完成大約十分鐘後刪掉這個 worktree
+	// （a2a_lifecycle.go 的 MaxRetainedFailedSandboxes / 回收規則），沒 commit
+	// 的修改就這樣連分支帶內容一起消失，呼叫方拿到的只是一個查無此樹的分支
+	// 名。選擇「教沙盒在回覆前 commit」而不是「乾脆不回傳 branch」：後者會讓
+	// 每一次成功的委任都失去唯一可驗證、可審查的產出，即使呼叫方本來就打算
+	// 自己再 push/PR；前者把負擔放在唯一知道「這次改了什麼檔案」的地方。
+	a2aCommitNotice := ""
+	if job.Source.Platform == "a2a" {
+		a2aCommitNotice = "\n\n【A2A 委任專用】這個工作目錄是一次性 sandbox：你把回覆送出（rename 完成）之後大約十分鐘，這整個 worktree 就會被回收刪除。委任方收到的回應只有這個 git 分支的名稱，沒有其他東西——如果你在這個目錄裡做了任何檔案修改，必須在完成前先執行 git add -A 與 git commit（尚未設定 git 身分的話先補 git config user.email / user.name）把改動提交到目前這個分支；沒有 commit 的修改在 worktree 被回收後就永遠遺失，委任方拿到的分支名將指向一棵已經不存在的樹。"
+	}
+	return fmt.Sprintf(`請讀取 %s/current_job.json。%s%s%s
 
 根據目前 Claude Code session / project context，分析裡面的新對話內容，產生要回覆使用者的訊息。
 
@@ -420,7 +437,7 @@ JSON 必須是這個格式（注意 send 要設成布林 true 才會把回覆送
 
 若你啟動了長時間的背景任務（detached，例如安裝、編譯、長測試），請在 shell 指令鏈的最後加上：
 && claude-cron notify %s "完成訊息" --root %s
-這樣任務跑完會自動通知使用者；不要為了等它而卡住這次回覆。`, root, images, texts, outputPath, outputPath, 1, job.JobID, job.RequestID, job.InputHash, root, job.Source.ChannelID, root)
+這樣任務跑完會自動通知使用者；不要為了等它而卡住這次回覆。`, root, images, texts, a2aCommitNotice, outputPath, outputPath, 1, job.JobID, job.RequestID, job.InputHash, root, job.Source.ChannelID, root)
 }
 
 // downloadImageAttachments saves a job's image attachments under

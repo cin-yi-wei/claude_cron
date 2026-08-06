@@ -531,9 +531,26 @@ func (s *A2AServer) handleMessageSend(w http.ResponseWriter, r *http.Request, re
 			if derr != nil {
 				// 交付失敗不能讓任務狀態退回、也不能觸發重新派送 —— 沙盒本身
 				// 還活著,只是這一句沒送到,跟「派送失敗」是完全不同性質的
-				// 錯誤(那套邏輯的前提是沙盒根本沒起來)。只記 log,讓呼叫方
-				// 之後可以再送一次。
+				// 錯誤(那套邏輯的前提是沙盒根本沒起來)。log 之外還要記到
+				// task row 上：final review 2026-08-06, Important 3 —— 修之
+				// 前這裡只 log，呼叫方拿到的是成功回應，兩小時硬逾時才會發現
+				// 真相。用 appendDetail 疊加（不覆寫既有 Detail），固定安全
+				// 字串（不帶 derr 內容——那可能夾著 host 路徑），這樣 tasks/get
+				// 立刻就能查到，呼叫方可以決定要不要重送。不改 State：沙盒仍
+				// 活著，這不是終態轉換。
 				log.Printf("a2a: follow-up delivery failed for contextId %s (agent=%s): %v", followUpTask.ContextID, followUpTask.Agent, derr)
+				if serr := WithTasks(s.Root, func(tasks *TaskStore) error {
+					cur, ok := tasks.ByContext(followUpTask.ContextID)
+					if !ok || cur.TaskID != followUpTask.TaskID || isTerminal(cur.State) {
+						return errA2AStoreUnchanged
+					}
+					cur.Detail, cur.DetailSafe = appendDetail(cur.Detail, cur.DetailSafe,
+						"a follow-up message failed to deliver into the sandbox; it may not have been seen", true)
+					tasks.Upsert(cur)
+					return nil
+				}); serr != nil && !errors.Is(serr, errA2AStoreUnchanged) {
+					log.Printf("a2a: failed to record follow-up delivery failure for %s/%s: %v", followUpTask.Agent, followUpTask.ContextID, serr)
+				}
 			}
 		}
 		_ = AppendAudit(s.Root, AuditEntry{

@@ -941,6 +941,66 @@ func TestFollowUpOnWorkingRowNeverRegressesCapacityEvenWhenFull(t *testing.T) {
 	}
 }
 
+// followUpFailingExecutor 讓測試在不碰 tmux 的情況下模擬 DeliverFollowUp 失敗
+// （例如沙盒的 inbox 目錄暫時寫不進去）。Start 永遠成功，只有 DeliverFollowUp
+// 會回錯。
+type followUpFailingExecutor struct {
+	StubExecutor
+	err error
+}
+
+func (f *followUpFailingExecutor) DeliverFollowUp(_ context.Context, _ A2ATask, _ string) error {
+	return f.err
+}
+
+// Important 3（final review 2026-08-06）：交付失敗之前只 log，呼叫方收到的仍
+// 是成功回應，直到兩小時硬逾時才會發現。這裡驗證失敗必須被記到 task row 的
+// Detail 上（DetailSafe=true 的固定文字，不外洩 err 內容），這樣 tasks/get
+// 立刻就能看見，而不必等 sweep。
+func TestFollowUpDeliveryFailureIsRecordedOnTheTaskRow(t *testing.T) {
+	s, root := newTestA2AServer(t)
+	deliverErr := errors.New("write /sandboxes/aa-codereview-c1/inbox/pending/x.json: no space left on device")
+	s.Executor = &followUpFailingExecutor{err: deliverErr}
+
+	var seed TaskStore
+	seed.Upsert(A2ATask{
+		ContextID: "c1", Agent: "codereview", CallerID: "peer-a",
+		Session: SessionNameFor("codereview", "c1"), State: TaskWorking,
+		Worktree: "/p/x-c1", Branch: "aa/c1",
+		Prompt: "first", StartedAt: time.Now().UTC().Format(time.RFC3339),
+		Level: GrantReadOnly,
+	})
+	if err := SaveTasks(root, seed); err != nil {
+		t.Fatalf("SaveTasks: %v", err)
+	}
+
+	rec := postRPC(t, s.Handler(), "secret-1",
+		`{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"agent":"codereview","contextId":"c1","text":"follow up"}}`)
+	var resp RPCResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	if resp.Error != nil {
+		t.Fatalf("a follow-up whose delivery fails must still ACK (the sandbox is still alive) got %#v", resp.Error)
+	}
+
+	tasks, _ := LoadTasks(root)
+	tk, ok := tasks.ByContext("c1")
+	if !ok {
+		t.Fatal("c1 disappeared")
+	}
+	if tk.State != TaskWorking {
+		t.Fatalf("state = %s, want still working (delivery failure is not a dispatch failure)", tk.State)
+	}
+	if tk.Detail == "" {
+		t.Fatal("Detail is empty; a failed follow-up delivery must be discoverable via tasks/get without waiting for the 2h hard timeout")
+	}
+	if !tk.DetailSafe {
+		t.Fatal("DetailSafe = false; the recorded reason must be a fixed safe string, not the raw error")
+	}
+	if strings.Contains(tk.Detail, "no space left") || strings.Contains(tk.Detail, "/sandboxes/") {
+		t.Fatalf("Detail leaked the underlying error/host path: %q", tk.Detail)
+	}
+}
+
 // 對憑證做暴力嘗試會在 a2a-audit.jsonl 產生零行 —— 對一個以「誰要求了什麼的
 // 持久紀錄」為存在理由的對外監聽器，這是最該有的一筆。
 func TestUnauthorizedRequestIsAudited(t *testing.T) {

@@ -203,6 +203,39 @@ func TestBuildClaudePromptTeachesNotify(t *testing.T) {
 	}
 }
 
+// Important 2（final review 2026-08-06）：a2a_server.go 一律回傳一個 branch
+// 給呼叫方，但沙盒收到的提示詞（跟 cc- 完全一樣）從沒教它要 commit —— sweep
+// 十分鐘後就把 worktree 刪了，呼叫方拿到的是一個內容已經不存在的分支名。
+// 修法是在提示詞裡對 A2A 的工作（job.Source.Platform == "a2a"）額外教一句
+// 「回覆前先 commit」；cc- 的 job（Platform 是 discord/slack/...，從來不會是
+// "a2a" —— 這個值只由 a2a_executor.go 在伺服器端設定，呼叫方無法偽造）必須
+// 完全不受影響，字面一個字都不能多。
+func TestBuildClaudePromptTeachesA2ASandboxToCommitBeforeReporting(t *testing.T) {
+	ccJob := InputJob{
+		Schema: 1, JobID: "j1", RequestID: "r1", InputHash: "h1",
+		Source: SourceMessage{Platform: "discord", ChannelID: "chan99", Content: "hi"},
+	}
+	ccPrompt := BuildClaudePrompt(".channel-agent", ccJob, ".channel-agent/outbox/pending/j1.json", nil, nil)
+	if strings.Contains(ccPrompt, "commit") {
+		t.Fatalf("a cc- job's prompt must not mention committing at all:\n%s", ccPrompt)
+	}
+
+	a2aJob := InputJob{
+		Schema: 1, JobID: "j2", RequestID: "r2", InputHash: "h2",
+		Source: SourceMessage{Platform: "a2a", ChannelID: "c1", Content: "please refactor foo.go"},
+	}
+	a2aPrompt := BuildClaudePrompt(".channel-agent", a2aJob, ".channel-agent/outbox/pending/j2.json", nil, nil)
+	if !strings.Contains(a2aPrompt, "git commit") && !strings.Contains(a2aPrompt, "commit") {
+		t.Fatalf("an a2a job's prompt must instruct the sandbox to commit before reporting done:\n%s", a2aPrompt)
+	}
+
+	// The rest of the prompt (notify teaching etc.) must still be present —
+	// this is an ADDITION, not a replacement of the shared template.
+	if !strings.Contains(a2aPrompt, "claude-cron notify") {
+		t.Fatalf("a2a prompt lost the shared notify teaching:\n%s", a2aPrompt)
+	}
+}
+
 func TestTextAttachmentDetection(t *testing.T) {
 	cases := []struct {
 		a      Attachment

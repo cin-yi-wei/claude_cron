@@ -207,11 +207,11 @@ func RunWorkerOnce(ctx context.Context, root string, injector Injector, timeout 
 			return true, err
 		}
 		_ = moveFile(processingPath, pathIn(root, "inbox", "failed", name))
-		return true, err
+		return true, newDroppedJobError(err, "no usable reply within the time limit")
 	}
 	if err := ValidateOutput(job, output); err != nil {
 		_ = moveFile(processingPath, pathIn(root, "inbox", "failed", name))
-		return true, err
+		return true, newDroppedJobError(err, "the reply did not pass output validation")
 	}
 	if err := moveFile(processingPath, pathIn(root, "inbox", "done", name)); err != nil {
 		return true, err
@@ -317,6 +317,46 @@ func ValidateOutput(job InputJob, output OutputJob) error {
 // returns, so the binding lock is released in ~stallWindow instead of being held
 // the full `timeout` (which silences the channel; see INJECT_LOCK_FIX_SPEC.md).
 var errStalled = errors.New("turn stalled: no output and pane idle")
+
+// errJobDropped is a sentinel identifying a TERMINAL, no-retry job drop: the
+// message was moved straight to inbox/failed with no further attempt — as
+// opposed to errSessionBusy/errStalled/a glitch hit, all of which requeue.
+// cc- bindings never inspect this (a dropped job there just means the user's
+// message got no reply; the binding itself is unaffected and keeps going).
+// A2A's SandboxDriver DOES care: unlike a cc- binding, a dropped job is the
+// task's only carrier of "did this succeed" — without this signal, the row
+// sits in TaskWorking until the 2-hour hard timeout reports a generic,
+// wrong cause (final review 2026-08-06, Important 4). See DroppedJobReason.
+var errJobDropped = errors.New("job dropped (moved to inbox/failed, no retry)")
+
+// droppedJobError wraps the real error (err) so RunWorkerOnce's returned
+// Error() text is BYTE-IDENTICAL to what it always returned here (Error()
+// delegates to the wrapped cause) — cc- bindings' logs are unaffected. Is
+// lets errors.Is(returned, errJobDropped) recognize this without changing
+// what err.Error()/errors.Unwrap report.
+type droppedJobError struct {
+	err    error
+	reason string // fixed, safe-to-surface (no err internals) description
+}
+
+func newDroppedJobError(err error, reason string) error {
+	return &droppedJobError{err: err, reason: reason}
+}
+
+func (e *droppedJobError) Error() string        { return e.err.Error() }
+func (e *droppedJobError) Unwrap() error        { return e.err }
+func (e *droppedJobError) Is(target error) bool { return target == errJobDropped }
+
+// DroppedJobReason extracts the fixed, safe reason string from an error
+// RunWorkerOnce returned, if it represents a dropped job (see errJobDropped).
+// ok is false for any other error, including nil.
+func DroppedJobReason(err error) (reason string, ok bool) {
+	var d *droppedJobError
+	if errors.As(err, &d) {
+		return d.reason, true
+	}
+	return "", false
+}
 
 // working reports whether the session is actively working (spinner); nil
 // disables stall detection (full-timeout behavior preserved). onProgress, if

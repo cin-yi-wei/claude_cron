@@ -1273,8 +1273,15 @@ func removeCandidate(ctx context.Context, root string, sm SessionManager, c recl
 //  4. worktree 回收交給下一趟 sweep —— 它已經會回收 canceled 且仍持有
 //     session/worktree 的 row，這裡重做一次只會跟 sweep 搶同一組路徑。
 //
+// 不收 ctx / SessionManager / SandboxStopper：這裡從不停任何東西（步驟 3
+// 只是文件裡的舊敘述，實際的停止與回收全部發生在 sweep 那條唯一的、有
+// TryLock + 身分重新確認的拆除路徑），先前的簽章帶著這三個參數卻完全不用，
+// 讓呼叫端（RevokeCaller/DisableAgent/CancelTask 一路到 a2a_admin.go 的
+// SetA2ARuntime 接線）看起來像在做一件實際上沒發生的事。round 2026-08-06
+// final review, Important 1：拿掉參數本身，而不是留著騙下一個讀者。
+//
 // 回傳被終止的 row 數。
-func terminateTasks(ctx context.Context, root string, match func(A2ATask) bool, detail string, sm SessionManager, stopper SandboxStopper) (int, error) {
+func terminateTasks(root string, match func(A2ATask) bool, detail string) (int, error) {
 	var sessions []string
 	n := 0
 	err := WithTasks(root, func(tasks *TaskStore) error {
@@ -1322,8 +1329,10 @@ func terminateTasks(ctx context.Context, root string, match func(A2ATask) bool, 
 	return n, nil
 }
 
-// RevokeCaller 撤銷一個呼叫方，並讓撤銷對已排隊與執行中的工作生效。
-func RevokeCaller(ctx context.Context, root, id string, sm SessionManager, stopper SandboxStopper) (int, error) {
+// RevokeCaller 撤銷一個呼叫方，並讓撤銷對已排隊與執行中的工作生效。不收
+// ctx / SessionManager / SandboxStopper：見 terminateTasks 的說明，它們只
+// 會被轉交給 terminateTasks，而那裡從不使用。
+func RevokeCaller(root, id string) (int, error) {
 	// 撤銷這個狀態轉換必須在 callersMu 之內完成，否則一個併發的
 	// approve/level/callback 請求會用它自己的舊快照整檔覆寫回去——撤銷回
 	// 200 OK，caller 卻還是 approved（round 14 review, Critical 2）。
@@ -1341,7 +1350,7 @@ func RevokeCaller(ctx context.Context, root, id string, sm SessionManager, stopp
 		}
 		return 0, err
 	}
-	n, err := terminateTasks(ctx, root, func(t A2ATask) bool { return t.CallerID == id }, "caller revoked", sm, stopper)
+	n, err := terminateTasks(root, func(t A2ATask) bool { return t.CallerID == id }, "caller revoked")
 	_ = AppendAudit(root, AuditEntry{
 		At:       time.Now().UTC().Format(time.RFC3339),
 		CallerID: id,
@@ -1351,8 +1360,9 @@ func RevokeCaller(ctx context.Context, root, id string, sm SessionManager, stopp
 	return n, err
 }
 
-// DisableAgent 停用一個 agent，語意與 RevokeCaller 相同。
-func DisableAgent(ctx context.Context, root, name string, sm SessionManager, stopper SandboxStopper) (int, error) {
+// DisableAgent 停用一個 agent，語意與 RevokeCaller 相同（同樣不收
+// ctx / SessionManager / SandboxStopper，理由同上）。
+func DisableAgent(root, name string) (int, error) {
 	// 與 RevokeCaller 同一個道理：停用這個狀態轉換在 agentsMu 之內完成，
 	// terminateTasks（會取 tasksMu）留在鎖外。
 	unknown := false
@@ -1371,7 +1381,7 @@ func DisableAgent(ctx context.Context, root, name string, sm SessionManager, sto
 		}
 		return 0, err
 	}
-	n, err := terminateTasks(ctx, root, func(t A2ATask) bool { return t.Agent == name }, "agent disabled", sm, stopper)
+	n, err := terminateTasks(root, func(t A2ATask) bool { return t.Agent == name }, "agent disabled")
 	_ = AppendAudit(root, AuditEntry{
 		At:      time.Now().UTC().Format(time.RFC3339),
 		Agent:   name,
@@ -1382,9 +1392,10 @@ func DisableAgent(ctx context.Context, root, name string, sm SessionManager, sto
 }
 
 // CancelTask 取消單一 contextId。取消由 operator 執行 —— 刻意不做
-// tasks/cancel RPC，呼叫方自助取消屬獨立範圍決策（規格第五節）。
-func CancelTask(ctx context.Context, root, contextID string, sm SessionManager, stopper SandboxStopper) error {
-	n, err := terminateTasks(ctx, root, func(t A2ATask) bool { return t.ContextID == contextID }, "canceled by operator", sm, stopper)
+// tasks/cancel RPC，呼叫方自助取消屬獨立範圍決策（規格第五節）。不收
+// ctx / SessionManager / SandboxStopper，理由同 terminateTasks。
+func CancelTask(root, contextID string) error {
+	n, err := terminateTasks(root, func(t A2ATask) bool { return t.ContextID == contextID }, "canceled by operator")
 	if err != nil {
 		return err
 	}
