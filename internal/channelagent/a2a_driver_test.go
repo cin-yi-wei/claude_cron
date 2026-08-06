@@ -2,6 +2,7 @@ package channelagent
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -187,7 +188,7 @@ func TestAutoAnswerSandboxConfirmAnswersRealDialog(t *testing.T) {
 	var sent []string
 	stubTmuxPane(t, confirmPaneFixture, &sent)
 
-	got := autoAnswerSandboxConfirm(context.Background(), "aa-codereview-c1", "")
+	got := autoAnswerSandboxConfirm(context.Background(), "aa-codereview-c1", confirmPaneFixture, "")
 	if got == "" {
 		t.Fatal("expected a non-empty dialog hash after answering a real dialog")
 	}
@@ -203,7 +204,7 @@ func TestAutoAnswerSandboxConfirmIgnoresProse(t *testing.T) {
 	var sent []string
 	stubTmuxPane(t, proseNumberedListFixture, &sent)
 
-	got := autoAnswerSandboxConfirm(context.Background(), "aa-codereview-c1", "")
+	got := autoAnswerSandboxConfirm(context.Background(), "aa-codereview-c1", proseNumberedListFixture, "")
 	if got != "" {
 		t.Fatalf("hash = %q, want empty — prose must not parse as a confirm dialog", got)
 	}
@@ -221,7 +222,7 @@ func TestAutoAnswerSandboxConfirmNeverTouchesCCSession(t *testing.T) {
 	var sent []string
 	stubTmuxPane(t, confirmPaneFixture, &sent) // a REAL dialog is showing
 
-	got := autoAnswerSandboxConfirm(context.Background(), "cc-somebinding", "")
+	got := autoAnswerSandboxConfirm(context.Background(), "cc-somebinding", confirmPaneFixture, "")
 	if got != "" {
 		t.Fatalf("hash = %q, want empty — cc- sessions must never be auto-answered", got)
 	}
@@ -238,14 +239,32 @@ func TestAutoAnswerSandboxConfirmDebouncesRepeatedDialog(t *testing.T) {
 	var sent []string
 	stubTmuxPane(t, confirmPaneFixture, &sent)
 
-	h1 := autoAnswerSandboxConfirm(context.Background(), "aa-codereview-c1", "")
-	h2 := autoAnswerSandboxConfirm(context.Background(), "aa-codereview-c1", h1)
+	h1 := autoAnswerSandboxConfirm(context.Background(), "aa-codereview-c1", confirmPaneFixture, "")
+	h2 := autoAnswerSandboxConfirm(context.Background(), "aa-codereview-c1", confirmPaneFixture, h1)
 
 	if h1 == "" || h1 != h2 {
 		t.Fatalf("hash changed across identical dialog captures: h1=%q h2=%q", h1, h2)
 	}
 	if len(sent) != 2 {
 		t.Fatalf("keystrokes = %#v, want exactly one [1 Enter] pair total", sent)
+	}
+}
+
+// The aa- guard is a strict prefix check, not a substring check: a session
+// name that merely CONTAINS "aa-" somewhere in the middle (e.g. because it
+// embeds a context id that happens to contain that substring) must still be
+// refused — only a session actually NAMED with the aa- sandbox prefix may be
+// auto-answered.
+func TestAutoAnswerSandboxConfirmRequiresPrefixNotSubstring(t *testing.T) {
+	var sent []string
+	stubTmuxPane(t, confirmPaneFixture, &sent) // a REAL dialog is showing
+
+	got := autoAnswerSandboxConfirm(context.Background(), "cc-aa-not-a-sandbox", confirmPaneFixture, "")
+	if got != "" {
+		t.Fatalf("hash = %q, want empty — a session merely containing \"aa-\" must not be auto-answered", got)
+	}
+	if len(sent) != 0 {
+		t.Fatalf("keystrokes = %#v, want none", sent)
 	}
 }
 
@@ -387,5 +406,150 @@ func TestSandboxDriverDeliversJobWhileAgentChannelSendHangs(t *testing.T) {
 	}
 	if inj.count() == 0 {
 		t.Fatal("driver never delivered the staged job — a slow agent-channel send blocked it")
+	}
+}
+
+const managedSettingsPaneFixture = `
+ Managed settings require approval
+
+ This project has managed settings. Do you trust these settings?
+
+ ❯ 1. Yes, I trust these settings
+   2. No, exit
+`
+
+const loginContinuePaneFixture = `
+ Login successful.
+
+ Press Enter to continue…
+`
+
+const loggedOutPaneFixture = `
+ Invalid authentication credentials
+
+ Please run /login to authenticate
+`
+
+// 這條修正真正的重點：命中任一畫面分支就 skip 本輪 RunWorkerOnce。paneBusy 不
+// 把 ScreenLogin 算成忙碌（adapters.go:208-217），所以 RunWorkerOnce 會照常
+// typeAndSubmit，把 prompt 打進核准畫面；驗證條件是「輸入框裡還有沒有字」
+// （adapters.go:94），核准畫面沒有輸入框 → Inject 回報成功、job 移進 done、
+// prompt 消失。skip 掉才擋得住。
+func TestSandboxDriverSkipsWorkOnManagedSettingsGate(t *testing.T) {
+	var sent []string
+	stubTmuxPane(t, managedSettingsPaneFixture, &sent)
+
+	root := t.TempDir()
+	task := A2ATask{ContextID: "c1", Agent: "pm", Session: SessionNameFor("pm", "c1"), State: TaskWorking}
+	sandbox := SandboxRoot(root, task.Session)
+	if err := Init(sandbox); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := IngestMessages(context.Background(), sandbox, []SourceMessage{{
+		Platform: "a2a", ChannelID: "c1", MessageID: "m1",
+		CreatedAt: time.Now().UTC().Format(time.RFC3339), Content: "do the thing",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	inj := &recordingInjector{}
+	d := NewSandboxDriver(root, time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d.Ensure(ctx, task, inj)
+	time.Sleep(600 * time.Millisecond)
+	d.StopAll()
+
+	if inj.count() != 0 {
+		t.Fatalf("driver injected %d job(s) into a managed-settings approval screen; the prompt would have vanished", inj.count())
+	}
+	if len(sent) < 2 || sent[0] != "1" || sent[1] != "Enter" {
+		t.Fatalf("keystrokes = %#v, want the gate answered with [1 Enter]", sent)
+	}
+	// 該 job 必須還在 pending，沒有被 RunWorkerOnce 消化掉。
+	entries, _ := os.ReadDir(pathIn(sandbox, "inbox", "pending"))
+	if len(entries) != 1 {
+		t.Fatalf("pending jobs = %d, want the job still queued", len(entries))
+	}
+}
+
+func TestSandboxDriverAdvancesLoginContinueScreen(t *testing.T) {
+	var sent []string
+	stubTmuxPane(t, loginContinuePaneFixture, &sent)
+
+	root := t.TempDir()
+	task := A2ATask{ContextID: "c1", Agent: "pm", Session: SessionNameFor("pm", "c1"), State: TaskWorking}
+	_ = Init(SandboxRoot(root, task.Session))
+
+	d := NewSandboxDriver(root, time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d.Ensure(ctx, task, &recordingInjector{})
+	time.Sleep(400 * time.Millisecond)
+	d.StopAll()
+
+	if len(sent) == 0 || sent[len(sent)-1] != "Enter" {
+		t.Fatalf("keystrokes = %#v, want a bare Enter", sent)
+	}
+}
+
+// 真的登出時，沙盒永遠不驅動登入流程：那是 operator 的事，一個沙盒去操作
+// /login 會動到全機共用的憑證。任務標 failed 並停掉本 driver。
+func TestSandboxDriverFailsTaskWhenLoggedOut(t *testing.T) {
+	var sent []string
+	stubTmuxPane(t, loggedOutPaneFixture, &sent)
+
+	root := t.TempDir()
+	task := A2ATask{ContextID: "c1", Agent: "pm", Session: SessionNameFor("pm", "c1"), State: TaskWorking}
+	_ = Init(SandboxRoot(root, task.Session))
+	_ = WithTasks(root, func(s *TaskStore) error { s.Upsert(task); return nil })
+
+	d := NewSandboxDriver(root, time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d.Ensure(ctx, task, &recordingInjector{})
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && len(d.Running()) != 0 {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := d.Running(); len(got) != 0 {
+		t.Fatalf("driver still running on a logged-out session: %#v", got)
+	}
+	tasks, _ := LoadTasks(root)
+	tk, _ := tasks.ByContext("c1")
+	if tk.State != TaskFailed || !strings.Contains(tk.Detail, "login") {
+		t.Fatalf("task = %q / %q, want failed with a login detail", tk.State, tk.Detail)
+	}
+	for _, k := range sent {
+		if k == "/login" {
+			t.Fatal("a sandbox must never drive the login flow")
+		}
+	}
+}
+
+// 一個卡住的沙盒每輪都會失敗；沒有去重與退避時最長兩小時可以往 agent 頻道
+// 推約 7200 則。
+func TestDriverErrorThrottleDeduplicatesAndCaps(t *testing.T) {
+	now := time.Now()
+	th := newDriverErrorThrottle()
+	if !th.allow("boom", now) {
+		t.Fatal("first occurrence must be emitted")
+	}
+	if th.allow("boom", now.Add(30*time.Second)) {
+		t.Fatal("the same error within 60s must be suppressed")
+	}
+	if !th.allow("boom", now.Add(61*time.Second)) {
+		t.Fatal("the same error after 60s must be emitted again")
+	}
+	// 每分鐘 60 行的上限：61 個各不相同的錯誤，最後一個要被擋。
+	th2 := newDriverErrorThrottle()
+	for i := 0; i < 60; i++ {
+		if !th2.allow(fmt.Sprintf("e%d", i), now) {
+			t.Fatalf("distinct error %d must be emitted", i)
+		}
+	}
+	if th2.allow("e60", now) {
+		t.Fatal("the 61st line in one minute must be suppressed")
 	}
 }

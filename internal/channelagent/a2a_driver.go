@@ -140,6 +140,11 @@ func (d *SandboxDriver) loop(ctx context.Context, task A2ATask, inj Injector) {
 	// second "1"+Enter landing after the real dismissal would submit as a
 	// stray prompt to a live sandbox. See autoAnswerSandboxConfirm.
 	var lastConfirmHash string
+	// throttle bounds how many "⚠️ <err>" lines this loop can push to the
+	// agent channel: a sandbox stuck failing every tick has no other backoff,
+	// and without this a two-hour hang can push ~7200 identical lines before
+	// the sweep finally kills it. See driverErrorThrottle.
+	throttle := newDriverErrorThrottle()
 	for {
 		select {
 		case <-ctx.Done():
@@ -148,26 +153,83 @@ func (d *SandboxDriver) loop(ctx context.Context, task A2ATask, inj Injector) {
 		}
 
 		// Sandboxes have no channel and no human to ask, so Claude Code's own
-		// confirm dialogs (trust folder, "Do you want to proceed?") — which are
-		// NOT PreToolUse-gated and therefore invisible to the permission gate —
-		// would otherwise block the pane forever: RunWorkerOnce's Inject would
-		// see the pane busy (errSessionBusy) and just defer every cycle with no
-		// way out. Auto-answer with option 1 (trust / proceed) before attempting
-		// delivery; the a2a authorization layer is the actual policy gate here,
-		// not a per-dialog human. This reuses the exact same session-name-scoped
-		// primitives (capturePane/classifyScreen/parseConfirmDialog/
-		// sendConfirmChoice) the cc- confirm watchdog uses in supervisor.go —
-		// verified they carry no Binding/registry coupling, so they parse a
-		// sandbox pane identically to a binding pane. cc- behaviour (which still
-		// asks the human) is untouched: autoAnswerSandboxConfirm refuses any
-		// non-aa- session, and this call only ever runs from the sandbox driver
-		// loop, never from supervisor.go.
-		lastConfirmHash = autoAnswerSandboxConfirm(ctx, session, lastConfirmHash)
+		// screens that the permission hook does not cover — folder trust, the
+		// managed-settings approval gate, "Do you want to proceed?", or a
+		// genuine logout — would otherwise block the pane forever:
+		// RunWorkerOnce's Inject would see the pane busy (errSessionBusy) for a
+		// confirm dialog, or — worse — for the managed-settings/login-continue
+		// gates, which classifyScreen reports as ScreenLogin and paneBusy does
+		// NOT treat as busy (adapters.go:208-217) — Inject would type the
+		// prompt straight into the approval screen and report success, and the
+		// prompt would simply vanish. Capture the pane exactly ONCE per loop
+		// iteration (capture-pane is a fork/exec; with up to 8 sandboxes ticking
+		// every second, a second capture would double that syscall traffic) and
+		// branch every screen decision off this single snapshot.
+		pane := capturePane(ctx, session)
+		low := strings.ToLower(stripANSI(pane))
+		skip := false
+		switch {
+		case pane == "":
+			// 抓不到畫面（session 還沒起來 / tmux 不可用）：交給 RunWorkerOnce
+			// 的 errSessionBusy 路徑處理，不要在這裡猜。
+		case paneAwaitingManagedSettings(low):
+			// screen.go:180。這個閘被 classifyScreen 判為 ScreenLogin，而
+			// supervisor.go 的登入 watchdog 只跑 binding 迴圈 —— 沙盒得自己
+			// 處理。SelectTrustSettings 就是 watchdog 用的同一個 helper。
+			_ = TmuxInjector{Session: session}.SelectTrustSettings(ctx)
+			skip = true
+		case paneAwaitingLoginContinue(low):
+			// screen.go:174。同上，送一個 Enter 推進去。
+			_ = TmuxInjector{Session: session}.PressEnter(ctx)
+			skip = true
+		default:
+			switch classifyScreen(pane) {
+			case ScreenConfirm:
+				// Sandboxes have no channel and no human to ask, so Claude
+				// Code's own confirm dialogs (trust folder, "Do you want to
+				// proceed?") — which are NOT PreToolUse-gated and therefore
+				// invisible to the permission gate — are answered with option
+				// 1 (trust / proceed) here; the a2a authorization layer is the
+				// actual policy gate, not a per-dialog human. This reuses the
+				// exact same session-name-scoped primitives
+				// (classifyScreen/parseConfirmDialog/sendConfirmChoice) the
+				// cc- confirm watchdog uses in supervisor.go — verified they
+				// carry no Binding/registry coupling, so they parse a sandbox
+				// pane identically to a binding pane. cc- behaviour (which
+				// still asks the human) is untouched: autoAnswerSandboxConfirm
+				// refuses any non-aa- session, and this call only ever runs
+				// from the sandbox driver loop, never from supervisor.go.
+				lastConfirmHash = autoAnswerSandboxConfirm(ctx, session, pane, lastConfirmHash)
+				skip = true
+			case ScreenLogin:
+				// 真的登出了。沙盒永遠不驅動登入流程：那是 operator 的事，一個
+				// 沙盒去操作 /login 會動到全機共用的憑證。任務標 failed 並停掉
+				// 本 driver — worktree 保留供 forensics。
+				markSandboxLoginFailure(d.root, task, channel)
+				return
+			default:
+				lastConfirmHash = ""
+			}
+		}
+		// 命中任一畫面分支就 skip 本輪 RunWorkerOnce —— 這是這條修正真正的
+		// 重點。paneBusy 不把 ScreenLogin 算成忙碌（adapters.go:208-217），
+		// RunWorkerOnce 會把 prompt 打進核准畫面並回報成功（adapters.go:94
+		// 的驗證條件在無輸入框的畫面上必然為 false），prompt 就此消失。
+		if skip {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Second):
+			}
+			continue
+		}
 
 		processed, err := RunWorkerOnce(ctx, sandbox, inj, d.timeout)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "a2a driver %s: %v\n", session, err)
-			channel.SendLine(task.ContextID, "⚠️ "+err.Error())
+			if throttle.allow(err.Error(), time.Now()) {
+				channel.SendLine(task.ContextID, "⚠️ "+err.Error())
+			}
 		}
 		// Stream the sandbox's transcript activity (thinking/tool-use) to its
 		// agent channel — the "what is this sandbox actually doing" visibility
@@ -189,17 +251,75 @@ func (d *SandboxDriver) loop(ctx context.Context, task A2ATask, inj Injector) {
 	}
 }
 
-// autoAnswerSandboxConfirm checks the sandbox's pane and, if it is sitting on
-// one of Claude Code's own confirm dialogs, answers it with option 1 (trust /
-// proceed) so the loop is never blocked by a prompt nobody can see. Errors
-// (no such tmux session, tmux unavailable) resolve to ScreenUnknown/empty pane
-// and are silently ignored — the next RunWorkerOnce attempt will simply defer
-// again via errSessionBusy if the session truly isn't ready yet.
+// markSandboxLoginFailure 把任務標成 failed 並在 agent 頻道留一行。worktree
+// 保留（依 2026-08-05 規格第 124 行的 forensics 規則），由 sweep 的
+// MaxRetainedFailedSandboxes 上限約束。
+func markSandboxLoginFailure(root string, task A2ATask, channel AgentChannel) {
+	const detail = "sandbox session needs login"
+	_ = WithTasks(root, func(tasks *TaskStore) error {
+		cur, ok := tasks.ByContext(task.ContextID)
+		if !ok || !CanTransition(cur.State, TaskFailed) {
+			return nil
+		}
+		cur.State = TaskFailed
+		cur.Detail = detail
+		cur.CompletedAt = time.Now().UTC().Format(time.RFC3339)
+		tasks.Upsert(cur)
+		return nil
+	})
+	channel.SendLine(task.ContextID, "🔴 "+detail)
+}
+
+// driverErrorThrottle 讓一個卡住的沙盒不會把 agent 頻道灌爆：同一段錯誤文字
+// 60 秒內最多一行，且每個 session 每分鐘最多 60 行。沒有它時，一個 session
+// 消失的沙盒會在兩小時硬逾時前推出約 7200 則（a2a_driver.go 原本的錯誤路徑
+// 無去重、無退避、無次數上限）。
+type driverErrorThrottle struct {
+	lastSeen map[string]time.Time
+	windowAt time.Time
+	inWindow int
+}
+
+func newDriverErrorThrottle() *driverErrorThrottle {
+	return &driverErrorThrottle{lastSeen: map[string]time.Time{}}
+}
+
+func (t *driverErrorThrottle) allow(msg string, now time.Time) bool {
+	if now.Sub(t.windowAt) >= time.Minute {
+		t.windowAt, t.inWindow = now, 0
+	}
+	if t.inWindow >= 60 {
+		return false
+	}
+	if last, ok := t.lastSeen[msg]; ok && now.Sub(last) < time.Minute {
+		return false
+	}
+	// map 只受同一 session 的相異錯誤文字數量約束；超過 256 種就整批清空，
+	// 避免一個會產生唯一錯誤字串的失敗模式把記憶體吃光。
+	if len(t.lastSeen) > 256 {
+		t.lastSeen = map[string]time.Time{}
+	}
+	t.lastSeen[msg] = now
+	t.inWindow++
+	return true
+}
+
+// autoAnswerSandboxConfirm 依 loop 已經抓好的 pane 判斷是否停在 Claude Code
+// 自己的 confirm 對話框上，是的話答 option 1（trust / proceed），這樣 loop
+// 就不會被一個沒人看得到的對話框卡住。空 pane 或未被判為 ScreenConfirm 的
+// pane 都視為 no-op —— 若 session 真的還沒 ready，下一次 RunWorkerOnce 仍會
+// 走 errSessionBusy 照常延後。
+//
+// pane 由呼叫端傳入而不是自己 capture：loop 每輪只能 capture 一次
+// （capture-pane 是 fork/exec，8 個沙盒 = 每秒 8 次），新增畫面分支不得讓它
+// 變成兩次。
 //
 // ONLY aa- sandboxes are ever auto-answered — checked here too (not just in
 // Ensure) as defense in depth, since this is the function that actually types
 // the keystroke. A cc- binding must keep asking the human via supervisor.go's
-// confirm watchdog.
+// confirm watchdog. The check is a strict prefix match, not a substring
+// match: a session name that merely contains "aa-" somewhere else in its name
+// must not qualify.
 //
 // lastHash is the hash (confirmDialog.hash()) of the dialog this function
 // last answered for this session, or "" if none. It is returned updated:
@@ -209,11 +329,10 @@ func (d *SandboxDriver) loop(ctx context.Context, task A2ATask, inj Injector) {
 // submitted as a prompt once the dialog actually dismisses. Reset to "" the
 // moment the pane stops showing a confirm dialog at all, so a genuinely new
 // dialog (even one with identical text) is still answered.
-func autoAnswerSandboxConfirm(ctx context.Context, session, lastHash string) string {
+func autoAnswerSandboxConfirm(ctx context.Context, session, pane, lastHash string) string {
 	if !strings.HasPrefix(session, "aa-") {
 		return ""
 	}
-	pane := capturePane(ctx, session)
 	if pane == "" || classifyScreen(pane) != ScreenConfirm {
 		return ""
 	}
