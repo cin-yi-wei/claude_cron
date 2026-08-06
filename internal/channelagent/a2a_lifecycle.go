@@ -97,8 +97,23 @@ func parseRFC3339(s string) (time.Time, bool) {
 // disk for a later sweep to retry. projectDir may be empty when the owning
 // agent can no longer be resolved (deleted since the task ran); RemoveWorktree
 // still falls back to deleting the worktree directory directly in that case.
+//
+// taskID and state are the row's OWN values at the moment step 1 selected it,
+// carried forward so step 3 can prove the row it is about to clear is still
+// the same task in the same state — not a fresh task that reused the same
+// contextId while teardown was in flight (task-8 review round 3, finding 1).
+// contextId ownership is enforced on CallerID only, not on task state, and
+// SessionNameFor/SandboxWorktree are deterministic functions of the
+// contextId, so a resubmission during the teardown window lands a live
+// Session/Worktree at the exact paths this candidate is tearing down, under
+// the SAME contextId (Upsert keys on contextId, so the resubmission
+// overwrites this row in place). Matching on contextId alone would then let
+// step 3 zero out that brand-new task's live fields — the exact
+// unrecoverable-orphan class finding 1 exists to close, reintroduced through
+// the bookkeeping step meant to fix it.
 type reclaimCandidate struct {
-	contextID, projectDir, worktree, session string
+	taskID, contextID, projectDir, worktree, session string
+	state                                            TaskState
 }
 
 // SweepTimeouts cancels tasks past HardTimeout and tears down completed and
@@ -121,21 +136,34 @@ type reclaimCandidate struct {
 //
 //  1. Identify candidates (state transitions for hard-timeout cancels are
 //     applied and persisted here, but no Worktree/Session field is cleared
-//     yet for anything this pass wants to reclaim).
+//     yet for anything this pass wants to reclaim), recording each
+//     candidate's own TaskID/State/Worktree/Session as they stood at
+//     selection time.
 //  2. Outside the lock: stop sessions, then attempt each candidate's
 //     removal. A failure is logged and left for a later sweep to retry — the
-//     candidate's path stays out of the "succeeded" set below.
-//  3. Take the lock again and clear Worktree/Session only for the
-//     candidates whose removal actually succeeded in step 2, so a failed one
-//     remains discoverable (still referenced by its task row) instead of
-//     silently becoming an orphaned, untracked directory.
+//     candidate stays out of the "succeeded" list below.
+//  3. Take the lock again and, for each succeeded candidate, clear
+//     Worktree/Session ONLY if the row at that contextId still has the
+//     exact same TaskID, State, Worktree and Session recorded in step 1. A
+//     contextId is caller-chosen and its ownership check does not pin task
+//     state, so the same caller can legally resubmit the same contextId
+//     while step 2 is tearing down a terminal task under it; TaskStore.Upsert
+//     keys on contextId, so that resubmission overwrites the row in place
+//     with a fresh TaskID and a live Session/Worktree at the same
+//     deterministic paths. Matching on contextId alone would let this step
+//     zero out that new, live task's fields. A row that no longer matches is
+//     left completely alone — it keeps its fields, so the retry path in
+//     step 2 covers it again on the next sweep if it's still genuinely
+//     reclaim-eligible.
 //
 // canceled counts state transitions from step 1 (unaffected by removal
 // success, since no path information is lost by that transition alone).
-// reclaimed counts candidates whose disk removal succeeded in step 2,
-// independent of whether step 3's persist of that success also succeeds —
-// if it doesn't, the next sweep simply retries an already-removed path,
-// which os.RemoveAll and RemoveWorktree both tolerate.
+// reclaimed counts candidates that were both successfully removed in step 2
+// AND confirmed still the same task in step 3 — a candidate whose row
+// changed identity underneath it is not counted, since nothing was actually
+// cleared for it. reclaimed is independent of whether step 3's SaveTasks
+// call itself succeeds; if it doesn't, the next sweep simply retries an
+// already-removed path, which os.RemoveAll and RemoveWorktree both tolerate.
 func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time.Time) (int, int, error) {
 	canceled, reclaimed := 0, 0
 	// Sessions to stop are collected under the lock but stopped after it is
@@ -217,7 +245,7 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 				if t.Session != "" {
 					toStop = append(toStop, t.Session)
 				}
-				candidates = append(candidates, reclaimCandidate{t.ContextID, projectDirFor(t.Agent), t.Worktree, t.Session})
+				candidates = append(candidates, reclaimCandidate{t.TaskID, t.ContextID, projectDirFor(t.Agent), t.Worktree, t.Session, t.State})
 			}
 		}
 
@@ -238,7 +266,7 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 			if t.Session == "" && t.Worktree == "" {
 				continue // already fully reclaimed
 			}
-			candidates = append(candidates, reclaimCandidate{t.ContextID, projectDirFor(t.Agent), t.Worktree, t.Session})
+			candidates = append(candidates, reclaimCandidate{t.TaskID, t.ContextID, projectDirFor(t.Agent), t.Worktree, t.Session, t.State})
 		}
 
 		// Cap the forensics exemption: failed sandboxes are kept on purpose,
@@ -265,7 +293,7 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 				if t.Session != "" {
 					toStop = append(toStop, t.Session)
 				}
-				candidates = append(candidates, reclaimCandidate{t.ContextID, projectDirFor(t.Agent), t.Worktree, t.Session})
+				candidates = append(candidates, reclaimCandidate{t.TaskID, t.ContextID, projectDirFor(t.Agent), t.Worktree, t.Session, t.State})
 			}
 		}
 
@@ -290,7 +318,7 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 	for _, session := range toStop {
 		_ = sm.Stop(ctx, session)
 	}
-	succeeded := make(map[string]bool, len(candidates))
+	var succeeded []reclaimCandidate
 	for _, c := range candidates {
 		ok := true
 		if c.worktree != "" {
@@ -306,24 +334,48 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 			}
 		}
 		if ok {
-			succeeded[c.contextID] = true
+			succeeded = append(succeeded, c)
 		}
 	}
-	reclaimed = len(succeeded)
 
-	// --- Step 3: take the lock again, clear fields only for successes. ---
+	// --- Step 3: take the lock again, clear fields only for confirmed matches. ---
+	//
+	// contextId ownership is enforced on CallerID only, not on task state
+	// (the deliberate I2 design), and SessionNameFor/SandboxWorktree are
+	// deterministic functions of the contextId. So between step 1 releasing
+	// the lock and this reacquiring it, the same caller can legally resubmit
+	// the same contextId: TaskStore.Upsert keys on contextId, so a fresh
+	// task with a new TaskID, live Session/Worktree, and TaskSubmitted state
+	// overwrites this exact row in place. Matching on contextId alone here
+	// would zero out that live task's fields — corrupting a task that step 1
+	// never selected and turning it into the very unrecoverable orphan this
+	// whole retry design exists to prevent. Clearing therefore requires the
+	// row to still be an exact match — same TaskID, same State, same
+	// Worktree, same Session as step 1 recorded — not merely the same
+	// contextId. A row that no longer matches is left completely alone: it
+	// keeps whatever fields it currently has, and if it is genuinely still
+	// the same reclaim candidate (e.g. a transient mismatch that wasn't
+	// actually a race), the next sweep picks it up again.
 	if len(succeeded) > 0 {
 		err2 := WithTasks(root, func(tasks *TaskStore) error {
 			changed := false
-			for i := range tasks.Tasks {
-				if !succeeded[tasks.Tasks[i].ContextID] {
-					continue
+			for _, c := range succeeded {
+				for i := range tasks.Tasks {
+					t := tasks.Tasks[i]
+					if t.ContextID != c.contextID {
+						continue
+					}
+					if t.TaskID != c.taskID || t.State != c.state || t.Worktree != c.worktree || t.Session != c.session {
+						log.Printf("a2a: sweep: context %s changed during teardown (now task %s, state %s); leaving its worktree/session untouched", c.contextID, t.TaskID, t.State)
+						break
+					}
+					t.Worktree = ""
+					t.Session = ""
+					tasks.Tasks[i] = t
+					reclaimed++
+					changed = true
+					break
 				}
-				t := tasks.Tasks[i]
-				t.Worktree = ""
-				t.Session = ""
-				tasks.Tasks[i] = t
-				changed = true
 			}
 			if !changed {
 				return errNothingSwept
@@ -335,7 +387,11 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 			// that marks them cleared failed to persist. Log it — the next
 			// sweep will harmlessly retry an already-gone path — but don't
 			// let it override step 1's result, which is what actually
-			// happened to cancellation/reclaim eligibility this pass.
+			// happened to cancellation/reclaim eligibility this pass. Note
+			// reclaimed was already incremented above per matched row inside
+			// the (failed-to-save) callback; that overstates the persisted
+			// count in this rare case, same as the pre-existing tradeoff
+			// documented in the doc comment above.
 			log.Printf("a2a: sweep: failed to persist reclaimed sandboxes: %v", err2)
 		}
 	}

@@ -66,6 +66,14 @@ type FakeSessionManager struct {
 	Injected   []SourceMessage
 	Removed    []string
 	FailOn     string
+	// OnRemove, if set, fires once on the first RemoveWorkspace call, then
+	// clears itself. Tests use it to inject a state change into tasks.json
+	// from inside SweepTimeouts' teardown window — the gap between its step 1
+	// (candidate identification) and step 3 (clearing fields for confirmed
+	// matches) — to simulate a caller resubmitting the same contextId while
+	// teardown for the previous, terminal task is in flight (task-8 review
+	// round 3, finding 1).
+	OnRemove func()
 }
 
 func (f *FakeSessionManager) EnsureWorkspace(_ context.Context, _, _, worktree string) error {
@@ -93,6 +101,11 @@ func (f *FakeSessionManager) Stop(_ context.Context, session string) error {
 }
 
 func (f *FakeSessionManager) RemoveWorkspace(_ context.Context, _, worktree string) error {
+	if f.OnRemove != nil {
+		hook := f.OnRemove
+		f.OnRemove = nil
+		hook()
+	}
 	if f.FailOn == "remove" {
 		return errors.New("fake remove failure")
 	}

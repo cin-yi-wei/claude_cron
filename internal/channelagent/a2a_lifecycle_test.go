@@ -389,6 +389,58 @@ func TestSweepRetriesFailedRemoval(t *testing.T) {
 	}
 }
 
+// TestSweepSkipsRowChangedDuringTeardown guards finding 1 of the task-8 review
+// round 3: contextId ownership is checked on CallerID only, not on task
+// state, and Session/Worktree paths are deterministic functions of the
+// contextId. So a caller can legally resubmit the same contextId while a
+// terminal task under it is mid-teardown (the window between SweepTimeouts'
+// step 1, which identifies the row as a reclaim candidate, and step 3, which
+// clears its fields). TaskStore.Upsert keys on contextId, so that
+// resubmission overwrites the row in place with a new TaskID, a live
+// Session/Worktree, and TaskSubmitted state. Step 3 must recognize the row no
+// longer matches what step 1 selected and leave it untouched — clearing it
+// would corrupt a live task's bookkeeping and orphan it with nothing left
+// pointing at its (still very much alive) disk footprint.
+//
+// FakeSessionManager.OnRemove fires exactly once, from inside the
+// RemoveWorkspace call that step 2 makes for the original candidate — i.e.
+// precisely inside the window between steps 1 and 3 — and simulates the race
+// by overwriting the tasks-file row for the same contextId with a different
+// task carrying live Worktree/Session values.
+func TestSweepSkipsRowChangedDuringTeardown(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	var s TaskStore
+	s.Upsert(A2ATask{
+		ContextID: "c1", TaskID: "task-A", Session: "aa-a-c1", State: TaskCompleted,
+		Worktree:    "/p/aa-a-c1",
+		CompletedAt: now.Add(-15 * time.Minute).Format(time.RFC3339),
+	})
+	_ = SaveTasks(root, s)
+
+	fake := &FakeSessionManager{}
+	fake.OnRemove = func() {
+		var live TaskStore
+		live.Upsert(A2ATask{
+			ContextID: "c1", TaskID: "task-B", Session: "aa-a-c1", State: TaskSubmitted,
+			Worktree:  "/p/aa-a-c1",
+			StartedAt: now.Format(time.RFC3339),
+		})
+		if err := SaveTasks(root, live); err != nil {
+			t.Fatalf("inject race: %v", err)
+		}
+	}
+
+	if _, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now); err != nil || reclaimed != 0 {
+		t.Fatalf("reclaimed = %d err = %v, want 0 (the row now belongs to a different, live task)", reclaimed, err)
+	}
+	got, _ := LoadTasks(root)
+	tk, _ := got.ByContext("c1")
+	if tk.TaskID != "task-B" || tk.State != TaskSubmitted || tk.Worktree != "/p/aa-a-c1" || tk.Session != "aa-a-c1" {
+		t.Fatalf("the racing task's live fields were clobbered by the stale sweep: %#v", tk)
+	}
+}
+
 // TestSweepReclaimsWorktreeOnHardTimeoutCancel guards finding 2 of the task-8
 // review: a canceled task is not a failed one, so the forensics exemption
 // must not apply to it. HardTimeout's own purpose is bounding a wedged
