@@ -16,6 +16,7 @@ type Config struct {
 	Push         PushConfig     `json:"push,omitempty"`
 	Admin        AdminConfig    `json:"admin,omitempty"`
 	Control      ControlConfig  `json:"control,omitempty"`
+	A2A          A2AConfig      `json:"a2a,omitempty"`
 	// IdleSleepMinutes: a binding idle this long auto-sleeps (session killed to
 	// free RAM; auto-wakes on next message). 0 = default (30 min); <0 = disabled.
 	IdleSleepMinutes int `json:"idle_sleep_minutes,omitempty"`
@@ -105,6 +106,26 @@ func (c Config) ControlPlanes() []ControlPlane {
 type AdminConfig struct {
 	Listen string `json:"listen,omitempty"`
 	Token  string `json:"token,omitempty"`
+}
+
+// A2AConfig configures the agent-to-agent listener. Listen MUST differ from the
+// admin API address: the admin API can create shell-capable bindings and must
+// never become externally reachable. Enabled defaults to false — with it off,
+// serve starts no listener and runs no A2A sweeps, leaving existing behaviour
+// byte-for-byte unchanged.
+type A2AConfig struct {
+	Enabled bool   `json:"enabled,omitempty"`
+	Listen  string `json:"listen,omitempty"`
+	BaseURL string `json:"base_url,omitempty"`
+}
+
+// A2AListen resolves the A2A listen address, defaulting to a port distinct from
+// the admin default (127.0.0.1:8787).
+func (c Config) A2AListen() string {
+	if c.A2A.Listen != "" {
+		return c.A2A.Listen
+	}
+	return "127.0.0.1:8790"
 }
 
 // PushConfig configures push-mode (active) ingestion. Listen is the local

@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -210,6 +211,24 @@ func run(args []string, stdout, stderr io.Writer) int {
 				}
 			}()
 		}
+		// A2A listener: served on its OWN port, separate from the admin API
+		// (which can create shell-capable bindings and must never be
+		// externally reachable). Entirely gated behind cfg.A2A.Enabled so an
+		// unconfigured/default serve process opens no extra listener at all.
+		if cfg.A2A.Enabled {
+			a2a := &agent.A2AServer{
+				Root:     *root,
+				BaseURL:  cfg.A2A.BaseURL,
+				Executor: agent.NewSandboxExecutor(*root, agent.TmuxSessionManager{}),
+			}
+			a2aSrv := &http.Server{Addr: cfg.A2AListen(), Handler: a2a.Handler()}
+			go func() {
+				fmt.Fprintf(stdout, "a2a server listening on %s\n", cfg.A2AListen())
+				if err := a2aSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+					fmt.Fprintf(stderr, "a2a server error: %v\n", err)
+				}
+			}()
+		}
 		// Live activity streamer: an independent fast ticker that tails each
 		// session's transcript and streams thinking/tool-call progress. Kept OUT of
 		// the supervisor cycle (which blocks on the per-binding worker wait) so
@@ -241,6 +260,25 @@ func run(args []string, stdout, stderr io.Writer) int {
 					case <-t.C:
 						if _, err := agent.RunSchedulerOnce(supCtx, *root, time.Now()); err != nil {
 							fmt.Fprintf(stderr, "scheduler error: %v\n", err)
+						}
+						// A2A per-cycle lifecycle work, gated behind cfg.A2A.Enabled.
+						// Runs sequentially in THIS goroutine, on this same 30s
+						// ticker — never its own goroutine or timer — so DrainQueue
+						// (which tracks capacity locally within one call) never
+						// races a concurrent invocation of itself. Order matters:
+						// collect frees capacity that sweep/drain then act on in
+						// the same cycle. Any failure is logged and does not abort
+						// this cycle or touch the cc- bindings' own processing.
+						if cfg.A2A.Enabled {
+							if _, err := agent.CollectResults(*root, time.Now()); err != nil {
+								fmt.Fprintf(stderr, "a2a collect: %v\n", err)
+							}
+							if _, _, err := agent.SweepTimeouts(supCtx, *root, agent.TmuxSessionManager{}, time.Now()); err != nil {
+								fmt.Fprintf(stderr, "a2a sweep: %v\n", err)
+							}
+							if _, err := agent.DrainQueue(supCtx, *root, agent.NewSandboxExecutor(*root, agent.TmuxSessionManager{})); err != nil {
+								fmt.Fprintf(stderr, "a2a drain: %v\n", err)
+							}
 						}
 					}
 				}
