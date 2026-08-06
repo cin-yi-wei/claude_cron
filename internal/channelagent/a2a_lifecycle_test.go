@@ -3,6 +3,8 @@ package channelagent
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -311,10 +313,11 @@ func TestSweepReclaimsCompletedTaskWithUnparseableCompletedAt(t *testing.T) {
 	}
 }
 
-// TestSweepLeavesFailedSandboxForensicsEvenWithGarbageTimestamp pins that the
-// forensics exemption is not weakened by the corrupt-timestamp fix: a failed
-// task must never be reclaimed, regardless of how unreadable its CompletedAt
-// is.
+// TestSweepRemovesWorktreeOnReclaim also pins that reclamation removes the
+// sandbox root (inbox/outbox/locks), not just the worktree: it creates a real
+// marker file under SandboxRoot beforehand and asserts the whole directory is
+// gone afterwards (finding 4 of the task-8 review — sandbox-root removal was
+// previously asserted nowhere).
 func TestSweepRemovesWorktreeOnReclaim(t *testing.T) {
 	root := t.TempDir()
 	now := time.Now().UTC()
@@ -326,12 +329,103 @@ func TestSweepRemovesWorktreeOnReclaim(t *testing.T) {
 	})
 	_ = SaveTasks(root, s)
 
+	sandboxRoot := SandboxRoot(root, "aa-a-c1")
+	if err := os.MkdirAll(sandboxRoot, 0o755); err != nil {
+		t.Fatalf("MkdirAll sandbox root: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sandboxRoot, "marker"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+
 	fake := &FakeSessionManager{}
 	if _, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now); err != nil || reclaimed != 1 {
 		t.Fatalf("reclaimed = %d err = %v", reclaimed, err)
 	}
 	if len(fake.Removed) != 1 || fake.Removed[0] != "/p/aa-a-c1" {
 		t.Fatalf("worktree not removed: %#v", fake.Removed)
+	}
+	if _, err := os.Stat(sandboxRoot); !os.IsNotExist(err) {
+		t.Fatalf("sandbox root not removed: stat err = %v", err)
+	}
+}
+
+// TestSweepRetriesFailedRemoval guards finding 1 of the task-8 review: clearing
+// Worktree/Session before the actual removal succeeds would make a transient
+// git/tmux/fs failure permanently orphan the sandbox, since nothing would
+// reference its path any longer for a later sweep to find. A failed removal
+// must leave the task's Worktree/Session in place so the next sweep retries.
+func TestSweepRetriesFailedRemoval(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	var s TaskStore
+	s.Upsert(A2ATask{
+		ContextID: "c1", Session: "aa-a-c1", State: TaskCompleted,
+		Worktree:    "/p/aa-a-c1",
+		CompletedAt: now.Add(-15 * time.Minute).Format(time.RFC3339),
+	})
+	_ = SaveTasks(root, s)
+
+	fake := &FakeSessionManager{FailOn: "remove"}
+	if _, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now); err != nil || reclaimed != 0 {
+		t.Fatalf("first sweep: reclaimed = %d err = %v, want 0 (removal failed)", reclaimed, err)
+	}
+	got, _ := LoadTasks(root)
+	tk, _ := got.ByContext("c1")
+	if tk.Worktree != "/p/aa-a-c1" || tk.Session != "aa-a-c1" {
+		t.Fatalf("worktree/session cleared despite a failed removal, now unreclaimable: %#v", tk)
+	}
+
+	fake.FailOn = ""
+	if _, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now); err != nil || reclaimed != 1 {
+		t.Fatalf("retry sweep: reclaimed = %d err = %v, want 1", reclaimed, err)
+	}
+	if len(fake.Removed) != 1 || fake.Removed[0] != "/p/aa-a-c1" {
+		t.Fatalf("worktree not removed on retry: %#v", fake.Removed)
+	}
+	got, _ = LoadTasks(root)
+	tk, _ = got.ByContext("c1")
+	if tk.Worktree != "" || tk.Session != "" {
+		t.Fatalf("task not cleared after the retry succeeded: %#v", tk)
+	}
+}
+
+// TestSweepReclaimsWorktreeOnHardTimeoutCancel guards finding 2 of the task-8
+// review: a canceled task is not a failed one, so the forensics exemption
+// must not apply to it. HardTimeout's own purpose is bounding a wedged
+// sandbox's disk footprint — leaving its worktree behind after cancellation
+// would let a caller grow disk usage without bound purely via hard-timeouts.
+func TestSweepReclaimsWorktreeOnHardTimeoutCancel(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	var s TaskStore
+	s.Upsert(A2ATask{
+		ContextID: "c1", Session: "aa-a-c1", State: TaskWorking,
+		Worktree:  "/p/aa-a-c1",
+		StartedAt: now.Add(-3 * time.Hour).Format(time.RFC3339),
+	})
+	_ = SaveTasks(root, s)
+
+	fake := &FakeSessionManager{}
+	canceled, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now)
+	if err != nil {
+		t.Fatalf("SweepTimeouts: %v", err)
+	}
+	if canceled != 1 {
+		t.Fatalf("canceled = %d, want 1", canceled)
+	}
+	if reclaimed != 1 {
+		t.Fatalf("reclaimed = %d, want 1 (a canceled task is not exempt like a failed one)", reclaimed)
+	}
+	if len(fake.Removed) != 1 || fake.Removed[0] != "/p/aa-a-c1" {
+		t.Fatalf("worktree not removed for the canceled task: %#v", fake.Removed)
+	}
+	got, _ := LoadTasks(root)
+	tk, _ := got.ByContext("c1")
+	if tk.State != TaskCanceled {
+		t.Fatalf("state = %s, want canceled", tk.State)
+	}
+	if tk.Worktree != "" || tk.Session != "" {
+		t.Fatalf("canceled task's worktree/session not cleared: %#v", tk)
 	}
 }
 
@@ -382,6 +476,10 @@ func TestSweepKeepsFailedSandboxesUnderTheCap(t *testing.T) {
 	}
 }
 
+// TestSweepLeavesFailedSandboxForensicsEvenWithGarbageTimestamp pins that the
+// forensics exemption is not weakened by the corrupt-timestamp fix: a failed
+// task must never be reclaimed, regardless of how unreadable its CompletedAt
+// is.
 func TestSweepLeavesFailedSandboxForensicsEvenWithGarbageTimestamp(t *testing.T) {
 	root := t.TempDir()
 	now := time.Now().UTC()

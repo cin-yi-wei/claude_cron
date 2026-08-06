@@ -89,42 +89,61 @@ func parseRFC3339(s string) (time.Time, bool) {
 	return t, true
 }
 
-// removal is one workspace this sweep decided to tear down: the git worktree
-// (if any) plus its sandbox root (inbox/outbox/locks), keyed by session.
-// projectDir may be empty when the owning agent can no longer be resolved
-// (deleted since the task ran); RemoveWorktree still falls back to deleting
-// the worktree directory directly in that case.
-type removal struct {
-	projectDir, worktree, session string
+// reclaimCandidate is one task this sweep pass considered tearing down: its
+// worktree (if any) and sandbox root, identified but NOT yet cleared from the
+// task row. Fields are only cleared after the actual removal below succeeds
+// (see SweepTimeouts doc comment) — a candidate whose removal fails is simply
+// left out of the next WithTasks write, so its Worktree/Session survive on
+// disk for a later sweep to retry. projectDir may be empty when the owning
+// agent can no longer be resolved (deleted since the task ran); RemoveWorktree
+// still falls back to deleting the worktree directory directly in that case.
+type reclaimCandidate struct {
+	contextID, projectDir, worktree, session string
 }
 
-// SweepTimeouts cancels tasks past HardTimeout and tears down completed
-// sandboxes past RetainAfterComplete, reclaiming their worktree and sandbox
-// root — not just the tmux session. Failed sandboxes are deliberately left in
-// place for forensics, but that exemption is capped at
-// MaxRetainedFailedSandboxes: the oldest failures beyond the cap are reclaimed
-// the same way, keeping only the newest (most likely to still be worth
-// inspecting).
+// SweepTimeouts cancels tasks past HardTimeout and tears down completed and
+// canceled sandboxes, reclaiming their worktree and sandbox root — not just
+// the tmux session. A canceled task is not a failed one, so the forensics
+// exemption does not apply to it: HardTimeout exists precisely to bound a
+// wedged sandbox's disk footprint, and that bound would be meaningless if the
+// worktree it was holding were left behind after cancellation. Failed
+// sandboxes alone are deliberately kept for forensics, but that exemption is
+// itself capped at MaxRetainedFailedSandboxes: the oldest failures beyond the
+// cap are reclaimed the same way, keeping only the newest (most likely to
+// still be worth inspecting).
 //
-// canceled and reclaimed count tasks whose STATE was transitioned by this
-// sweep, not tasks whose disk footprint was verifiably removed: the state
-// mutation is committed under the tasks-file lock first, and the actual
-// tmux/git/filesystem teardown happens afterwards and best-effort, matching
-// the pre-existing sm.Stop handling below. A removal failure is logged and
-// swallowed rather than retried or surfaced as a sweep error — the next sweep
-// pass will simply try the same (by-then-already-cleared) path again, which
-// is harmless. This mirrors sm.Stop's existing "_ = sm.Stop(...)" contract:
-// the counts reflect bookkeeping intent, and disk state is reconciled
-// best-effort rather than transactionally.
+// Reclamation is retry-safe: a task's Worktree/Session are only cleared AFTER
+// its worktree and sandbox root have actually been removed from disk, never
+// before. This runs in two passes over the tasks-file lock, with the slow
+// tmux/git/filesystem work happening in between, outside the lock (WithTasks'
+// mutex is non-reentrant, so nesting a second WithTasks call inside the first
+// would deadlock):
+//
+//  1. Identify candidates (state transitions for hard-timeout cancels are
+//     applied and persisted here, but no Worktree/Session field is cleared
+//     yet for anything this pass wants to reclaim).
+//  2. Outside the lock: stop sessions, then attempt each candidate's
+//     removal. A failure is logged and left for a later sweep to retry — the
+//     candidate's path stays out of the "succeeded" set below.
+//  3. Take the lock again and clear Worktree/Session only for the
+//     candidates whose removal actually succeeded in step 2, so a failed one
+//     remains discoverable (still referenced by its task row) instead of
+//     silently becoming an orphaned, untracked directory.
+//
+// canceled counts state transitions from step 1 (unaffected by removal
+// success, since no path information is lost by that transition alone).
+// reclaimed counts candidates whose disk removal succeeded in step 2,
+// independent of whether step 3's persist of that success also succeeds —
+// if it doesn't, the next sweep simply retries an already-removed path,
+// which os.RemoveAll and RemoveWorktree both tolerate.
 func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time.Time) (int, int, error) {
 	canceled, reclaimed := 0, 0
-	// Sessions to stop and workspaces to remove are collected under the lock
-	// but acted on after it is released: sm.Stop/RemoveWorkspace shell out to
-	// tmux and git, and os.RemoveAll touches the filesystem — nothing that
-	// touches a session, process, or disk may run while tasksMu is held (the
-	// same rule the executor's dispatch follows for the same reason).
+	// Sessions to stop are collected under the lock but stopped after it is
+	// released: sm.Stop shells out to tmux, and nothing that touches a
+	// session or process may run while tasksMu is held (the same rule the
+	// executor's dispatch follows for the same reason).
 	var toStop []string
-	var toRemove []removal
+	var candidates []reclaimCandidate
 
 	// A task only records its owning agent's name, not its ProjectDir, so
 	// resolve it here the same way SandboxExecutor.Start does. A load failure
@@ -144,6 +163,7 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 		return ""
 	}
 
+	// --- Step 1: transitions + candidate identification, under the lock. ---
 	err := WithTasks(root, func(tasks *TaskStore) error {
 		changed := false
 		for i := range tasks.Tasks {
@@ -191,19 +211,34 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 				if !ok {
 					log.Printf("a2a: sweep: task %s (session %s) has an unparseable CompletedAt %q; reclaiming its sandbox rather than pinning it forever", t.ContextID, t.Session, t.CompletedAt)
 				}
-				if t.Session == "" {
-					continue
+				if t.Session == "" && t.Worktree == "" {
+					continue // already fully reclaimed by an earlier sweep
 				}
-				toStop = append(toStop, t.Session)
-				if t.Worktree != "" {
-					toRemove = append(toRemove, removal{projectDirFor(t.Agent), t.Worktree, t.Session})
+				if t.Session != "" {
+					toStop = append(toStop, t.Session)
 				}
-				t.Session = ""  // mark reclaimed; branch is kept
-				t.Worktree = "" // the worktree is being removed below; nothing left to track
-				tasks.Tasks[i] = t
-				reclaimed++
-				changed = true
+				candidates = append(candidates, reclaimCandidate{t.ContextID, projectDirFor(t.Agent), t.Worktree, t.Session})
 			}
+		}
+
+		// Canceled tasks are not failed: the forensics exemption does not
+		// apply to them, so any task sitting in TaskCanceled that still holds
+		// a worktree or session is reclaim-eligible — including one just
+		// transitioned above this same pass (tasks.Tasks already reflects
+		// that mutation here), one canceled by an earlier sweep, and one
+		// whose earlier removal attempt failed and is being retried. Its
+		// session was already stopped at the moment it was canceled (either
+		// just above, or by a previous sweep pass), so this does not
+		// re-append to toStop.
+		for i := range tasks.Tasks {
+			t := tasks.Tasks[i]
+			if t.State != TaskCanceled {
+				continue
+			}
+			if t.Session == "" && t.Worktree == "" {
+				continue // already fully reclaimed
+			}
+			candidates = append(candidates, reclaimCandidate{t.ContextID, projectDirFor(t.Agent), t.Worktree, t.Session})
 		}
 
 		// Cap the forensics exemption: failed sandboxes are kept on purpose,
@@ -230,12 +265,7 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 				if t.Session != "" {
 					toStop = append(toStop, t.Session)
 				}
-				toRemove = append(toRemove, removal{projectDirFor(t.Agent), t.Worktree, t.Session})
-				t.Worktree = ""
-				t.Session = ""
-				tasks.Tasks[fc.idx] = t
-				reclaimed++
-				changed = true
+				candidates = append(candidates, reclaimCandidate{t.ContextID, projectDirFor(t.Agent), t.Worktree, t.Session})
 			}
 		}
 
@@ -245,24 +275,70 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 		return nil
 	})
 
+	// Don't destroy anything on a failed persist: if step 1's SaveTasks
+	// failed, tasks.json still shows the pre-sweep state, so tearing down
+	// sessions or disk now would desync reality from the file that is
+	// supposed to track it. errNothingSwept means step 1 made no mutation
+	// (state transitions only — the reclaim candidates above are never
+	// mutated yet, so they're unaffected either way) and is treated as
+	// success.
+	if err != nil && !errors.Is(err, errNothingSwept) {
+		return canceled, 0, err
+	}
+
+	// --- Step 2: outside the lock, stop sessions and attempt removal. ---
 	for _, session := range toStop {
 		_ = sm.Stop(ctx, session)
 	}
-	for _, r := range toRemove {
-		if r.worktree != "" {
-			if rmErr := sm.RemoveWorkspace(ctx, r.projectDir, r.worktree); rmErr != nil {
-				log.Printf("a2a: sweep: failed to remove worktree %s for session %s: %v", r.worktree, r.session, rmErr)
+	succeeded := make(map[string]bool, len(candidates))
+	for _, c := range candidates {
+		ok := true
+		if c.worktree != "" {
+			if rmErr := sm.RemoveWorkspace(ctx, c.projectDir, c.worktree); rmErr != nil {
+				log.Printf("a2a: sweep: failed to remove worktree %s for context %s (left in place, will retry next sweep): %v", c.worktree, c.contextID, rmErr)
+				ok = false
 			}
 		}
-		if r.session != "" {
-			if rmErr := os.RemoveAll(SandboxRoot(root, r.session)); rmErr != nil {
-				log.Printf("a2a: sweep: failed to remove sandbox root for session %s: %v", r.session, rmErr)
+		if c.session != "" {
+			if rmErr := os.RemoveAll(SandboxRoot(root, c.session)); rmErr != nil {
+				log.Printf("a2a: sweep: failed to remove sandbox root for context %s (left in place, will retry next sweep): %v", c.contextID, rmErr)
+				ok = false
 			}
+		}
+		if ok {
+			succeeded[c.contextID] = true
+		}
+	}
+	reclaimed = len(succeeded)
+
+	// --- Step 3: take the lock again, clear fields only for successes. ---
+	if len(succeeded) > 0 {
+		err2 := WithTasks(root, func(tasks *TaskStore) error {
+			changed := false
+			for i := range tasks.Tasks {
+				if !succeeded[tasks.Tasks[i].ContextID] {
+					continue
+				}
+				t := tasks.Tasks[i]
+				t.Worktree = ""
+				t.Session = ""
+				tasks.Tasks[i] = t
+				changed = true
+			}
+			if !changed {
+				return errNothingSwept
+			}
+			return nil
+		})
+		if err2 != nil && !errors.Is(err2, errNothingSwept) {
+			// The removals already happened on disk; only the bookkeeping
+			// that marks them cleared failed to persist. Log it — the next
+			// sweep will harmlessly retry an already-gone path — but don't
+			// let it override step 1's result, which is what actually
+			// happened to cancellation/reclaim eligibility this pass.
+			log.Printf("a2a: sweep: failed to persist reclaimed sandboxes: %v", err2)
 		}
 	}
 
-	if errors.Is(err, errNothingSwept) {
-		return canceled, reclaimed, nil
-	}
-	return canceled, reclaimed, err
+	return canceled, reclaimed, nil
 }
