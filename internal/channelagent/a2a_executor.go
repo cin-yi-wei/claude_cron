@@ -151,7 +151,10 @@ func (e *SandboxExecutor) Start(ctx context.Context, task A2ATask, prompt string
 	msg := SourceMessage{
 		Platform:  "a2a",
 		ChannelID: task.ContextID,
-		MessageID: task.Session + "-" + task.ContextID,
+		// Unique per message, not per context: IngestMessages dedups on
+		// platform:channel:messageID, so a constant ID would silently drop
+		// every follow-up in the same contextId.
+		MessageID: fmt.Sprintf("%s-%d", task.Session, time.Now().UnixNano()),
 		AuthorID:  task.CallerID,
 		CreatedAt: time.Now().UTC().Format(time.RFC3339),
 		Content:   prompt,

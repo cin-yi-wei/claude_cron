@@ -2,6 +2,7 @@ package channelagent
 
 import (
 	"context"
+	"os"
 	"strings"
 	"testing"
 )
@@ -306,5 +307,57 @@ func TestSandboxExecutorTearsDownSessionWhenTaskCanceledDuringStart(t *testing.T
 	}
 	if got.State != TaskCanceled || got.Detail != "canceled mid-start" {
 		t.Fatalf("canceled row must be left exactly as it was, got %#v", got)
+	}
+}
+
+// realInjectSessionManager fakes every side effect except Inject: workspace
+// creation and session start/stop never touch git or tmux (inherited from
+// FakeSessionManager), but Inject calls the real IngestMessages. That is the
+// only way to prove a follow-up message was genuinely queued — asserting on
+// FakeSessionManager.Injected (a recorded call) cannot distinguish "queued"
+// from "silently deduped", because IngestMessages returning created=0 with no
+// error is exactly the bug this test guards against.
+type realInjectSessionManager struct {
+	*FakeSessionManager
+}
+
+func (r *realInjectSessionManager) Inject(ctx context.Context, root string, msg SourceMessage) error {
+	_, err := IngestMessages(ctx, root, []SourceMessage{msg})
+	return err
+}
+
+// TestSandboxExecutorSecondMessageInSameContextIsDelivered pins the task-5
+// fix: a follow-up Start() call in the same contextId (as happens when a
+// caller replies within the sandbox's post-completion retention window) must
+// actually reach the sandbox's inbox, not be silently dropped by
+// IngestMessages' platform:channel:messageID dedup. Asserting on the real
+// on-disk inbox (not a mock's call count) is the only assertion that can
+// catch a call that "succeeds" while doing nothing.
+func TestSandboxExecutorSecondMessageInSameContextIsDelivered(t *testing.T) {
+	root := t.TempDir()
+	agents := AgentStore{}
+	_ = agents.Add(Agent{Name: "codereview", ProjectDir: "/p/x", Enabled: true})
+	if err := SaveAgents(root, agents); err != nil {
+		t.Fatalf("SaveAgents: %v", err)
+	}
+	sm := &realInjectSessionManager{FakeSessionManager: &FakeSessionManager{}}
+	ex := NewSandboxExecutor(root, sm)
+
+	task := A2ATask{ContextID: "c1", Agent: "codereview", Session: SessionNameFor("codereview", "c1"), State: TaskSubmitted}
+
+	if err := ex.Start(context.Background(), task, "first"); err != nil {
+		t.Fatalf("first Start: %v", err)
+	}
+	if err := ex.Start(context.Background(), task, "second"); err != nil {
+		t.Fatalf("second Start: %v", err)
+	}
+
+	dir := pathIn(SandboxRoot(root, task.Session), "inbox", "pending")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read inbox: %v", err)
+	}
+	if len(entries) < 2 {
+		t.Fatalf("inbox has %d job(s); the second message was deduped away", len(entries))
 	}
 }
