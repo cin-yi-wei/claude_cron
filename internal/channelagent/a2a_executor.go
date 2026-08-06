@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 )
 
@@ -36,6 +37,28 @@ func SandboxWorktree(projectDir, session string) string {
 
 // BranchFor namespaces sandbox branches so they are obvious in git output.
 func BranchFor(session string) string { return "aa/" + session }
+
+// injectSeq is a process-wide monotonic counter mixed into every injected
+// message's id. Two Start calls for the same contextId are NOT guaranteed to
+// be sequential: the same caller may send a follow-up while the prior task
+// is still TaskWorking (its HTTP request runs in its own goroutine alongside
+// the in-flight Start), and task 11's DrainQueue can also Start the same
+// task from a different goroutine. A timestamp alone only makes a collision
+// unlikely; atomically incrementing this counter makes it structurally
+// impossible regardless of clock resolution or goroutine interleaving.
+var injectSeq uint64
+
+// nextInjectedMessageID builds the MessageID for a message injected into
+// session's sandbox. It must differ across every call, including concurrent
+// ones for the same session: IngestMessages dedups on
+// platform:channel:messageID (watcher.go), so a repeated id silently drops
+// the message instead of queuing it. The timestamp keeps ids ordered and
+// readable for debugging; the atomic counter is what actually guarantees
+// uniqueness.
+func nextInjectedMessageID(session string) string {
+	seq := atomic.AddUint64(&injectSeq, 1)
+	return fmt.Sprintf("%s-%d-%d", session, time.Now().UnixNano(), seq)
+}
 
 // isTerminal reports whether a TaskState is one CanTransition treats as
 // final: nothing may transition out of it. Round 2 of the task-8 review
@@ -154,7 +177,7 @@ func (e *SandboxExecutor) Start(ctx context.Context, task A2ATask, prompt string
 		// Unique per message, not per context: IngestMessages dedups on
 		// platform:channel:messageID, so a constant ID would silently drop
 		// every follow-up in the same contextId.
-		MessageID: fmt.Sprintf("%s-%d", task.Session, time.Now().UnixNano()),
+		MessageID: nextInjectedMessageID(task.Session),
 		AuthorID:  task.CallerID,
 		CreatedAt: time.Now().UTC().Format(time.RFC3339),
 		Content:   prompt,

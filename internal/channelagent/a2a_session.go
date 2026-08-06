@@ -3,6 +3,7 @@ package channelagent
 import (
 	"context"
 	"errors"
+	"fmt"
 )
 
 // SessionManager isolates every side effect that touches git or tmux, so tests
@@ -31,8 +32,21 @@ func (TmuxSessionManager) Stop(ctx context.Context, session string) error {
 }
 
 func (TmuxSessionManager) Inject(ctx context.Context, root string, msg SourceMessage) error {
-	_, err := IngestMessages(ctx, root, []SourceMessage{msg})
-	return err
+	created, err := IngestMessages(ctx, root, []SourceMessage{msg})
+	if err != nil {
+		return err
+	}
+	if created == 0 {
+		// IngestMessages dedups on platform:channel:messageID and reports a
+		// duplicate by returning created=0 with a nil error: nothing landed
+		// in the inbox, but the call otherwise looks like it succeeded.
+		// Silently returning nil here is exactly how a caller
+		// (SandboxExecutor.Start) came to believe a message was queued when
+		// it had actually been dropped. Treat it as an error so the
+		// caller's failure handling fires instead of lying about success.
+		return fmt.Errorf("inject: message %s:%s:%s was deduped, nothing queued", msg.Platform, msg.ChannelID, msg.MessageID)
+	}
+	return nil
 }
 
 // FakeSessionManager records calls for assertions. FailOn makes one method

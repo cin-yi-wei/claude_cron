@@ -43,3 +43,25 @@ func TestFakeSessionManagerCanFail(t *testing.T) {
 		t.Fatal("expected Start to fail when FailOn=start")
 	}
 }
+
+// TestTmuxSessionManagerInjectErrorsWhenDeduped pins the fix for the other
+// half of the task-5 bug: IngestMessages reports a deduped message by
+// returning created=0 with a nil error, so a caller that only checks the
+// error (as SandboxExecutor.Start originally did) believes the message was
+// queued when it was actually dropped. Inject must surface that as an error.
+// This only exercises Inject's own disk I/O (via IngestMessages) — it never
+// touches tmux or spawns a claude process.
+func TestTmuxSessionManagerInjectErrorsWhenDeduped(t *testing.T) {
+	root := t.TempDir()
+	sm := TmuxSessionManager{}
+	msg := SourceMessage{Platform: "a2a", ChannelID: "c1", MessageID: "same-id", Content: "x", CreatedAt: "2026-08-06T00:00:00Z"}
+
+	if err := sm.Inject(context.Background(), root, msg); err != nil {
+		t.Fatalf("first Inject: %v", err)
+	}
+	// Same Platform/ChannelID/MessageID: IngestMessages' dedup key matches,
+	// so this second call genuinely queues nothing.
+	if err := sm.Inject(context.Background(), root, msg); err == nil {
+		t.Fatal("expected Inject to error when the message was deduped (created=0), got nil")
+	}
+}

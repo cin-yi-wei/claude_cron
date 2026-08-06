@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -359,5 +360,35 @@ func TestSandboxExecutorSecondMessageInSameContextIsDelivered(t *testing.T) {
 	}
 	if len(entries) < 2 {
 		t.Fatalf("inbox has %d job(s); the second message was deduped away", len(entries))
+	}
+}
+
+// TestNextInjectedMessageIDIsAlwaysDistinct exercises the id generator
+// directly rather than through timing: two Start calls for the same
+// contextId are reachable concurrently (a same-caller follow-up sent while
+// the prior task is still TaskWorking runs in its own goroutine, and
+// task 11's DrainQueue can also Start the same task from another goroutine),
+// so a timestamp alone only makes a collision unlikely, not impossible. The
+// atomic counter folded into every id is what makes this actually
+// structural: run it concurrently and require every id to be unique.
+func TestNextInjectedMessageIDIsAlwaysDistinct(t *testing.T) {
+	const n = 200
+	ids := make([]string, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ids[i] = nextInjectedMessageID("aa-x-c1")
+		}(i)
+	}
+	wg.Wait()
+
+	seen := make(map[string]bool, n)
+	for _, id := range ids {
+		if seen[id] {
+			t.Fatalf("duplicate id generated: %q", id)
+		}
+		seen[id] = true
 	}
 }
