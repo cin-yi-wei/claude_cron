@@ -23,10 +23,13 @@ import "sync"
 // 釘住的行為 —— 追問不等整個派送做完就必須送達)。如果兩者搶同一把單純
 // mutex,追問會被迫等到整個派送結束才能送,舊有的、必須維持綠燈的測試就會
 // 死鎖。所以「使用」用共享鎖(RLock):Start 與 DeliverFollowUp 可以並存;
-// sweep 第 2 步的拆除動作用互斥鎖(Lock):它必須等所有正在使用這個 session
-// 的呼叫都放手才能動手,而且一旦它拿到鎖,任何新的使用者都要等它做完
-// (做完之後,一個晚到的 DeliverFollowUp 會在鎖內重新確認 row 還活著,看到
-// row 已經被 sweep 清空就直接拒絕投遞 —— 不會把剛刪掉的目錄重建回來)。
+// sweep 第 2 步的拆除動作用互斥鎖，但用 TryLock（非阻塞）而不是 Lock：它
+// 只在這個瞬間沒有任何人在使用時才動手，拿不到就放棄這個 candidate、留給
+// 下一次 sweep（sweep 絕不能在一個活著的建置上等待——見
+// tryLockSandboxSessionForTeardown 的說明）。拿到鎖之後任何新的使用者都要
+// 等它做完（做完之後，一個晚到的 DeliverFollowUp 會在鎖內重新確認 row 還
+// 活著，看到 row 已經被 sweep 清空就直接拒絕投遞 —— 不會把剛刪掉的目錄重
+// 建回來）。
 //
 // 鎖序（違反即死鎖）：lockSandboxSession 系列 → tasksMu。
 // SandboxExecutor.Start、SandboxExecutor.DeliverFollowUp 與 sweep 第 2 步都
@@ -72,7 +75,7 @@ func releaseSessionLock(session string, l *sessionLock) {
 // lockSandboxSession 取得 session 名的共享鎖（RLock），供「使用」這個
 // session 的呼叫方使用（建立中的 SandboxExecutor.Start、投遞追問的
 // SandboxExecutor.DeliverFollowUp）。多個使用者可以同時持有；只有
-// lockSandboxSessionForTeardown 的互斥鎖會被它們擋住，彼此之間不會。
+// tryLockSandboxSessionForTeardown 的互斥鎖會被它們擋住，彼此之間不會。
 func lockSandboxSession(session string) func() {
 	l := acquireSessionLock(session)
 	l.mu.RLock()
@@ -82,15 +85,26 @@ func lockSandboxSession(session string) func() {
 	}
 }
 
-// lockSandboxSessionForTeardown 取得 session 名的互斥鎖（Lock），只供 sweep
-// 第 2 步的拆除動作使用：必須等所有正在使用這個 session 的
-// Start/DeliverFollowUp 呼叫都釋放共享鎖之後才能拿到，且拿到之後任何新的
-// 使用者都要等它做完，才能繼續（那時它們會在鎖內重新確認 row 是否還活著）。
-func lockSandboxSessionForTeardown(session string) func() {
+// tryLockSandboxSessionForTeardown 嘗試取得 session 名的互斥鎖（Lock），只
+// 供 sweep 第 2 步的拆除動作使用：只有在這個瞬間沒有任何 Start/DeliverFollowUp
+// 正持有共享鎖時才會成功，成功後任何新的使用者都要等它做完才能繼續（那時它
+// 們會在鎖內重新確認 row 是否還活著）。
+//
+// 為什麼是 TryLock 而不是 Lock（阻塞版）：handleRPC 在請求的 goroutine 上呼叫
+// Executor.Start，它會持有共享鎖直到整個建立完成——最長 90 秒，git worktree
+// add 或 tmux 卡住時無上限。sweep 的 Lock() 不吃 ctx、也沒有逾時，若用阻塞
+// 版，一個卡住的 HTTP 派送就能把 sweep 卡死，連帶卡死 DrainQueue、
+// EnsureSandboxDrivers 與 serve 關機時的 driver.StopAll()。sweep 因此絕不
+// 能在一個活著的建置上等待：拿不到就直接放棄這個 candidate，跟身分重確認失
+// 敗時完全一樣的處理——留給下一次 sweep 重試，而不是拆掉它。
+func tryLockSandboxSessionForTeardown(session string) (unlock func(), ok bool) {
 	l := acquireSessionLock(session)
-	l.mu.Lock()
+	if !l.mu.TryLock() {
+		releaseSessionLock(session, l)
+		return nil, false
+	}
 	return func() {
 		l.mu.Unlock()
 		releaseSessionLock(session, l)
-	}
+	}, true
 }

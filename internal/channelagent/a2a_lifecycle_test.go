@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -704,38 +705,223 @@ func TestSweepPreservesPriorDetailOnStaleDispatch(t *testing.T) {
 }
 
 // 規格第五節測試 3：既有的 TestSweepSkipsRowChangedDuringTeardown 只驗第 3 步
-// 的帳面守衛。這一條驗第 2 步 —— 拆除的動作本身不得碰到新身分。
+// 的帳面守衛（清欄位前的比對）。這一條驗第 2 步本身 —— 拆除的破壞性動作
+// （停 driver、停 tmux session、刪 worktree、刪 sandbox root）一項都不能碰
+// 到新身分,不只是「事後帳本沒被清空」。
+//
+// review round 2, important 3：原本這裡用 FakeSessionManager.OnRemove 在
+// RemoveWorkspace 裡面才模擬重新提交,但那已經是 tryLockSandboxSessionForTeardown
+// 成功、candidateStillMatches 也通過之後的事了 —— 測到的其實是第 3 步既有
+// 的帳面比對,不是這個任務新加的鎖／重確認。把 candidateStillMatches 與鎖整
+// 段刪掉,這個舊寫法照樣會過(os.RemoveAll 對不存在的路徑回 nil,斷言只讀
+// row)。
+//
+// 改成把「持有共享鎖」這個真正的把柄移到 sweep 開始「之前」：直接呼叫
+// lockSandboxSession（session 鎖同一顆物件、同一個 RWMutex）模擬一個正在
+// 建立中的 Start（或正在投遞的 DeliverFollowUp）持有它，並在持有期間把 row
+// 換成新身分（等同真正 Start 的 persist() 會做的事）。這是真正的鎖競爭
+// （tryLockSandboxSessionForTeardown 底下呼叫的是同一個 RWMutex 的
+// TryLock），不是計時賭注：只要共享鎖還被握著，TryLock 不管排程如何都會失
+// 敗。斷言也從「row 沒被清空」升級成「stop 與 remove 兩類破壞性動作全部沒
+// 發生、sandbox root 目錄真的還在磁碟上」。
 func TestSweepDoesNotDestroyAResubmittedIdentity(t *testing.T) {
 	root := t.TempDir()
 	now := time.Now().UTC()
+	const session = "aa-a-c1"
 	var s TaskStore
 	s.Upsert(A2ATask{
-		ContextID: "c1", TaskID: "t-old", Agent: "a", Session: "aa-a-c1",
+		ContextID: "c1", TaskID: "t-old", Agent: "a", Session: session,
 		Worktree: "/p/aa-a-c1", State: TaskCompleted,
 		CompletedAt: now.Add(-time.Hour).Format(time.RFC3339),
 	})
-	_ = SaveTasks(root, s)
+	if err := SaveTasks(root, s); err != nil {
+		t.Fatalf("SaveTasks: %v", err)
+	}
+	// 沙盒真的存在過，好讓「還在磁碟上」的斷言有意義。
+	if err := Init(SandboxRoot(root, session)); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	// 在 sweep 開始之前就把共享鎖握住並換成新身分 —— 這正是 D3(a) 要擋的窗口
+	// 本身，不是它的事後結果。
+	unlock := lockSandboxSession(session)
+	if err := WithTasks(root, func(tasks *TaskStore) error {
+		tasks.Upsert(A2ATask{
+			ContextID: "c1", TaskID: "t-new", Agent: "a", Session: session,
+			Worktree: "/p/aa-a-c1", State: TaskDispatching, Level: GrantDevelop,
+			StartedAt: now.Format(time.RFC3339), DispatchedAt: now.Format(time.RFC3339),
+		})
+		return nil
+	}); err != nil {
+		unlock()
+		t.Fatalf("WithTasks (simulate resubmission): %v", err)
+	}
 
 	fake := &FakeSessionManager{}
-	// 在拆除窗口正中間模擬同 contextId 的合法重新提交。
-	fake.OnRemove = func() {
-		_ = WithTasks(root, func(tasks *TaskStore) error {
-			tasks.Upsert(A2ATask{
-				ContextID: "c1", TaskID: "t-new", Agent: "a", Session: "aa-a-c1",
-				Worktree: "/p/aa-a-c1", State: TaskDispatching, Level: GrantDevelop,
-				StartedAt: now.Format(time.RFC3339), DispatchedAt: now.Format(time.RFC3339),
-			})
-			return nil
-		})
-	}
-	if _, _, err := SweepTimeouts(context.Background(), root, fake, now, nil); err != nil {
+	stopper := &recordingStopper{}
+	_, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now, stopper)
+	unlock()
+	if err != nil {
 		t.Fatalf("SweepTimeouts: %v", err)
+	}
+	if reclaimed != 0 {
+		t.Fatalf("reclaimed = %d, want 0 (the session is in use, sweep must not have touched it at all)", reclaimed)
+	}
+	if len(fake.Stopped) != 0 {
+		t.Fatalf("sweep stopped a tmux session that is currently in use: %#v", fake.Stopped)
+	}
+	if len(fake.Removed) != 0 {
+		t.Fatalf("sweep removed a worktree that is currently in use: %#v", fake.Removed)
+	}
+	if len(stopper.stopped) != 0 {
+		t.Fatalf("sweep stopped a driver whose session is currently in use: %#v", stopper.stopped)
+	}
+	if _, err := os.Stat(SandboxRoot(root, session)); err != nil {
+		t.Fatalf("sandbox root must survive on disk while the session is in use: %v", err)
 	}
 
 	got, _ := LoadTasks(root)
 	tk, _ := got.ByContext("c1")
 	if tk.TaskID != "t-new" || tk.Session == "" || tk.Worktree == "" {
 		t.Fatalf("the resubmitted identity was corrupted: %#v", tk)
+	}
+}
+
+// TestSweepDoesNotStopADispatchStalledSessionCurrentlyInUse pins the same
+// review round 2 critical finding for the OTHER code path that stops a
+// session without ever building a reclaimCandidate: a row stuck in
+// TaskDispatching past DispatchStaleAfter (dispatch-stalled crash recovery,
+// a2a_lifecycle.go's stopOnly). Before this fix it appended straight to
+// toStop with no identity snapshot at all, so nothing guarded it against
+// the same resubmission race reclaimCandidate is guarded against.
+//
+// This is deliberately a one-shot guard, not a retry-forever one: unlike a
+// reclaimCandidate (re-derived fresh from the row's still-live
+// Worktree/Session on every sweep pass), a dispatch-stalled row is only
+// ever considered for a session-stop at the exact instant it transitions to
+// TaskFailed — scanning EVERY TaskFailed row on every later pass to retry a
+// missed stop was tried and reverted, because it cannot distinguish "this
+// TaskFailed row's session is a genuine leftover from OUR crashed dispatch"
+// from "this TaskFailed row is being deliberately kept untouched for
+// forensics" (see TestSweepLeavesFailedSandboxForensics — a live Session on
+// a forensically-retained failure must never be stopped, ever, by design).
+// The narrow race this guards against — the session is busy at the exact
+// instant sweep tries to stop it — resolves itself without a retry anyway:
+// "busy" only means some legitimate Start/DeliverFollowUp is using it right
+// then, and that call's own completion changes this row's identity out from
+// under the stale snapshot sweep would otherwise retry against.
+//
+// Uses the same real-lock-contention technique as
+// TestSweepDoesNotDestroyAResubmittedIdentity: holding the session's shared
+// lock IS the deterministic proof that tryLockSandboxSessionForTeardown
+// cannot succeed, not a timing gamble.
+func TestSweepDoesNotStopADispatchStalledSessionCurrentlyInUse(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	const session = "aa-a-c1"
+	var s TaskStore
+	s.Upsert(A2ATask{
+		ContextID: "c1", TaskID: "t1", Agent: "a", Session: session, State: TaskDispatching,
+		StartedAt:    now.Add(-1 * time.Minute).Format(time.RFC3339),
+		DispatchedAt: now.Add(-DispatchStaleAfter - time.Minute).Format(time.RFC3339),
+	})
+	if err := SaveTasks(root, s); err != nil {
+		t.Fatalf("SaveTasks: %v", err)
+	}
+
+	unlock := lockSandboxSession(session)
+	fake := &FakeSessionManager{}
+	if _, _, err := SweepTimeouts(context.Background(), root, fake, now, nil); err != nil {
+		unlock()
+		t.Fatalf("SweepTimeouts: %v", err)
+	}
+	unlock()
+
+	// 狀態轉換是第 1 步在 tasksMu 底下做的純帳面動作，跟 session 鎖無關，一
+	// 樣會發生 —— 只有真正的破壞性動作（停 session）被擋下來。
+	got, _ := LoadTasks(root)
+	tk, _ := got.ByContext("c1")
+	if tk.State != TaskFailed {
+		t.Fatalf("state = %s, want failed (bookkeeping must proceed regardless of the session lock)", tk.State)
+	}
+	if len(fake.Stopped) != 0 {
+		t.Fatalf("sweep stopped a session that was in use at the time: %#v", fake.Stopped)
+	}
+}
+
+// TestSweepNeverBlocksOnALiveBuild pins review round 2, important finding 2:
+// handleRPC calls Executor.Start on the request goroutine, which holds the
+// session's shared lock for the WHOLE build — up to ~90s in production,
+// unbounded if git worktree add or tmux wedges. Sweep's exclusive
+// acquisition (tryLockSandboxSessionForTeardown) must never wait for that
+// to finish, or one wedged HTTP-dispatched Start blocks the sweep cycle and,
+// with it, DrainQueue, EnsureSandboxDrivers and shutdown's driver.StopAll()
+// — indefinitely.
+//
+// This is a genuine concurrency proof, not a timing gamble: a REAL Start()
+// call runs on a REAL goroutine and is deterministically parked mid-build
+// via FakeSessionManager's EnsureWorkspaceHold/Entered (the same idiom
+// a2a_server_test.go's TestHandlerAndDrainQueueNeverDoubleDispatch and
+// TestFollowUpDuringInFlightDrainQueueDispatchDoesNotDoubleDispatch already
+// use for exactly this reason) — <-entered only unblocks once Start is
+// genuinely inside EnsureWorkspace, still holding the shared lock. Sweep
+// then runs concurrently against a candidate whose session is that exact
+// same name and must return well within the timeout regardless — if
+// tryLockSandboxSessionForTeardown ever regressed to a blocking Lock(),
+// this test would hang until Go's test timeout, not merely run slow.
+func TestSweepNeverBlocksOnALiveBuild(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	agents := AgentStore{}
+	_ = agents.Add(Agent{Name: "a", ProjectDir: "/p/x", Enabled: true})
+	if err := SaveAgents(root, agents); err != nil {
+		t.Fatalf("SaveAgents: %v", err)
+	}
+	const session = "aa-a-c1"
+
+	// c1 是這一輪 sweep 想回收的候選，session 名跟下面正在建立中的那個撞名
+	// （合法追問落在確定性路徑上的同一個道理：session 名只是 agent+contextId
+	// 的函式，這裡直接指定同名即可，不需要真的透過 SessionNameFor 產生撞
+	// 名，測的是鎖本身，不是命名規則）。
+	var s TaskStore
+	s.Upsert(A2ATask{
+		ContextID: "c1", TaskID: "t-old", Agent: "a", Session: session,
+		Worktree: "/p/aa-a-c1", State: TaskCompleted,
+		CompletedAt: now.Add(-time.Hour).Format(time.RFC3339),
+	})
+	if err := SaveTasks(root, s); err != nil {
+		t.Fatalf("SaveTasks: %v", err)
+	}
+
+	hold := make(chan struct{})
+	entered := make(chan struct{})
+	fake := &FakeSessionManager{EnsureWorkspaceHold: hold, EnsureWorkspaceEntered: entered}
+	ex := NewSandboxExecutor(root, fake)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		task := A2ATask{ContextID: "c2", Agent: "a", Session: session, State: TaskSubmitted, Level: GrantReadOnly}
+		_ = ex.Start(context.Background(), task, "go")
+	}()
+	<-entered // Start 現在真的卡在 EnsureWorkspace 裡，共享鎖確定被握著。
+	defer func() {
+		close(hold) // 放開它，讓它跑完，不留下測試結束後還在跑的 goroutine。
+		wg.Wait()
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		_, _, _ = SweepTimeouts(context.Background(), root, &FakeSessionManager{}, now, nil)
+		close(done)
+	}()
+	select {
+	case <-done:
+		// 通過：sweep 沒有卡住，即使有一個活著的建置正握著同名 session 的
+		// 共享鎖。
+	case <-time.After(2 * time.Second):
+		t.Fatal("SweepTimeouts blocked on a live build instead of using a non-blocking exclusive acquisition")
 	}
 }
 
