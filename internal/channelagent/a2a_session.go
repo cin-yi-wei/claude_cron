@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os/exec"
 	"path/filepath"
 	"sync"
 )
@@ -60,15 +61,36 @@ func (TmuxSessionManager) Alive(ctx context.Context, session string) (bool, erro
 	return TmuxSessionAlive(ctx, session)
 }
 
-// TmuxSessionAlive 用 `tmux has-session -t` 判斷。非零離開碼一律解讀為
-// 「不存在」：tmux 不區分「沒有這個 session」與「tmux server 沒起來」，而後
-// 者對一個應該有 session 在跑的沙盒來說結論相同 —— 它沒在跑。sweep 的
-// LivenessGrace 就是為了不讓一次瞬間的誤判殺掉剛起來的任務。
+// TmuxSessionAlive 用 `tmux has-session -t` 判斷，但只有「tmux 真的跑起來、
+// 回報了明確的離開碼」才解讀成「不存在」——這種情況下不管是「沒有這個
+// session」還是「tmux server 沒起來」，對一個應該有 session 在跑的沙盒來說
+// 結論相同：它沒在跑。任何讓我們「根本沒問到答案」的失敗都必須回傳非 nil
+// 的 error，不可以跟上面那種「問到了、答案是沒有」混在一起——這兩者對呼叫
+// 方的意義完全相反：前者是「先當它還活著，之後再查」，後者才是「真的死
+// 了，可以動手」。round 9 review 抓到的 Critical：fork EAGAIN（這台機器有
+// OOM 史）、tmux 執行檔暫時找不到、以及 sweep 傳入的 ctx 在 serve 關機時被
+// 取消，這三種「問不到」的情況，先前全部被這個函式吞成 (false, nil)，跟
+// 「真的沒有這個 session」無法區分——sweep 的「這次判不出來就先當它還活
+// 著」guard 因此在正式環境裡永遠打不到。
 func TmuxSessionAlive(ctx context.Context, session string) (bool, error) {
-	if err := runExternalCommand(ctx, "tmux", "has-session", "-t", session); err != nil {
+	err := runExternalCommand(ctx, "tmux", "has-session", "-t", session)
+	if err == nil {
+		return true, nil
+	}
+	// ctx 被取消/逾時：這不是 tmux 回報的答案，是我們自己沒等到——最典型
+	// 的例子是 serve 關機時 sweep 用的 supCtx 被取消，這時每一個還在跑的
+	// row 都不該被判定死亡。優先於下面的離開碼判斷，因為 context 取消時
+	// cmd.Run() 回的錯誤型別不保證是 *exec.ExitError。
+	if ctx.Err() != nil {
+		return false, ctx.Err()
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
 		return false, nil
 	}
-	return true, nil
+	// 執行本身失敗（fork EAGAIN、tmux 執行檔找不到……）：同樣是「問不到」，
+	// 不是「問到了，沒有」。把錯誤原樣往上傳。
+	return false, err
 }
 
 func (TmuxSessionManager) RemoveWorkspace(ctx context.Context, projectDir, worktree string) error {

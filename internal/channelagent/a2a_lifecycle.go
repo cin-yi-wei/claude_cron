@@ -144,7 +144,7 @@ func failDrainedTask(root string, t A2ATask, reason string) {
 			return errNothingToDrain
 		}
 		cur.State = TaskFailed
-		cur.Detail = reason
+		cur.Detail = appendDetail(cur.Detail, reason)
 		cur.CompletedAt = time.Now().UTC().Format(time.RFC3339)
 		tasks.Upsert(cur)
 		return nil
@@ -177,10 +177,42 @@ const (
 // ones worth inspecting.
 const MaxRetainedFailedSandboxes = 20
 
-// LivenessGrace 是一列進入 working / dispatching 之後，多久才開始檢查它的
-// tmux session 還在不在。剛起來的 session 有 tmux server 尚未就緒的窗口，
-// 沒有寬限期會把健康的任務誤殺。
+// LivenessGrace 是一列進入 dispatching 之後，多久才開始檢查它的 tmux
+// session 還在不在。DispatchedAt 起算——剛起來的 session 有 tmux server 尚
+// 未就緒的窗口（EnsureWorkspace + Sessions.Start 最長 90 秒），沒有寬限期
+// 會把還在合法開機視窗內的健康派送誤殺。working 的 row 不套用這個寬限期：
+// SandboxExecutor.Start 只在 Sessions.Start 真的成功（tmux session 已經存
+// 在）之後才會把 row 寫成 TaskWorking，所以 working 這個狀態本身就是「
+// session 已經存在」的證明，用 StartedAt（提交/排隊時刻，跟這個 session
+// 何時真正起來完全無關——round 9 review, Minor 2）算寬限期反而會誤判：一個
+// 排隊 30 分鐘才被撿走、剛開機 1 秒的健康 session，StartedAt 早就過了
+// LivenessGrace，會被誤判成「已經過了寬限期、該檢查了」而立刻檢查——這裡
+// 剛好是安全的（因為根本不需要保護），但語意是錯的，所以刻意不比照
+// dispatching 套用 StartedAt。
 const LivenessGrace = 2 * time.Minute
+
+// VanishedConfirmStrikes 是連續幾次「tmux 回報這個 session 真的不存在」才
+// 真正判定 vanished、轉 TaskFailed。單一次取樣不夠：一次 fork EAGAIN（這台
+// 機器有 OOM 史）、tmux 執行檔暫時找不到、或 sweep 自己的 ctx 在 serve 關機
+// 時被取消，都可能讓某一輪的判定不可靠——round 9 review, Critical：這些情
+// 況現在都會讓 TmuxSessionAlive 回傳非 nil 的 error（見該函式），不會累計
+// 到這個計數上；只有「真的問到了、tmux 明確回報沒有這個 session」才會累
+// 計。要求連續 2 次才動手，用一次 sweep 週期（預設 10 秒）換掉單次快照判定
+// 帶來的誤殺風險。
+const VanishedConfirmStrikes = 2
+
+// appendDetail 把新的理由接在既有 Detail 後面（用「; 」分隔），不覆寫掉卡
+// 住之前就已經留在 Detail 裡的線索（常見的是 task 4 的 TrustFolder 失敗警
+// 告）。HardTimeout 取消與派送中崩潰兩條既有路徑都遵守這個慣例（見
+// TestSweepPreservesPriorDetailOnHardTimeout / …OnStaleDispatch，commit
+// b8c5ab0），存活偵測與撤銷偵測這兩條新路徑必須一致——否則卡住前的原因會
+// 在最後一步斷掉（round 9 review, Important）。
+func appendDetail(existing, reason string) string {
+	if existing == "" {
+		return reason
+	}
+	return existing + "; " + reason
+}
 
 func parseRFC3339(s string) (time.Time, bool) {
 	t, err := time.Parse(time.RFC3339, s)
@@ -573,6 +605,11 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 	}
 
 	// --- 存活偵測（I7）。挑清單在鎖內，tmux 呼叫在鎖外，落帳再回鎖內。 ---
+	//
+	// dispatching 用 DispatchedAt 套 LivenessGrace（還在合法開機視窗內就不
+	// 查）；working 立刻查——見 LivenessGrace 的說明，working 這個狀態本身
+	// 已經證明 session 存在過，不需要、也不該用 StartedAt（提交時刻）當寬
+	// 限期基準。
 	var liveCheck []A2ATask
 	_ = WithTasks(root, func(tasks *TaskStore) error {
 		for _, t := range tasks.Tasks {
@@ -582,40 +619,66 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 			if t.Session == "" {
 				continue
 			}
-			ref := t.StartedAt
-			if t.State == TaskDispatching && t.DispatchedAt != "" {
-				ref = t.DispatchedAt
-			}
-			if at, ok := parseRFC3339(ref); ok && now.Sub(at) < LivenessGrace {
-				continue
+			if t.State == TaskDispatching {
+				at, ok := parseRFC3339(t.DispatchedAt)
+				if !ok || now.Sub(at) < LivenessGrace {
+					continue
+				}
 			}
 			liveCheck = append(liveCheck, t)
 		}
 		return errNothingSwept // 只讀不寫
 	})
-	var vanished []A2ATask
+	// alive==false 才累計 strike；err!=nil（round 9 review, Critical：ctx
+	// 取消、fork EAGAIN、tmux 執行檔找不到……這些「問不到答案」的情況，
+	// TmuxSessionAlive 現在會誠實回傳非 nil 的 error）完全不碰計數——不遞
+	// 增也不清零，等下一輪用一次真正問到答案的取樣再說。alive==true 則清
+	// 零：這是「連續」次數，不是「累計」次數。
+	var toIncrement []A2ATask
+	var toReset []A2ATask
 	for _, t := range liveCheck {
 		alive, err := sm.Alive(ctx, t.Session)
 		if err != nil {
-			log.Printf("a2a: sweep: 檢查 %s 存活失敗，這一趟先當它還活著: %v", t.Session, err)
+			log.Printf("a2a: sweep: 檢查 %s 存活失敗，這一趟先當它還活著（不計入、不清零 strike）: %v", t.Session, err)
 			continue
 		}
-		if !alive {
-			vanished = append(vanished, t)
+		if alive {
+			if t.VanishedStrikes != 0 {
+				toReset = append(toReset, t)
+			}
+			continue
 		}
+		toIncrement = append(toIncrement, t)
 	}
-	if len(vanished) > 0 {
+	var vanished []A2ATask
+	if len(toIncrement) > 0 || len(toReset) > 0 {
 		_ = WithTasks(root, func(tasks *TaskStore) error {
 			changed := false
-			for _, v := range vanished {
+			for _, v := range toReset {
+				cur, ok := tasks.ByContext(v.ContextID)
+				if !ok || cur.TaskID != v.TaskID || cur.State != v.State || cur.Session != v.Session {
+					continue
+				}
+				if cur.VanishedStrikes != 0 {
+					cur.VanishedStrikes = 0
+					tasks.Upsert(cur)
+					changed = true
+				}
+			}
+			for _, v := range toIncrement {
 				cur, ok := tasks.ByContext(v.ContextID)
 				// 身分必須還是同一個，否則就是拆除窗口內的重新提交。
 				if !ok || cur.TaskID != v.TaskID || cur.State != v.State || cur.Session != v.Session {
 					continue
 				}
-				cur.State = TaskFailed
-				cur.Detail = "sandbox session vanished"
-				cur.CompletedAt = now.UTC().Format(time.RFC3339)
+				cur.VanishedStrikes++
+				if cur.VanishedStrikes >= VanishedConfirmStrikes {
+					cur.State = TaskFailed
+					cur.Detail = appendDetail(cur.Detail, "sandbox session vanished")
+					cur.CompletedAt = now.UTC().Format(time.RFC3339)
+					cur.VanishedStrikes = 0 // row 已經是終態，不必再留計數
+					vanished = append(vanished, cur)
+				}
 				tasks.Upsert(cur)
 				changed = true
 			}
@@ -624,6 +687,15 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 			}
 			return nil
 		})
+	}
+	// round 9 review, Critical：vanished 的 row 先前不會產生任何 stopTarget
+	// ——false positive（或真的死掉）會孤兒化一個活著的 tmux session/claude
+	// 行程，沒有任何 row 再指向它、沒有任何 sweep 再回頭看它，直到
+	// MaxRetainedFailedSandboxes 的上限把它連 worktree 一起刪掉。併入既有
+	// 的 stopOnly，跟撤銷偵測與派送中崩潰完全同一條落地方式——不多開一條拆
+	// 除路徑。
+	for _, v := range vanished {
+		stopOnly = append(stopOnly, stopTarget{taskID: v.TaskID, contextID: v.ContextID, session: v.Session, state: TaskFailed})
 	}
 
 	// --- 撤銷偵測，跑得到的一半（D6）。DrainQueue 的重驗證只碰得到還在佇列
@@ -656,8 +728,21 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 	if len(authCheck) > 0 {
 		callers, cerr := LoadCallers(root)
 		agents, aerr := LoadAgents(root)
+		// round 9 review, Critical：讀 callers.json / agents.json 失敗，對
+		// 「還沒起沙盒」的排隊工作該當拒絕（fail closed，DrainQueue 走的
+		// 路，drainRejectReason 對它維持原樣）；但對「已經在跑」的沙盒，套
+		// 用同一條規則等於把一次暫時性讀檔失敗（operator 手動編輯
+		// callers.json 途中，寫到一半的半份 JSON 是正常事件，report 裡已
+		// 經明說這是手動編輯）放大成「每一列都判定 caller 不存在 →
+		// 全部撤銷」——一次沒寫完的 vim 存檔就能把全部健康中的沙盒都拆
+		// 光。整段跳過，留給下一次 sweep 重試，絕不把讀檔失敗本身當成拒絕
+		// 理由套用到任何一列 working/dispatching row 上。
+		if cerr != nil || aerr != nil {
+			log.Printf("a2a: sweep: 撤銷偵測讀取 callers.json / agents.json 失敗，本輪整段跳過（下一趟重試，不動任何一列在跑的沙盒）: callers=%v agents=%v", cerr, aerr)
+			authCheck = nil
+		}
 		for _, t := range authCheck {
-			reason := drainRejectReason(callers, agents, cerr, aerr, t)
+			reason := drainRejectReason(callers, agents, nil, nil, t)
 			if reason == "" {
 				continue
 			}
@@ -692,7 +777,7 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 					return errNothingSwept
 				}
 				cur.State = TaskFailed
-				cur.Detail = reason
+				cur.Detail = appendDetail(cur.Detail, reason)
 				cur.CompletedAt = now.UTC().Format(time.RFC3339)
 				tasks.Upsert(cur)
 				changed = true

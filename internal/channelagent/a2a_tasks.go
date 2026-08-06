@@ -52,6 +52,13 @@ type A2ATask struct {
 	// Level 是這個任務的有效授權等級,dispatch 當下算出並寫進沙盒政策檔。
 	// 空值的 row 不可以起沙盒(SandboxExecutor.Start 會拒絕)。
 	Level GrantLevel `json:"level,omitempty"`
+	// VanishedStrikes 累計「這個 session 連續被判定不存在」的次數，只有
+	// SweepTimeouts 的存活偵測會動它。單一次 tmux 呼叫失敗（fork EAGAIN、
+	// 執行檔暫時找不到、serve 關機時 sweep 自己的 ctx 被取消）不足以宣告一
+	// 個健康任務死亡；連續累積到 VanishedConfirmStrikes 才真的判定 vanished
+	// 並轉 TaskFailed。任何一次判定結果是「活著」就清零——不是遞減，因為
+	// 這是「連續」而不是「累計」次數。
+	VanishedStrikes int `json:"vanished_strikes,omitempty"`
 }
 
 type TaskStore struct {

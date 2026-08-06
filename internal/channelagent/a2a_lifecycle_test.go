@@ -2,8 +2,10 @@ package channelagent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -1281,37 +1283,167 @@ func TestDrainQueueFailsRowsForDisabledAgents(t *testing.T) {
 	}
 }
 
-// task 8 (I7)：session 不存在但任務未完成 → 標 failed（不是 canceled），worktree 保留。
+// task 8 (I7), redesigned per round 9 review (Critical 1 + Minor 2):
+//
+//   - A session vanishing for good must NOT be decided off a single tmux
+//     sample — a lone fork EAGAIN, a transiently-missing tmux binary, or the
+//     sweep's own ctx being canceled mid-pass (e.g. a serve shutdown) must
+//     never, by themselves, fail a healthy running task. It takes
+//     VanishedConfirmStrikes (2) CONSECUTIVE dead samples across separate
+//     sweep passes.
+//   - The liveness grace is keyed off DispatchedAt for TaskDispatching (the
+//     row whose session might genuinely still be booting), never off
+//     StartedAt for TaskWorking — a TaskWorking row's session is already
+//     proven to exist the moment Start() writes that state, so there is
+//     nothing for a StartedAt-based grace to protect there, and using it
+//     (submit time, not boot time) would just be the wrong reference by
+//     construction (round 9 review, Minor 2).
+//   - A row that does get confirmed vanished must be routed through the
+//     existing stopOnly/stopSessionGuarded teardown path, so the driver and
+//     the tmux session are actually stopped — not merely left as an orphan
+//     that no future sweep pass revisits until the failed-retention cap
+//     eventually deletes its worktree out from under it (round 9 review,
+//     Critical 1, second half).
 func TestSweepFailsTasksWhoseSessionVanished(t *testing.T) {
 	root := t.TempDir()
 	now := time.Now().UTC()
 	var s TaskStore
 	s.Upsert(A2ATask{
+		// StartedAt 是「現在」——刻意證明 TaskWorking 完全不吃寬限期，立刻
+		// 就會被列入存活檢查清單（round 9 review, Minor 2）。
 		ContextID: "c1", TaskID: "t1", Agent: "a", Session: "aa-a-c1", Worktree: "/p/aa-a-c1",
-		State: TaskWorking, StartedAt: now.Add(-LivenessGrace - time.Minute).Format(time.RFC3339),
+		State: TaskWorking, StartedAt: now.Format(time.RFC3339),
 	})
 	s.Upsert(A2ATask{
+		// TaskDispatching + DispatchedAt=now：還在合法開機視窗內，不管 sweep
+		// 跑幾輪都不該被碰。
 		ContextID: "c2", TaskID: "t2", Agent: "a", Session: "aa-a-c2", Worktree: "/p/aa-a-c2",
-		State: TaskWorking, StartedAt: now.Format(time.RFC3339), // 還在寬限期內
+		State: TaskDispatching, DispatchedAt: now.Format(time.RFC3339),
 	})
 	_ = SaveTasks(root, s)
 
 	fake := &FakeSessionManager{AliveSessions: map[string]bool{"aa-a-c1": false, "aa-a-c2": false}}
+
+	// 第一輪：只是第一次取樣到「不在」，還不到 VanishedConfirmStrikes，row
+	// 必須維持原樣——這正是 Critical 1 要求的「單次取樣不足以動手」。
 	if _, _, err := SweepTimeouts(context.Background(), root, fake, now, nil); err != nil {
-		t.Fatalf("SweepTimeouts: %v", err)
+		t.Fatalf("SweepTimeouts (pass 1): %v", err)
 	}
 	got, _ := LoadTasks(root)
 	c1, _ := got.ByContext("c1")
+	if c1.State != TaskWorking || c1.VanishedStrikes != 1 {
+		t.Fatalf("c1 after pass 1 = state=%q strikes=%d, want still working with exactly 1 strike (a single sample must never fail a healthy task)", c1.State, c1.VanishedStrikes)
+	}
+	c2, _ := got.ByContext("c2")
+	if c2.State != TaskDispatching || c2.VanishedStrikes != 0 {
+		t.Fatalf("c2 after pass 1 = state=%q strikes=%d; a task inside the dispatch liveness grace must be left completely alone", c2.State, c2.VanishedStrikes)
+	}
+	if len(fake.Stopped) != 0 {
+		t.Fatalf("nothing should be stopped yet: %#v", fake.Stopped)
+	}
+
+	// 第二輪：連續第 2 次取樣到「不在」，達到門檻，這才是真的判定 vanished
+	// 的時刻。
+	if _, _, err := SweepTimeouts(context.Background(), root, fake, now, nil); err != nil {
+		t.Fatalf("SweepTimeouts (pass 2): %v", err)
+	}
+	got, _ = LoadTasks(root)
+	c1, _ = got.ByContext("c1")
 	if c1.State != TaskFailed || !strings.Contains(c1.Detail, "vanished") {
-		t.Fatalf("c1 = %q / %q, want failed", c1.State, c1.Detail)
+		t.Fatalf("c1 after pass 2 = %q / %q, want failed with a vanished detail", c1.State, c1.Detail)
 	}
 	// forensics：failed 的 worktree 保留。
 	if c1.Worktree == "" || len(fake.Removed) != 0 {
 		t.Fatalf("a vanished sandbox's worktree must be kept for forensics: worktree=%q removed=%#v", c1.Worktree, fake.Removed)
 	}
-	c2, _ := got.ByContext("c2")
-	if c2.State != TaskWorking {
-		t.Fatalf("c2 = %q; a task inside the liveness grace must be left alone", c2.State)
+	// 既有的單一拆除路徑必須真的跑到——不能只改 row 狀態就結束，留下一個
+	// 沒有任何 row 再指向的孤兒 tmux session（round 9 review, Critical 1）。
+	if len(fake.Stopped) != 1 || fake.Stopped[0] != "aa-a-c1" {
+		t.Fatalf("session not stopped: %#v — a confirmed-vanished row must still go through the existing teardown path", fake.Stopped)
+	}
+	c2, _ = got.ByContext("c2")
+	if c2.State != TaskDispatching {
+		t.Fatalf("c2 = %q; a task inside the dispatch liveness grace must still be left alone after a second pass", c2.State)
+	}
+}
+
+// round 9 review, Critical 1: TmuxSessionAlive must distinguish "tmux ran and
+// told us the session is definitely gone" from "we could not get an answer at
+// all" — a canceled/expired context, a missing tmux binary, or a transient
+// fork failure must never be collapsed into the same (false, nil) a genuine
+// "no such session" produces. Without this, the sweep's own "couldn't tell,
+// assume alive" guard is unreachable in production, and a serve shutdown
+// (which cancels the sweep's ctx mid-pass) would look identical to every
+// running sandbox's session having vanished.
+func TestTmuxSessionAliveDistinguishesGoneFromInconclusive(t *testing.T) {
+	oldRun := runExternalCommand
+	defer func() { runExternalCommand = oldRun }()
+
+	t.Run("clean exit means alive", func(t *testing.T) {
+		runExternalCommand = func(context.Context, string, ...string) error { return nil }
+		alive, err := TmuxSessionAlive(context.Background(), "aa-a-c1")
+		if err != nil || !alive {
+			t.Fatalf("alive=%v err=%v, want alive=true err=nil", alive, err)
+		}
+	})
+
+	t.Run("a real exit code means definitely gone", func(t *testing.T) {
+		runExternalCommand = func(context.Context, string, ...string) error {
+			return exec.Command("false").Run() // a genuine *exec.ExitError
+		}
+		alive, err := TmuxSessionAlive(context.Background(), "aa-a-c1")
+		if err != nil || alive {
+			t.Fatalf("alive=%v err=%v, want alive=false err=nil (tmux definitively answered 'no')", alive, err)
+		}
+	})
+
+	t.Run("a canceled context means inconclusive, not gone", func(t *testing.T) {
+		runExternalCommand = func(context.Context, string, ...string) error {
+			return errors.New("boom: fork EAGAIN or similar")
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		alive, err := TmuxSessionAlive(ctx, "aa-a-c1")
+		if err == nil {
+			t.Fatalf("alive=%v err=%v, want a non-nil error — a canceled context must never read as 'definitely gone'", alive, err)
+		}
+	})
+
+	t.Run("an exec failure other than a real exit code means inconclusive", func(t *testing.T) {
+		runExternalCommand = func(context.Context, string, ...string) error {
+			return errors.New("fork/exec tmux: resource temporarily unavailable")
+		}
+		alive, err := TmuxSessionAlive(context.Background(), "aa-a-c1")
+		if err == nil {
+			t.Fatalf("alive=%v err=%v, want a non-nil error — a fork failure is not tmux answering 'no such session'", alive, err)
+		}
+	})
+}
+
+// round 9 review, Critical 1 (second half): a session that is only
+// INCONCLUSIVELY checked (Alive returns a non-nil error) must not have its
+// VanishedStrikes counter touched at all — not incremented (that would let a
+// string of unrelated transient failures eventually cross the threshold with
+// zero genuine "gone" samples) and not reset either (a real strike from an
+// earlier pass must survive an inconclusive pass in between).
+func TestSweepLeavesVanishedStrikesUntouchedOnInconclusiveCheck(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	var s TaskStore
+	s.Upsert(A2ATask{
+		ContextID: "c1", TaskID: "t1", Agent: "a", Session: "aa-a-c1", Worktree: "/p/aa-a-c1",
+		State: TaskWorking, StartedAt: now.Format(time.RFC3339), VanishedStrikes: 1,
+	})
+	_ = SaveTasks(root, s)
+
+	fake := &FakeSessionManager{FailOn: "alive"} // 每次都判不出來
+	if _, _, err := SweepTimeouts(context.Background(), root, fake, now, nil); err != nil {
+		t.Fatalf("SweepTimeouts: %v", err)
+	}
+	got, _ := LoadTasks(root)
+	c1, _ := got.ByContext("c1")
+	if c1.State != TaskWorking || c1.VanishedStrikes != 1 {
+		t.Fatalf("c1 = state=%q strikes=%d, want unchanged (still working, strikes still 1) — an inconclusive check must not move the counter either way", c1.State, c1.VanishedStrikes)
 	}
 }
 
@@ -1473,5 +1605,212 @@ func TestSweepLeavesRunningTaskUntouchedWhenPolicyRevocationFails(t *testing.T) 
 	}
 	if len(fake.Stopped) != 0 {
 		t.Fatalf("session must not be stopped when its policy could not be revoked: %#v", fake.Stopped)
+	}
+}
+
+// round 9 review: the test above proves the ordering with a synthetic
+// failure (an invalid session name) that ALSO passes against the pre-fix
+// code — it is a forward guard, not a regression test, since the old code
+// never touched a row like that either. This is the behavioural version,
+// reproducing the reviewer's own chmod-based probe: a genuinely unwritable
+// a2a-policies/ directory (the realistic failure mode — an interrupted disk,
+// a permissions mistake, disk full) forces RevokeSandboxPolicy's underlying
+// AtomicWriteFile to fail for real, on a row whose session name is
+// otherwise completely valid.
+func TestSweepLeavesRunningTaskUntouchedWhenPolicyDirUnwritable(t *testing.T) {
+	root := t.TempDir()
+	var callers CallerStore
+	_ = callers.Register("peer-a", "s")
+	callers.Approve("peer-a", []string{"read"})
+	callers.Revoke("peer-a")
+	_ = SaveCallers(root, callers)
+	var agents AgentStore
+	_ = agents.Add(Agent{Name: "a", ProjectDir: "/p/a", Capabilities: []string{"read"}, Enabled: true})
+	_ = SaveAgents(root, agents)
+
+	now := time.Now().UTC()
+	const session = "aa-a-c1"
+	var s TaskStore
+	s.Upsert(A2ATask{
+		ContextID: "c1", TaskID: "t1", Agent: "a", CallerID: "peer-a", Level: GrantReadOnly,
+		Session: session, State: TaskWorking, StartedAt: now.Format(time.RFC3339),
+	})
+	if err := SaveTasks(root, s); err != nil {
+		t.Fatalf("SaveTasks: %v", err)
+	}
+	// 政策檔必須先存在——RevokeSandboxPolicy 對不存在的政策檔直接回 nil
+	// （視為沙盒已經不在了），要真的走到寫檔那一步才會踩到目錄權限。
+	if err := WriteSandboxPolicy(root, SandboxPolicy{
+		Session: session, ContextID: "c1", Agent: "a", CallerID: "peer-a", Level: GrantReadOnly,
+	}); err != nil {
+		t.Fatalf("WriteSandboxPolicy: %v", err)
+	}
+
+	dir := PolicyDir(root)
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) }) // 讓 t.TempDir() 的清理拿得回控制權
+
+	fake := &FakeSessionManager{}
+	if _, _, err := SweepTimeouts(context.Background(), root, fake, now, nil); err != nil {
+		t.Fatalf("SweepTimeouts: %v", err)
+	}
+
+	got, _ := LoadTasks(root)
+	tk, _ := got.ByContext("c1")
+	if tk.State != TaskWorking {
+		t.Fatalf("row state = %q, want still working — an unwritable policy directory must retry next sweep, never fail the row while its policy was never actually touched", tk.State)
+	}
+	if len(fake.Stopped) != 0 {
+		t.Fatalf("session must not be stopped when its policy could not be revoked: %#v", fake.Stopped)
+	}
+	pol, err := LoadSandboxPolicy(root, session)
+	if err != nil {
+		t.Fatalf("LoadSandboxPolicy: %v", err)
+	}
+	if pol.Level == GrantRevoked {
+		t.Fatal("policy must not read as revoked — the write never actually succeeded")
+	}
+}
+
+// round 9 review, Critical 2: an unreadable/corrupt callers.json or
+// agents.json must fail closed for QUEUED work (drainRejectReason's existing
+// behaviour, unchanged) but must NOT be applied verbatim to running work —
+// operator revocation is a manual file edit today (per this task's own
+// report), so a half-written save mid-edit is a normal, transient event, not
+// evidence every caller was revoked. Probe: truncate callers.json exactly
+// the way an interrupted editor save would, and confirm not a single healthy
+// TaskWorking row is touched.
+func TestSweepSkipsRunningRevocationOnUnreadableCallerStore(t *testing.T) {
+	root := t.TempDir()
+	var callers CallerStore
+	_ = callers.Register("peer-a", "s")
+	callers.Approve("peer-a", []string{"read"})
+	callers.SetGrantLevel("peer-a", GrantFull)
+	if err := SaveCallers(root, callers); err != nil {
+		t.Fatalf("SaveCallers: %v", err)
+	}
+	var agents AgentStore
+	_ = agents.Add(Agent{Name: "a", ProjectDir: "/p/a", Capabilities: []string{"read"}, Enabled: true})
+	if err := SaveAgents(root, agents); err != nil {
+		t.Fatalf("SaveAgents: %v", err)
+	}
+
+	now := time.Now().UTC()
+	const session = "aa-a-c1"
+	var s TaskStore
+	s.Upsert(A2ATask{
+		ContextID: "c1", TaskID: "t1", Agent: "a", CallerID: "peer-a", Level: GrantFull,
+		Session: session, State: TaskWorking, StartedAt: now.Format(time.RFC3339),
+	})
+	if err := SaveTasks(root, s); err != nil {
+		t.Fatalf("SaveTasks: %v", err)
+	}
+	if err := WriteSandboxPolicy(root, SandboxPolicy{
+		Session: session, ContextID: "c1", Agent: "a", CallerID: "peer-a", Level: GrantFull,
+	}); err != nil {
+		t.Fatalf("WriteSandboxPolicy: %v", err)
+	}
+
+	// 模擬一次被中斷的編輯器存檔：半份 JSON，跟 operator 手動編輯
+	// callers.json 途中被 sweep 撞見時一模一樣。
+	if err := os.WriteFile(CallersPath(root), []byte(`{"callers":[{"caller_id":"peer`), 0o600); err != nil {
+		t.Fatalf("write truncated callers.json: %v", err)
+	}
+
+	fake := &FakeSessionManager{}
+	if _, _, err := SweepTimeouts(context.Background(), root, fake, now, nil); err != nil {
+		t.Fatalf("SweepTimeouts: %v", err)
+	}
+
+	got, _ := LoadTasks(root)
+	tk, _ := got.ByContext("c1")
+	if tk.State != TaskWorking {
+		t.Fatalf("row state = %q, want still working — one interrupted callers.json write must not tear down every healthy running sandbox", tk.State)
+	}
+	if len(fake.Stopped) != 0 {
+		t.Fatalf("no session may be stopped off an unreadable store: %#v", fake.Stopped)
+	}
+	pol, err := LoadSandboxPolicy(root, session)
+	if err != nil {
+		t.Fatalf("LoadSandboxPolicy: %v", err)
+	}
+	if pol.Level == GrantRevoked {
+		t.Fatal("policy must not read as revoked — a store-read failure must never be treated as a rejection for already-running work")
+	}
+}
+
+// round 9 review, Important: the sweep's two NEW terminal transitions
+// (vanished, revoked-while-running) must prefix Detail like the two
+// pre-existing ones do (TestSweepPreservesPriorDetailOnHardTimeout /
+// …OnStaleDispatch, commit b8c5ab0) — not overwrite it. A row already
+// carrying a note (e.g. a TrustFolder failure seeded while it was still
+// working) must not lose that original cause the moment it is failed for an
+// unrelated reason.
+func TestSweepPreservesPriorDetailOnVanish(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	const trustNote = "預先信任 worktree 失敗,沙盒仍會啟動但可能卡在資料夾信任對話框: fake trust failure"
+	var s TaskStore
+	s.Upsert(A2ATask{
+		ContextID: "c1", TaskID: "t1", Agent: "a", Session: "aa-a-c1", Worktree: "/p/aa-a-c1",
+		State: TaskWorking, StartedAt: now.Format(time.RFC3339), Detail: trustNote,
+	})
+	_ = SaveTasks(root, s)
+
+	fake := &FakeSessionManager{AliveSessions: map[string]bool{"aa-a-c1": false}}
+	for i := 0; i < VanishedConfirmStrikes; i++ {
+		if _, _, err := SweepTimeouts(context.Background(), root, fake, now, nil); err != nil {
+			t.Fatalf("SweepTimeouts (pass %d): %v", i+1, err)
+		}
+	}
+	got, _ := LoadTasks(root)
+	tk, _ := got.ByContext("c1")
+	if tk.State != TaskFailed {
+		t.Fatalf("state = %s, want failed", tk.State)
+	}
+	if !strings.Contains(tk.Detail, trustNote) || !strings.Contains(tk.Detail, "vanished") {
+		t.Fatalf("Detail = %q, want both the prior trust-failure note AND the vanish reason", tk.Detail)
+	}
+}
+
+func TestSweepPreservesPriorDetailOnRunningRevocation(t *testing.T) {
+	root := t.TempDir()
+	var callers CallerStore
+	_ = callers.Register("peer-a", "s")
+	callers.Approve("peer-a", []string{"read"})
+	callers.Revoke("peer-a")
+	_ = SaveCallers(root, callers)
+	var agents AgentStore
+	_ = agents.Add(Agent{Name: "a", ProjectDir: "/p/a", Capabilities: []string{"read"}, Enabled: true})
+	_ = SaveAgents(root, agents)
+
+	now := time.Now().UTC()
+	const session = "aa-a-c1"
+	const trustNote = "預先信任 worktree 失敗,沙盒仍會啟動但可能卡在資料夾信任對話框: fake trust failure"
+	var s TaskStore
+	s.Upsert(A2ATask{
+		ContextID: "c1", TaskID: "t1", Agent: "a", CallerID: "peer-a", Level: GrantReadOnly,
+		Session: session, State: TaskWorking, StartedAt: now.Format(time.RFC3339), Detail: trustNote,
+	})
+	_ = SaveTasks(root, s)
+	if err := WriteSandboxPolicy(root, SandboxPolicy{
+		Session: session, ContextID: "c1", Agent: "a", CallerID: "peer-a", Level: GrantReadOnly,
+	}); err != nil {
+		t.Fatalf("WriteSandboxPolicy: %v", err)
+	}
+
+	fake := &FakeSessionManager{}
+	if _, _, err := SweepTimeouts(context.Background(), root, fake, now, nil); err != nil {
+		t.Fatalf("SweepTimeouts: %v", err)
+	}
+	got, _ := LoadTasks(root)
+	tk, _ := got.ByContext("c1")
+	if tk.State != TaskFailed {
+		t.Fatalf("state = %s, want failed", tk.State)
+	}
+	if !strings.Contains(tk.Detail, trustNote) || !strings.Contains(tk.Detail, "revoked") {
+		t.Fatalf("Detail = %q, want both the prior trust-failure note AND the revocation reason", tk.Detail)
 	}
 }
