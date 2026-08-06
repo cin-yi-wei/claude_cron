@@ -377,6 +377,7 @@ func markSandboxLoginFailure(root string, task A2ATask, channel AgentChannel) {
 		}
 		cur.State = TaskFailed
 		cur.Detail = detail
+		cur.DetailSafe = true // 固定字面文字，沒有包住任何 err，可以放行。
 		cur.CompletedAt = time.Now().UTC().Format(time.RFC3339)
 		tasks.Upsert(cur)
 		return nil

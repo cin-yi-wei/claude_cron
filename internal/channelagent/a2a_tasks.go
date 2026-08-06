@@ -49,6 +49,23 @@ type A2ATask struct {
 	// or failure) overwrites; it exists so a task stuck mid-boot shows a
 	// reason via status instead of only the serve journal.
 	Detail string `json:"detail,omitempty"`
+	// DetailSafe 標記 Detail 目前的內容是不是「沙盒/gate 自撰、原文回給遠端
+	// 呼叫方也不會洩漏 host 資訊」的文字。零值是 false——凡是沒有在寫入時明
+	// 確標成 true 的 Detail，tasks/get 一律當它可能包著 host 路徑、git 輸
+	// 出或 tmux 狀態（例如 markFailed 包住的 err.Error()），回應裡用固定字
+	// 串取代，絕不原文吐出去（fail closed：任何新寫入點如果忘了標記，預設
+	// 就是安全方向，不是洩漏方向）。
+	//
+	// 只在真的把 Detail 換成全新內容時才需要明確賦值：a2a_result.go 收下
+	// 沙盒自己的回覆（true）、a2a_driver.go 的登入失敗固定字串（true）、
+	// a2a_server.go 的派送失敗與 a2a_executor.go 的 markFailed 包住
+	// err.Error() 的那幾條（false）。a2a_lifecycle.go 的 appendDetail／
+	// sweep 的「;」接續只把固定字面文字接在既有 Detail 後面，不改這個旗
+	// 標——安全性沿著既有值原樣延續，因為 AND 一段已知安全的新增片段是
+	// no-op；這正是選「在寫入時標記來源」而不是「事後對 Detail 內容做字串
+	// 比對」的理由——後者對這種一路疊加的 Detail 沒辦法可靠分辨新舊片段的
+	// 來源，前者只要在真正引入新內容的那幾個賦值點標一次就永遠正確。
+	DetailSafe bool `json:"detail_safe,omitempty"`
 	// Level 是這個任務的有效授權等級,dispatch 當下算出並寫進沙盒政策檔。
 	// 空值的 row 不可以起沙盒(SandboxExecutor.Start 會拒絕)。
 	Level GrantLevel `json:"level,omitempty"`

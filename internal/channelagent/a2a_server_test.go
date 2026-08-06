@@ -1064,7 +1064,9 @@ func TestTasksGetReturnsTheCallersOwnTask(t *testing.T) {
 		ContextID: "c1", TaskID: "t1", Agent: "codereview", CallerID: "peer-a",
 		Session: "aa-codereview-c1", Branch: "aa/aa-codereview-c1", State: TaskCompleted,
 		StartedAt: "2026-08-06T00:00:00Z", CompletedAt: "2026-08-06T00:10:00Z",
-		Detail: "all good",
+		// DetailSafe:true — 這一列在模擬 a2a_result.go 收下的沙盒回覆（唯一
+		// 真正安全的來源），不是 markFailed 包住的 err.Error()。
+		Detail: "all good", DetailSafe: true,
 	})
 	_ = SaveTasks(root, tasks)
 
@@ -1090,6 +1092,14 @@ func TestTasksGetReturnsTheCallersOwnTask(t *testing.T) {
 }
 
 // 不洩漏存在性：別人的 contextId 與不存在的 contextId 回完全相同的錯誤。
+//
+// round-11-review Minor：只比 Code/Message 是一個很弱的柵欄——一個永遠回
+// errTaskNotVisible、完全不查 store 的假處理器也會通過它。改成比對整個回
+// 應 body（兩個請求的 id 相同，錯誤回應完全不含 contextId，所以正確實作下
+// body 必須逐位元組相同）、HTTP 狀態碼，並確認兩條路徑都沒有寫入 audit
+// log（handleTasksGet 目前只在格式錯誤時才呼叫 auditBadRequest，擁有權判
+// 定分支完全靜默——如果有人不小心讓其中一條分支多寫一筆 audit，就是另一個
+// 可觀察的側管道，這裡也要接住）。
 func TestTasksGetHidesOtherCallersTasks(t *testing.T) {
 	s, root := newTestA2AServer(t)
 	var tasks TaskStore
@@ -1114,17 +1124,42 @@ func TestTasksGetHidesOtherCallersTasks(t *testing.T) {
 	if a.Error.Code != b.Error.Code || a.Error.Message != b.Error.Message {
 		t.Fatalf("existence leaked: %#v vs %#v", a.Error, b.Error)
 	}
+	if mine.Code != ghost.Code {
+		t.Fatalf("HTTP status differs: %d vs %d", mine.Code, ghost.Code)
+	}
+	if mine.Body.String() != ghost.Body.String() {
+		t.Fatalf("response bodies differ:\n mine=%q\nghost=%q", mine.Body.String(), ghost.Body.String())
+	}
+	entries, err := ReadAudit(root)
+	if err != nil {
+		t.Fatalf("ReadAudit: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("ownership/not-found queries must not write to the audit log, got %d entries: %#v", len(entries), entries)
+	}
 }
 
 // detail 是沙盒自撰文字，回應中截斷至 64 KiB。這是對「沙盒文字不流出 HTTP」
 // 的刻意放寬 —— 沒有它就沒有交付（規格第六節開放問題 8）。
+//
+// round-11-review Minor：原本的 fixture 經過 tasks.Upsert，寫入時就已經把
+// Detail 截到 maxDetailBytes（a2a_tasks.go Upsert），所以就算
+// taskSnapshotPayload 完全不截斷、直接回傳 t.Detail 原文，這個測試一樣會
+// 通過——它從來沒有真的測到 taskSnapshotPayload 自己的防禦性截斷。改成繞
+// 過 Upsert，直接組一個 TaskStore 寫進 tasks.json，讓 store 上的 Detail
+// 本身就超過 maxDetailBytes（模擬「未來某條路徑繞過 Upsert 直接改了
+// Detail」的情境），這樣如果拿掉 taskSnapshotPayload 裡的截斷，這個測試會
+// 真的失敗。
 func TestTasksGetTruncatesDetail(t *testing.T) {
 	s, root := newTestA2AServer(t)
-	var tasks TaskStore
-	tasks.Upsert(A2ATask{
+	tasks := TaskStore{Tasks: []A2ATask{{
 		ContextID: "c1", TaskID: "t1", Agent: "codereview", CallerID: "peer-a",
-		State: TaskCompleted, Detail: strings.Repeat("x", 3*maxDetailBytes),
-	})
+		State: TaskCompleted,
+		// DetailSafe:true——這是唯一要驗證的是截斷防線，不是 redaction 防
+		// 線；若留成預設 false，回應會被 detailWithheldMessage 取代，這個
+		// 測試就測不到截斷邏輯了。
+		Detail: strings.Repeat("x", 3*maxDetailBytes), DetailSafe: true,
+	}}}
 	_ = SaveTasks(root, tasks)
 
 	rec := postRPC(t, s.Handler(), "secret-1", `{"jsonrpc":"2.0","id":1,"method":"tasks/get","params":{"contextId":"c1"}}`)
@@ -1133,5 +1168,40 @@ func TestTasksGetTruncatesDetail(t *testing.T) {
 	res, _ := resp.Result.(map[string]any)
 	if got := len(res["detail"].(string)); got > maxDetailBytes+32 {
 		t.Fatalf("detail = %d bytes, want at most %d", got, maxDetailBytes)
+	}
+}
+
+// round-11-review Critical：Detail 不只是沙盒自撰文字——markFailed／派送
+// 失敗這幾條路徑把 err.Error() 包進同一個欄位，可能夾帶絕對路徑（例如
+// "ensure worktree: /home/x/project/.channel-agent/sandboxes/...: git
+// checkout failed"）。這個測試模擬那種情況（DetailSafe 留預設值 false，
+// 就像 markFailed 對這類錯誤實際寫入的那樣），斷言 tasks/get 絕不把它原文
+// 交給遠端呼叫方；state 仍然要正確回報，operator 端的完整原文不受影響
+// （這個測試只檢查回應，不檢查 store）。
+func TestTasksGetRedactsUnsafeDetail(t *testing.T) {
+	s, root := newTestA2AServer(t)
+	hostErr := "ensure worktree: /home/conray/private-project/.channel-agent/sandboxes/aa-codereview-c1: git checkout failed"
+	tasks := TaskStore{Tasks: []A2ATask{{
+		ContextID: "c1", TaskID: "t1", Agent: "codereview", CallerID: "peer-a",
+		State: TaskFailed, Detail: hostErr, // DetailSafe: false（零值，未標記）
+	}}}
+	_ = SaveTasks(root, tasks)
+
+	rec := postRPC(t, s.Handler(), "secret-1", `{"jsonrpc":"2.0","id":1,"method":"tasks/get","params":{"contextId":"c1"}}`)
+	if strings.Contains(rec.Body.String(), "private-project") || strings.Contains(rec.Body.String(), "git checkout failed") {
+		t.Fatalf("unsafe Detail leaked into response body: %s", rec.Body.String())
+	}
+	var resp RPCResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %#v", resp.Error)
+	}
+	res, _ := resp.Result.(map[string]any)
+	if res["state"] != "failed" {
+		t.Fatalf("state = %#v, want failed", res["state"])
+	}
+	detail, _ := res["detail"].(string)
+	if detail == "" || strings.Contains(detail, hostErr) {
+		t.Fatalf("detail = %q, want a generic message with no host path", detail)
 	}
 }

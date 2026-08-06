@@ -89,10 +89,17 @@ func DrainQueue(ctx context.Context, root string, ex TaskExecutor) (int, error) 
 	// 寫明 Detail + 一筆稽核 —— 不是靜默 continue（那正是 I1 的形態）。
 	callers, cerr := LoadCallers(root)
 	agents, aerr := LoadAgents(root)
+	// drainRejectReason 的頭兩個分支（cerr/aerr 非 nil）回的是包住 store
+	// 讀檔錯誤的字串，可能夾帶 callers.json/agents.json 的絕對路徑；其餘分
+	// 支都是固定字面文字加上呼叫方自己的 caller/agent 名稱，不含 host 路
+	// 徑。這兩個變數對整個迴圈是常數，於是同一批呼叫全部共用同一個安全判
+	// 定——cerr/aerr 一旦非 nil，這一輪產生的每個 reason 字串都走的是同一
+	// 個不安全分支。
+	reasonSafe := cerr == nil && aerr == nil
 	started := 0
 	for _, t := range claimed {
 		if reason := drainRejectReason(callers, agents, cerr, aerr, t); reason != "" {
-			failDrainedTask(root, t, reason)
+			failDrainedTask(root, t, reason, reasonSafe)
 			continue
 		}
 		if err := ex.Start(ctx, t, t.Prompt); err != nil {
@@ -172,7 +179,12 @@ func revokeReasonForRunningTask(callers CallerStore, agents, rawAgents AgentStor
 	return reason
 }
 
-func failDrainedTask(root string, t A2ATask, reason string) {
+// safe 是 reason 本身(不含 cur.Detail 裡任何已經存在的舊內容)的安全性。合
+// 成後的旗標是兩者的 AND：舊內容不安全,結果就不安全,不管這次新接上去的
+// reason 多乾淨;新接上去的 reason 不安全,結果也不安全,不管舊內容原來多
+// 乾淨——appendDetail 是純粹的字串接續,沒有辦法事後把兩段的安全性分開,
+// 一旦合成就只能取更嚴格的那一邊。
+func failDrainedTask(root string, t A2ATask, reason string, safe bool) {
 	_ = WithTasks(root, func(tasks *TaskStore) error {
 		cur, ok := tasks.ByContext(t.ContextID)
 		if !ok || !CanTransition(cur.State, TaskFailed) {
@@ -180,6 +192,7 @@ func failDrainedTask(root string, t A2ATask, reason string) {
 		}
 		cur.State = TaskFailed
 		cur.Detail = appendDetail(cur.Detail, reason)
+		cur.DetailSafe = cur.DetailSafe && safe
 		cur.CompletedAt = time.Now().UTC().Format(time.RFC3339)
 		tasks.Upsert(cur)
 		return nil

@@ -522,6 +522,11 @@ func (s *A2AServer) handleMessageSend(w http.ResponseWriter, r *http.Request, re
 		log.Printf("a2a: dispatch failed for task %s (agent=%s contextId=%s): %v", task.TaskID, task.Agent, task.ContextID, err)
 		task.State = TaskFailed
 		task.Detail = err.Error()
+		// DetailSafe=false：err 是 Executor.Start 的回傳值，跟上面註解說的
+		// 一樣可能夾帶 worktree 路徑、git 輸出、tmux 狀態。這一列的 Detail
+		// 之後可以被 tasks/get 查到（taskSnapshotPayload），這裡明確標成
+		// 不安全，讓那個查詢路徑用固定字串取代，不把它原文交給遠端呼叫方。
+		task.DetailSafe = false
 		if serr := WithTasks(s.Root, func(tasks *TaskStore) error {
 			tasks.Upsert(task)
 			return nil
@@ -575,16 +580,39 @@ type TaskGetParams struct {
 // 完全一致，否則呼叫方可以用錯誤訊息的差異列舉別人的 contextId。
 const errTaskNotVisible = "no task for that contextId"
 
+// detailWithheldMessage 取代任何 DetailSafe==false 的 Detail。它本身必須是
+// 固定字串——不重複底層錯誤裡的任何字詞、不帶路徑——這樣任何未來忘記把
+// 新錯誤路徑標成 safe=false 的人，看到回應也不會誤以為「原文正常回傳」是
+// 預期行為（審計時一眼可辨）。
+const detailWithheldMessage = "internal error (detail withheld; see operator log)"
+
 // taskSnapshotPayload 是 tasks/get 的回應形狀，也是完成回呼的 body 基底
 // （Task 12 在它之上加一個 "event" 欄位）。刻意不含 session / worktree ——
 // 那是私有專案資訊，host 路徑與內部簿記沒有理由跨過 HTTP 邊界；state / detail
 // 才是這個功能存在的理由。
 //
-// detail 是沙盒自撰文字，截斷至 maxDetailBytes。把它交出去是對「沙盒文字不
-// 流出 HTTP」的刻意放寬，因為沒有它就沒有交付（規格第六節開放問題 8）。
-// Upsert 已經在寫入時把 Detail 截到 maxDetailBytes，這裡再截一次是防禦性的
-// ——就算未來某條路徑繞過 Upsert 直接改了 Detail，回應仍然有界。
+// detail 是「本來」該是沙盒自撰文字才能截斷放行的欄位（規格第六節開放問題
+// 8：沒有它就沒有交付），但 Detail 這個欄位本身同時也被 markFailed／派送失
+// 敗這幾條路徑拿去裝 err.Error()——那些字串可能包著 host 上的絕對路徑、git
+// 輸出、tmux 狀態，跟這裡要放行的「沙盒說了什麼」是完全不同的東西，卻共用
+// 同一個欄位（round-11-review Critical）。
+//
+// 用 A2ATask.DetailSafe 在「寫入的當下」標記來源，取代事後對 Detail 內容做
+// 字串比對（例如找有沒有像路徑的子字串）：這欄位一路被 appendDetail／sweep
+// 的「;」接續反覆疊加前面留下的線索，寫入時就知道這一段是誰寫的、事後從最
+// 終字串裡永遠分不出哪一段來自哪裡——內容比對這條路在這裡註定不可靠，標記
+// 來源不會。DetailSafe 為 false（包含從未被明確標成 true 的預設值——fail
+// closed）時，一律換成下面固定的 detailWithheldMessage；operator 仍能在
+// tasks.json 上看到完整原文，只是不讓它跨過這條 HTTP 邊界。
+//
+// 放行的 Detail 一樣截斷至 maxDetailBytes；Upsert 已經在寫入時做過這次截
+// 斷，這裡再截一次是防禦性的——就算未來某條路徑繞過 Upsert 直接改了
+// Detail，回應仍然有界。
 func taskSnapshotPayload(t A2ATask) map[string]any {
+	detail := t.Detail
+	if detail != "" && !t.DetailSafe {
+		detail = detailWithheldMessage
+	}
 	return map[string]any{
 		"contextId":   t.ContextID,
 		"taskId":      t.TaskID,
@@ -593,7 +621,7 @@ func taskSnapshotPayload(t A2ATask) map[string]any {
 		"branch":      t.Branch,
 		"startedAt":   t.StartedAt,
 		"completedAt": t.CompletedAt,
-		"detail":      truncateBytes(t.Detail, maxDetailBytes),
+		"detail":      truncateBytes(detail, maxDetailBytes),
 	}
 }
 

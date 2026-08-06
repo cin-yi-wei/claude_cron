@@ -117,7 +117,10 @@ func (e *SandboxExecutor) persist(task A2ATask) error {
 // created on disk by the time a later step fails. Clobbering the computed
 // identity with the stale row would strand a real worktree or tmux session
 // that nothing could then find to clean up.
-func (e *SandboxExecutor) markFailed(task A2ATask, detail string) {
+// safe 標記 detail 是否可以原文回給 tasks/get 的遠端呼叫方——見
+// A2ATask.DetailSafe 的說明。呼叫方必須在每個呼叫點明確決定，不給預設值，
+// 逼著新增的失敗分支也要做這個判斷，而不是靜默繼承上一個呼叫點的答案。
+func (e *SandboxExecutor) markFailed(task A2ATask, detail string, safe bool) {
 	_ = WithTasks(e.Root, func(tasks *TaskStore) error {
 		worktree, branch, session := task.Worktree, task.Branch, task.Session
 		t := task
@@ -135,6 +138,7 @@ func (e *SandboxExecutor) markFailed(task A2ATask, detail string) {
 		}
 		t.State = TaskFailed
 		t.Detail = detail
+		t.DetailSafe = safe
 		t.CompletedAt = time.Now().UTC().Format(time.RFC3339)
 		tasks.Upsert(t)
 		return nil
@@ -155,13 +159,16 @@ func (e *SandboxExecutor) Start(ctx context.Context, task A2ATask, prompt string
 	}
 	agent, ok := agents.Get(task.Agent)
 	if !ok {
+		// safe=true：這三個分支的字串只由固定格式 + 呼叫方自己送出的
+		// agent/contextId 組成,沒有 err.Error() 包住的任何 host 端錯誤——
+		// 呼叫方回顯自己已經知道的輸入,不構成新的資訊洩漏。
 		err := fmt.Errorf("unknown agent %q", task.Agent)
-		e.markFailed(task, err.Error())
+		e.markFailed(task, err.Error(), true)
 		return err
 	}
 	if !agent.Enabled {
 		err := fmt.Errorf("agent %q is disabled", task.Agent)
-		e.markFailed(task, err.Error())
+		e.markFailed(task, err.Error(), true)
 		return err
 	}
 
@@ -169,7 +176,7 @@ func (e *SandboxExecutor) Start(ctx context.Context, task A2ATask, prompt string
 	// 全面拒絕,結果是一個活著卻什麼都做不了、還佔著併發額度的殭屍。
 	if !ValidGrantLevel(task.Level) {
 		err := fmt.Errorf("task %s has no valid grant level", task.ContextID)
-		e.markFailed(task, err.Error())
+		e.markFailed(task, err.Error(), true)
 		return err
 	}
 
@@ -191,16 +198,20 @@ func (e *SandboxExecutor) Start(ctx context.Context, task A2ATask, prompt string
 			// would clobber it with (task-8 review round 2, finding 2).
 			return nil
 		}
-		e.markFailed(task, "persist sandbox identity: "+err.Error())
+		// safe=false 由此往下都是這個方向:這些分支的 err 來自 tasks.json
+		// I/O、檔案系統、git、政策檔、tmux、inject——都可能夾帶絕對路徑或
+		// 其他 host 端細節,絕不可原文交給遠端呼叫方(見 handleMessageSend
+		// 對這一類 err.Error() 的既有處理與 taskSnapshotPayload 的說明)。
+		e.markFailed(task, "persist sandbox identity: "+err.Error(), false)
 		return err
 	}
 
 	if err := Init(sandboxRoot); err != nil {
-		e.markFailed(task, "init sandbox root: "+err.Error())
+		e.markFailed(task, "init sandbox root: "+err.Error(), false)
 		return err
 	}
 	if err := e.Sessions.EnsureWorkspace(ctx, agent.ProjectDir, task.Branch, task.Worktree); err != nil {
-		e.markFailed(task, "ensure worktree: "+err.Error())
+		e.markFailed(task, "ensure worktree: "+err.Error(), false)
 		return err
 	}
 
@@ -212,7 +223,9 @@ func (e *SandboxExecutor) Start(ctx context.Context, task A2ATask, prompt string
 	// upsert 成 TaskWorking 時會一併帶上這個值,讓卡住的任務至少在狀態查詢
 	// 上留下線索,而不是靜默地跟原本的 bug 一樣看起來什麼都沒發生。
 	if err := e.Sessions.TrustFolder(ctx, task.Worktree); err != nil {
+		// safe=false：%v 包住的 err 來自 ~/.claude.json 讀寫，可能夾帶路徑。
 		task.Detail = fmt.Sprintf("預先信任 worktree 失敗,沙盒仍會啟動但可能卡在資料夾信任對話框: %v", err)
+		task.DetailSafe = false
 		log.Printf("a2a: 預先信任 %s 失敗(沙盒仍會啟動,靠 driver 的畫面 backstop): %v", task.Worktree, err)
 	}
 
@@ -228,12 +241,12 @@ func (e *SandboxExecutor) Start(ctx context.Context, task A2ATask, prompt string
 		Worktree:    cleanAbs(task.Worktree),
 		SandboxRoot: cleanAbs(sandboxRoot),
 	}); err != nil {
-		e.markFailed(task, "write sandbox policy: "+err.Error())
+		e.markFailed(task, "write sandbox policy: "+err.Error(), false)
 		return err
 	}
 
 	if err := e.Sessions.Start(ctx, task.Session, task.Worktree, sandboxRoot); err != nil {
-		e.markFailed(task, "start session: "+err.Error())
+		e.markFailed(task, "start session: "+err.Error(), false)
 		return err
 	}
 
@@ -250,7 +263,7 @@ func (e *SandboxExecutor) Start(ctx context.Context, task A2ATask, prompt string
 		Content:   prompt,
 	}
 	if err := e.Sessions.Inject(ctx, sandboxRoot, msg); err != nil {
-		e.markFailed(task, "inject: "+err.Error())
+		e.markFailed(task, "inject: "+err.Error(), false)
 		return err
 	}
 	// 記在 row 上，CollectResults 才有東西可以比對來源。

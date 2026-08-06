@@ -208,6 +208,9 @@ func CollectResults(root string, now time.Time) (int, error) {
 			}
 			cur.State = TaskCompleted
 			cur.Detail = f.text
+			// safe=true：f.text 是沙盒自己寫進 outbox/pending 的回覆，正是
+			// tasks/get 這個功能存在的理由——不是包住某個 host 端 err 的字串。
+			cur.DetailSafe = true
 			cur.CompletedAt = now.UTC().Format(time.RFC3339)
 			tasks.Upsert(cur)
 			promoted = append(promoted, f)
