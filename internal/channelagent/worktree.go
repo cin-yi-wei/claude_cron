@@ -199,8 +199,33 @@ const sandboxAgentSettings = `{
 }
 `
 
-// EnsureSandboxSettings 把 aa- 沙盒的權限設定寫進 dir(已存在則不動)。
-func EnsureSandboxSettings(dir string) error { return writeAgentSettings(dir, sandboxAgentSettings) }
+// EnsureSandboxSettings 把 aa- 沙盒的權限設定寫進 dir。與 EnsureAgentSettings/
+// EnsureControlSettings 不同,既有檔案不是永遠不動:如果既有 settings.local.json
+// 帶著 SessionStart hook,代表這個 worktree 是升級前的舊二進位留下的(那正是
+// 這個 task 要拔掉的閘的來源),必須整份重寫成不含 SessionStart 的版本,否則
+// 這個沙盒開機時還是會卡在同一個 managed-settings 閘上,升級等於沒修。不帶
+// SessionStart 的既有檔案(已經是沙盒版本、或使用者自訂)照舊不動。
+// writeAgentSettings/EnsureAgentSettings 的「已存在則不動」行為完全不受影響。
+func EnsureSandboxSettings(dir string) error {
+	settingsPath := filepath.Join(dir, ".claude", "settings.local.json")
+	existing, err := os.ReadFile(settingsPath)
+	switch {
+	case err == nil:
+		if !strings.Contains(string(existing), "SessionStart") {
+			return nil // 已經是沙盒版本(或不相關的自訂內容),不動
+		}
+		// 舊二進位留下的 worker 版本設定,帶著會卡死沙盒的 SessionStart hook,
+		// 必須整份換成 sandboxAgentSettings。
+	case os.IsNotExist(err):
+		// 第一次開機,走跟 writeAgentSettings 一樣的建立路徑。
+	default:
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(settingsPath), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(settingsPath, []byte(sandboxAgentSettings), 0o644)
+}
 
 // EnsureAgentSettings writes the WORKER permission config into dir's
 // .claude/settings.local.json if absent (existing file left untouched).

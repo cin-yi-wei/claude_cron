@@ -177,8 +177,13 @@ func (e *SandboxExecutor) Start(ctx context.Context, task A2ATask, prompt string
 
 	// 失敗只 log 不中止:它只是省一個對話框,不是必要條件(driver 的第 3 層
 	// backstop 仍在)。讓一個 ~/.claude.json 的暫時性讀寫錯誤害死每一個委派
-	// 任務,遠比多跳一次對話框糟糕。
+	// 任務,遠比多跳一次對話框糟糕。但也不能只寫進 journal:task 4 要修的就是
+	// 「使用者除了乾等兩小時什麼都看不到」這個症狀,journal 使用者看不到,
+	// 所以把原因記進 task row 的 Detail —— 下面的 WithTasks 區塊把 task
+	// upsert 成 TaskWorking 時會一併帶上這個值,讓卡住的任務至少在狀態查詢
+	// 上留下線索,而不是靜默地跟原本的 bug 一樣看起來什麼都沒發生。
 	if err := e.Sessions.TrustFolder(ctx, task.Worktree); err != nil {
+		task.Detail = fmt.Sprintf("預先信任 worktree 失敗,沙盒仍會啟動但可能卡在資料夾信任對話框: %v", err)
 		log.Printf("a2a: 預先信任 %s 失敗(沙盒仍會啟動,靠 driver 的畫面 backstop): %v", task.Worktree, err)
 	}
 

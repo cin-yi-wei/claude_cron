@@ -2,6 +2,9 @@ package channelagent
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -64,6 +67,41 @@ func TestFakeSessionManagerTrustFolderRecordsAndCanFail(t *testing.T) {
 	}
 	if len(failing.Trusted) != 0 {
 		t.Fatalf("Trusted should stay empty on failure: %#v", failing.Trusted)
+	}
+}
+
+// TestTmuxSessionManagerStartWritesSandboxSettingsNotWorkerSettings pins
+// a2a_session.go's TmuxSessionManager.Start call to StartTmuxClaudeSandbox
+// (not StartTmuxClaude): SessionManager only ever serves aa- sandboxes, so
+// reverting that one line back to StartTmuxClaude would silently reinstall
+// the SessionStart hook — and the managed-settings gate it causes — on every
+// sandbox's first boot, with no other test in the suite able to catch it.
+// runExternalCommand is faked so this never spawns tmux or a real claude
+// process.
+func TestTmuxSessionManagerStartWritesSandboxSettingsNotWorkerSettings(t *testing.T) {
+	old := runExternalCommand
+	defer func() { runExternalCommand = old }()
+	oldDelay := sessionBootDelay
+	sessionBootDelay = 0
+	defer func() { sessionBootDelay = oldDelay }()
+	runExternalCommand = func(_ context.Context, _ string, args ...string) error {
+		if len(args) > 0 && args[0] == "has-session" {
+			return context.Canceled // simulate "no such session"
+		}
+		return nil
+	}
+
+	cwd := t.TempDir()
+	sm := TmuxSessionManager{}
+	if err := sm.Start(context.Background(), "aa-x-c1", cwd, "/root"); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	blob, err := os.ReadFile(filepath.Join(cwd, ".claude", "settings.local.json"))
+	if err != nil {
+		t.Fatalf("read settings: %v", err)
+	}
+	if strings.Contains(string(blob), "SessionStart") {
+		t.Fatal("TmuxSessionManager.Start must write sandbox settings (no SessionStart), not the cc- worker settings")
 	}
 }
 

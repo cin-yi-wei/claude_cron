@@ -275,3 +275,66 @@ func TestSandboxSettingsDropSessionStartHookOnly(t *testing.T) {
 		t.Fatalf("sandbox settings are not valid JSON: %v", err)
 	}
 }
+
+// TestEnsureSandboxSettingsRewritesStaleSessionStartHook pins the upgrade
+// path: writeAgentSettings/EnsureAgentSettings no-op when a
+// settings.local.json already exists, and EnsureWorktree no-ops when the
+// worktree already exists — so a sandbox worktree created by a pre-fix
+// binary would otherwise keep its SessionStart-bearing settings forever and
+// hang exactly like the original bug on every future boot. EnsureSandboxSettings
+// must detect that stale content and rewrite it, unlike the cc-/control
+// writers (which must stay untouched — see
+// TestSandboxSettingsDropSessionStartHookOnly for that guarantee).
+func TestEnsureSandboxSettingsRewritesStaleSessionStartHook(t *testing.T) {
+	sandbox := t.TempDir()
+	// Simulate a worktree created by the pre-fix binary: it wrote the WORKER
+	// settings (agentSettings, complete with SessionStart) into what is now
+	// treated as a sandbox worktree.
+	if err := EnsureAgentSettings(sandbox); err != nil {
+		t.Fatalf("seed stale worker settings: %v", err)
+	}
+	settingsPath := filepath.Join(sandbox, ".claude", "settings.local.json")
+	stale, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(stale), "SessionStart") {
+		t.Fatal("fixture setup is wrong: seeded settings should carry SessionStart")
+	}
+
+	if err := EnsureSandboxSettings(sandbox); err != nil {
+		t.Fatalf("EnsureSandboxSettings: %v", err)
+	}
+	rewritten, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(rewritten), "SessionStart") {
+		t.Fatal("EnsureSandboxSettings left a stale SessionStart hook in place — an upgraded binary would hang on this worktree exactly like the original bug")
+	}
+	for _, m := range []string{`"Edit"`, `"Write"`, `"Bash"`, `"WebFetch"`, `"WebSearch"`, `"mcp__.*"`} {
+		if !strings.Contains(string(rewritten), m) {
+			t.Errorf("rewritten sandbox settings lost the %s matcher", m)
+		}
+	}
+
+	// A second call on the now-correct sandbox settings must be a genuine
+	// no-op — EnsureSandboxSettings must not thrash the file every boot.
+	if err := os.Chmod(settingsPath, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureSandboxSettings(sandbox); err != nil {
+		t.Fatalf("EnsureSandboxSettings (idempotent): %v", err)
+	}
+	after, err := os.Stat(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !before.ModTime().Equal(after.ModTime()) {
+		t.Fatal("EnsureSandboxSettings rewrote an already-correct sandbox settings file")
+	}
+}

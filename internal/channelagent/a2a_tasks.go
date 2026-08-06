@@ -33,7 +33,11 @@ type A2ATask struct {
 	// task queued at capacity can still be started later by DrainQueue.
 	Prompt string `json:"prompt,omitempty"`
 	// Detail carries the outcome: the sandbox's reply on success, or the error
-	// reason on failure. Never the input — that is Prompt.
+	// reason on failure. Never the input — that is Prompt. It can also carry a
+	// non-fatal warning while the task is still Working (e.g. a folder-trust
+	// seed failure) — a transient note the next terminal-state write (success
+	// or failure) overwrites; it exists so a task stuck mid-boot shows a
+	// reason via status instead of only the serve journal.
 	Detail string `json:"detail,omitempty"`
 	// Level 是這個任務的有效授權等級,dispatch 當下算出並寫進沙盒政策檔。
 	// 空值的 row 不可以起沙盒(SandboxExecutor.Start 會拒絕)。

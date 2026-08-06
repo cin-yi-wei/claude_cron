@@ -440,11 +440,37 @@ func TestSandboxExecutorRefusesTaskWithoutLevel(t *testing.T) {
 	}
 }
 
+// trustOrderSpy wraps FakeSessionManager to prove TrustFolder actually ran
+// BEFORE Start, not just that both ran at some point during Start.
+// FakeSessionManager records each call into its own slice (Trusted vs
+// Started), so asserting both slices are non-empty after Start returns
+// cannot distinguish "trusted then started" from "started then trusted" —
+// only observing Trusted's state from INSIDE Start, as it fires, can.
+type trustOrderSpy struct {
+	*FakeSessionManager
+	trustedBeforeStart bool
+}
+
+func (s *trustOrderSpy) Start(ctx context.Context, session, cwd, registryRoot string) error {
+	s.trustedBeforeStart = len(s.Trusted) == 1
+	return s.FakeSessionManager.Start(ctx, session, cwd, registryRoot)
+}
+
 // EnsureFolderTrusted 目前是死碼(零正式呼叫端),所以資料夾信任對話框在每個
 // 沙盒開機時都會跳。接上它 —— 但一定要走 SessionManager,否則單元測試會改寫
-// operator 的 ~/.claude.json。
+// operator 的 ~/.claude.json。信任必須在 session 啟動之前完成:trustOrderSpy
+// 從 Start 內部觀察 Trusted 是否已經記錄,而不是只在 Start 回傳後檢查兩個
+// slice 都非空(那種寫法連「先 Start 再 Trust」都會誤判成通過)。
 func TestSandboxExecutorTrustsWorktreeBeforeStart(t *testing.T) {
-	_, fake, ex := newExecutorFixture(t)
+	root := t.TempDir()
+	agents := AgentStore{}
+	_ = agents.Add(Agent{Name: "codereview", ProjectDir: "/p/x", Enabled: true})
+	if err := SaveAgents(root, agents); err != nil {
+		t.Fatalf("SaveAgents: %v", err)
+	}
+	spy := &trustOrderSpy{FakeSessionManager: &FakeSessionManager{}}
+	ex := NewSandboxExecutor(root, spy)
+
 	task := A2ATask{
 		ContextID: "c1", Agent: "codereview", CallerID: "peer-a",
 		Session: SessionNameFor("codereview", "c1"), State: TaskSubmitted, Level: GrantDevelop,
@@ -452,11 +478,14 @@ func TestSandboxExecutorTrustsWorktreeBeforeStart(t *testing.T) {
 	if err := ex.Start(context.Background(), task, "go"); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	if len(fake.Trusted) != 1 {
-		t.Fatalf("TrustFolder calls = %#v, want exactly one", fake.Trusted)
+	if len(spy.Trusted) != 1 {
+		t.Fatalf("TrustFolder calls = %#v, want exactly one", spy.Trusted)
 	}
-	if fake.Trusted[0] != SandboxWorktree("/p/x", task.Session) {
-		t.Fatalf("trusted %q, want the sandbox worktree", fake.Trusted[0])
+	if spy.Trusted[0] != SandboxWorktree("/p/x", task.Session) {
+		t.Fatalf("trusted %q, want the sandbox worktree", spy.Trusted[0])
+	}
+	if !spy.trustedBeforeStart {
+		t.Fatal("TrustFolder must run before Sessions.Start, not after")
 	}
 }
 

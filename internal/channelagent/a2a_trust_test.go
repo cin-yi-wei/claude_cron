@@ -2,8 +2,10 @@ package channelagent
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -111,5 +113,48 @@ func TestEnsureFolderTrustedPreservesFileMode(t *testing.T) {
 	}
 	if info.Mode().Perm() != 0o640 {
 		t.Fatalf("file mode changed: got %v, want 0640", info.Mode().Perm())
+	}
+}
+
+// TestEnsureFolderTrustedConcurrentCallsDoNotLoseEntries pins trustMu: a
+// unique-per-call temp file (fileutil.go) stops two concurrent writers from
+// interleaving bytes into one corrupt file, but does NOT by itself make the
+// read-decode-mutate-encode-write sequence atomic — two goroutines could
+// each read the same "before" snapshot, each add their own project's trust
+// entry only in memory, and whichever writes last would publish a version
+// that silently lacks the other's entry (a lost update). Sandbox starts are
+// concurrent by design in production (a2a_server.go's HTTP dispatch and
+// a2a_lifecycle.go's DrainQueue), so this is run under -race and asserts
+// every one of many concurrent callers' entries survives. This never
+// touches ~/.claude — configPath is a t.TempDir() file.
+func TestEnsureFolderTrustedConcurrentCallsDoNotLoseEntries(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "claude.json")
+	if err := os.WriteFile(path, []byte(`{"projects":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	const n = 50
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = EnsureFolderTrusted(path, fmt.Sprintf("/p/sandbox-%d", i))
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("caller %d: %v", i, err)
+		}
+	}
+
+	for i := 0; i < n; i++ {
+		trusted, present := readTrust(t, path, fmt.Sprintf("/p/sandbox-%d", i))
+		if !present || !trusted {
+			t.Fatalf("caller %d's trust entry was lost to a concurrent writer (present=%v trusted=%v)", i, present, trusted)
+		}
 	}
 }

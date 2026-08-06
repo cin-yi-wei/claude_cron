@@ -24,15 +24,26 @@ func AtomicWriteJSONMode(path string, v any, mode os.FileMode) error {
 }
 
 func AtomicWriteFile(path string, payload []byte, mode os.FileMode) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
 
-	tmp := path + ".tmp"
-	file, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
+	// The temp file MUST have a unique name, not a fixed path+".tmp": two
+	// concurrent writers to the same path (e.g. two sandboxes both calling
+	// EnsureFolderTrusted against the shared ~/.claude.json) would otherwise
+	// both O_TRUNC the same temp file and write from independent offsets,
+	// interleaving their payloads into invalid content before either rename
+	// even runs. os.CreateTemp in the SAME directory as path guarantees the
+	// final os.Rename stays on one filesystem (so it's still atomic) while
+	// giving every call its own file. os.CreateTemp always creates with mode
+	// 0600 regardless of what's asked for, so the requested mode is applied
+	// explicitly via Chmod before the rename publishes it.
+	file, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
 	if err != nil {
 		return err
 	}
+	tmp := file.Name()
 	cleanup := true
 	defer func() {
 		if cleanup {
@@ -41,6 +52,10 @@ func AtomicWriteFile(path string, payload []byte, mode os.FileMode) error {
 	}()
 
 	if _, err := file.Write(payload); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Chmod(mode); err != nil {
 		_ = file.Close()
 		return err
 	}
@@ -55,7 +70,7 @@ func AtomicWriteFile(path string, payload []byte, mode os.FileMode) error {
 		return err
 	}
 	cleanup = false
-	return syncDir(filepath.Dir(path))
+	return syncDir(dir)
 }
 
 func ReadJSON(path string, v any) error {
