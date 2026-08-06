@@ -27,7 +27,13 @@ const (
 	//（round-12-review Important 2 的探針：3 筆各 300ms 的解析 = 903ms 的
 	// cycle 停滯）。
 	callbackResolveTimeout = 3 * time.Second
+	// maxResolveAttempts：暫時性解析失敗最多重試幾輪 cycle 才放棄。
+	maxResolveAttempts = 3
 )
+
+// errCallbackResolveTransient 標記「解析不出來」這種暫時性失敗，用來跟「解析
+// 得到但位址不是公網」這種設定錯誤區分開。後者重試沒有意義。
+var errCallbackResolveTransient = errors.New("callback host resolution failed")
 
 // callbackRetryDelays：最多 3 次重試，只對傳輸錯誤與 5xx、429 重試。2xx 視為
 // 成功，其他 4xx 視為永久失敗立刻放棄。
@@ -59,6 +65,9 @@ type CallbackDispatcher struct {
 	//（規格第六節開放問題 7）。
 	mu       sync.Mutex
 	inflight map[string]bool
+	// resolveFails 記每個 caller 連續幾輪解析暫時失敗；成功就清掉。只在行程
+	// 記憶體，重啟後重新計數。
+	resolveFails map[string]int
 
 	// transport / httpClient 是整個 dispatcher 生命週期共用的唯一一組——
 	// Important 1（round-12-review）：舊版本在每次送遞時各建一個新
@@ -78,10 +87,11 @@ type CallbackDispatcher struct {
 
 func NewCallbackDispatcher(ctx context.Context, root string) *CallbackDispatcher {
 	d := &CallbackDispatcher{
-		root:     root,
-		ch:       make(chan callbackJob, callbackQueueSize),
-		done:     make(chan struct{}),
-		inflight: map[string]bool{},
+		root:         root,
+		ch:           make(chan callbackJob, callbackQueueSize),
+		done:         make(chan struct{}),
+		inflight:     map[string]bool{},
+		resolveFails: map[string]int{},
 		resolve: func(host string) ([]net.IP, error) {
 			// 逾時封頂：見 callbackResolveTimeout 的說明。
 			rctx, cancel := context.WithTimeout(context.Background(), callbackResolveTimeout)
@@ -145,7 +155,11 @@ func ValidateCallbackURL(raw string, resolve func(host string) ([]net.IP, error)
 	}
 	ips, err := resolve(host)
 	if err != nil {
-		return nil, fmt.Errorf("resolve callback host: %w", err)
+		// 包一層 errCallbackResolveTransient：解析失敗跟「解析得到但位址是內
+		// 網」是兩件事。前者是暫時的（DNS 打嗝、逾時），後者是設定錯誤。呼叫
+		// 端要能分辨——傳輸錯誤有 3 次重試，而一次 DNS 打嗝原本會直接把這則
+		// 完成通知永久燒掉（round-12-review 第二輪 Minor 2）。
+		return nil, fmt.Errorf("%w: %v", errCallbackResolveTransient, err)
 	}
 	if len(ips) == 0 {
 		return nil, errors.New("callback host resolved to no addresses")
@@ -178,7 +192,36 @@ var (
 	benchmarkBlock    = mustCIDR("198.18.0.0/15")
 	reservedBlock     = mustCIDR("240.0.0.0/4")
 	nat64Block        = mustCIDR("64:ff9b::/96")
+
+	// 以下每一段都能把一個 IPv4 位址包在 IPv6 位址裡。逐段列 CIDR 會一直漏
+	// ——`64:ff9b::/96` 擋掉之後，Jool / Tayga 實際會設定的 RFC 8215 local-use
+	// 前綴 `64:ff9b:1::/48` 就從旁邊走過去。所以這裡不是「再多擋幾段」，而是
+	// 把內嵌的那個 IPv4 抽出來一併送進 isPublicIP 判斷。
+	nat64LocalBlock = mustCIDR("64:ff9b:1::/48")  // RFC 8215 local-use NAT64
+	sixToFourBlock  = mustCIDR("2002::/16")       // RFC 3056 6to4
+	siitBlock       = mustCIDR("::ffff:0:0:0/96") // RFC 6145 SIIT translated
+	v4CompatBlock   = mustCIDR("::/96")           // 已廢棄的 IPv4-compatible
 )
+
+// embeddedIPv4 把包在 IPv6 位址裡的 IPv4 抽出來，抽不到就回 nil。
+//
+// `::ffff:127.0.0.1` 這種 IPv4-mapped 位址 Go 的 net.IP 本來就會正規化，
+// 但 6to4、SIIT、NAT64 這幾種不會——它們的 IPv4 藏在位址中間或尾端的
+// 特定 32 bits 裡，不抽出來就檢查不到。
+func embeddedIPv4(ip net.IP) net.IP {
+	v6 := ip.To16()
+	if v6 == nil || ip.To4() != nil {
+		return nil // 不是 IPv6，或已經是 IPv4（呼叫端自己會檢查）
+	}
+	switch {
+	case sixToFourBlock.Contains(ip):
+		return net.IPv4(v6[2], v6[3], v6[4], v6[5]) // 2002:V4ADDR::/48
+	case nat64Block.Contains(ip), nat64LocalBlock.Contains(ip),
+		siitBlock.Contains(ip), v4CompatBlock.Contains(ip):
+		return net.IPv4(v6[12], v6[13], v6[14], v6[15]) // 尾端 32 bits
+	}
+	return nil
+}
 
 func mustCIDR(s string) *net.IPNet {
 	_, n, err := net.ParseCIDR(s)
@@ -199,7 +242,14 @@ func isPublicIP(ip net.IP) bool {
 		ip.IsInterfaceLocalMulticast() || ip.IsMulticast() ||
 		cgnatBlock.Contains(ip) || ietfProtocolBlock.Contains(ip) ||
 		benchmarkBlock.Contains(ip) || reservedBlock.Contains(ip) ||
-		nat64Block.Contains(ip) {
+		nat64Block.Contains(ip) || nat64LocalBlock.Contains(ip) ||
+		sixToFourBlock.Contains(ip) || v4CompatBlock.Contains(ip) ||
+		siitBlock.Contains(ip) {
+		return false
+	}
+	// 位址本身看起來是公網的，但它可能把一個內網 IPv4 包在裡面。抽出來再判
+	// 一次；抽不到就是真的沒包。
+	if v4 := embeddedIPv4(ip); v4 != nil && !isPublicIP(v4) {
 		return false
 	}
 	return true
@@ -278,10 +328,30 @@ func EnqueueTerminalCallbacks(root string, d *CallbackDispatcher) int {
 			validated[t.CallerID] = v
 		}
 		if v.err != nil {
-			log.Printf("a2a callback: %s 的目的地驗證失敗，放棄: %v", t.CallerID, v.err)
+			// 暫時性解析失敗不燒掉這則通知：留在 pending，下一輪再試，最多
+			// maxResolveAttempts 輪。計數放在行程記憶體裡——serve 重啟後重新
+			// 計數是可接受的，callback 本來就是 at-least-once。
+			if errors.Is(v.err, errCallbackResolveTransient) {
+				d.mu.Lock()
+				d.resolveFails[t.CallerID]++
+				n := d.resolveFails[t.CallerID]
+				d.mu.Unlock()
+				if n < maxResolveAttempts {
+					log.Printf("a2a callback: %s 解析暫時失敗（第 %d/%d 次），留待下一輪: %v",
+						t.CallerID, n, maxResolveAttempts, v.err)
+					continue
+				}
+				log.Printf("a2a callback: %s 解析連續失敗 %d 次，放棄: %v", t.CallerID, n, v.err)
+			} else {
+				log.Printf("a2a callback: %s 的目的地驗證失敗，放棄: %v", t.CallerID, v.err)
+			}
 			d.mark(t.ContextID, "failed")
 			continue
 		}
+		// 這個 caller 這一輪解析成功，清掉先前累積的暫時失敗計數。
+		d.mu.Lock()
+		delete(d.resolveFails, t.CallerID)
+		d.mu.Unlock()
 		payload := taskSnapshotPayload(t)
 		payload["event"] = "task.terminal"
 		body, merr := json.Marshal(payload)

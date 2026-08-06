@@ -3,6 +3,7 @@ package channelagent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -402,5 +403,52 @@ func TestCallbackDeliveryDoesNotLeakGoroutines(t *testing.T) {
 	// 訊,但增量絕不可以隨 n 縮放 —— 這正是舊版本洩漏的樣子。
 	if delta := after - baseline; delta > 5 {
 		t.Fatalf("goroutine count grew by %d after %d deliveries (baseline=%d, after=%d) — want it to stay flat, not scale with delivery count", delta, n, baseline, after)
+	}
+}
+
+// round-12-review 第二輪 Minor 1：其他把 IPv4 包進 IPv6 的編碼方式。逐段列
+// CIDR 會一直漏——擋掉 64:ff9b::/96 之後，Jool/Tayga 實際設定的 RFC 8215
+// local-use 前綴就從旁邊走過去。
+func TestIsPublicIPRejectsEmbeddedIPv4Encodings(t *testing.T) {
+	for _, s := range []string{
+		"::127.0.0.1",          // IPv4-compatible
+		"::ffff:0:127.0.0.1",   // SIIT translated
+		"2002:7f00:1::",        // 6to4 wrapping 127.0.0.1
+		"64:ff9b:1::7f00:1",    // RFC 8215 local-use NAT64
+		"64:ff9b::7f00:1",      // well-known NAT64
+		"::ffff:127.0.0.1",     // IPv4-mapped
+		"2002:0a00:0001::",     // 6to4 wrapping 10.0.0.1
+		"64:ff9b:1::a9fe:a9fe", // NAT64 wrapping the metadata address
+	} {
+		if isPublicIP(net.ParseIP(s)) {
+			t.Errorf("isPublicIP(%s) = true, want false", s)
+		}
+	}
+	for _, s := range []string{"2001:4860:4860::8888", "1.1.1.1", "2606:4700:4700::1111"} {
+		if !isPublicIP(net.ParseIP(s)) {
+			t.Errorf("isPublicIP(%s) = false, want true", s)
+		}
+	}
+}
+
+// round-12-review 第二輪 Minor 2：一次 DNS 打嗝不該把完成通知永久燒掉。傳輸
+// 錯誤有 3 次重試，解析失敗原本一次都沒有。
+func TestTransientResolveFailureIsRetriedThenGivesUp(t *testing.T) {
+	if !errors.Is(fmt.Errorf("%w: x", errCallbackResolveTransient), errCallbackResolveTransient) {
+		t.Fatal("transient resolve error must be identifiable with errors.Is")
+	}
+	// 解析得到但位址是內網 —— 設定錯誤，不是暫時性，重試沒有意義。
+	_, err := ValidateCallbackURL("https://hook.example.com/h", func(string) ([]net.IP, error) {
+		return []net.IP{net.ParseIP("10.0.0.1")}, nil
+	})
+	if err == nil || errors.Is(err, errCallbackResolveTransient) {
+		t.Fatalf("private address err = %v; must be permanent, not transient", err)
+	}
+	// 解析不出來 —— 暫時性。
+	_, err = ValidateCallbackURL("https://hook.example.com/h", func(string) ([]net.IP, error) {
+		return nil, errors.New("i/o timeout")
+	})
+	if !errors.Is(err, errCallbackResolveTransient) {
+		t.Fatalf("resolve failure err = %v; want transient", err)
 	}
 }
