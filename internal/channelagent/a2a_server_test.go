@@ -371,9 +371,9 @@ func TestOversizedBodyNeverProducesATask(t *testing.T) {
 
 // Task 12: every accepted/rejected delegation must leave a durable audit
 // trail — the endpoint is externally reachable with no interactive prompt,
-// so this log is the only record of who asked for what. Fix round: the
-// header's "every accepted/rejected delegation" promise covers five distinct
-// outcomes, each of which must be independently distinguishable in the log.
+// so this log is the only record of who asked for what. Fix rounds: the
+// header's "every accepted/rejected delegation" promise covers six distinct
+// outcomes, each independently distinguishable in the log.
 func TestServerWritesAuditOnAcceptAndDeny(t *testing.T) {
 	s, root := newTestA2AServer(t)
 
@@ -409,10 +409,22 @@ func TestServerWritesAuditOnAcceptAndDeny(t *testing.T) {
 	_ = SaveCallers(root, callers)
 	postRPC(t, s.Handler(), "secret-2", `{"jsonrpc":"2.0","id":5,"method":"message/send","params":{"agent":"codereview","contextId":"c4","text":"steal"}}`)
 
-	// 5: accepted but held at capacity — queued, not dispatched. Fill every
+	// 5: dispatch failure — the caller was authorized and the request was
+	// well-formed, but the executor errors. This branch mutates task state
+	// (TaskFailed) via SaveTasks, so it must not do so silently. The audit
+	// Summary must carry the caller's request text, never the executor's raw
+	// error (which can carry worktree paths / internal detail — the same leak
+	// already fixed once on the response path in TestDispatchFailureMessageIsGeneric).
+	secretErr := "worktree /home/conray/private-project: git checkout failed"
+	s.Executor = &failingExecutor{err: fmt.Errorf("%s", secretErr)}
+	postRPC(t, s.Handler(), "secret-1", `{"jsonrpc":"2.0","id":6,"method":"message/send","params":{"agent":"codereview","contextId":"c6","text":"please fail"}}`)
+
+	// 6: accepted but held at capacity — queued, not dispatched. Fill every
 	// sandbox slot directly (bypassing the RPC, matching the pattern used in
 	// a2a_lifecycle_test.go) so the next message/send is queued rather than
-	// started.
+	// started. Restore a working executor first so this path isn't confused
+	// with the dispatch-failure one above.
+	s.Executor = &StubExecutor{}
 	tasks, _ := LoadTasks(root)
 	for i := 0; i < MaxConcurrentSandboxes; i++ {
 		tasks.Upsert(A2ATask{ContextID: "full" + string(rune('a'+i)), Agent: "codereview", State: TaskWorking})
@@ -420,14 +432,14 @@ func TestServerWritesAuditOnAcceptAndDeny(t *testing.T) {
 	if err := SaveTasks(root, tasks); err != nil {
 		t.Fatalf("SaveTasks: %v", err)
 	}
-	postRPC(t, s.Handler(), "secret-1", `{"jsonrpc":"2.0","id":6,"method":"message/send","params":{"agent":"codereview","contextId":"c5","text":"hold please"}}`)
+	postRPC(t, s.Handler(), "secret-1", `{"jsonrpc":"2.0","id":7,"method":"message/send","params":{"agent":"codereview","contextId":"c5","text":"hold please"}}`)
 
 	entries, err := ReadAudit(root)
 	if err != nil {
 		t.Fatalf("ReadAudit: %v", err)
 	}
-	if len(entries) != 6 {
-		t.Fatalf("audit entries = %d, want 6: %#v", len(entries), entries)
+	if len(entries) != 7 {
+		t.Fatalf("audit entries = %d, want 7: %#v", len(entries), entries)
 	}
 
 	if entries[0].Outcome != "accepted" {
@@ -454,10 +466,22 @@ func TestServerWritesAuditOnAcceptAndDeny(t *testing.T) {
 	if entries[4].ContextID != "c4" {
 		t.Fatalf("hijack entry ContextID = %q, want c4", entries[4].ContextID)
 	}
-	if entries[5].Outcome != "queued" {
-		t.Fatalf("entry 5 outcome = %q, want queued", entries[5].Outcome)
+	if entries[5].Outcome != "dispatch_failed" {
+		t.Fatalf("entry 5 outcome = %q, want dispatch_failed", entries[5].Outcome)
 	}
-	if entries[5].Outcome == entries[0].Outcome || entries[5].Outcome == entries[3].Outcome {
+	if entries[5].Outcome == entries[0].Outcome || entries[5].Outcome == entries[1].Outcome || entries[5].Outcome == entries[2].Outcome || entries[5].Outcome == entries[4].Outcome {
+		t.Fatal("dispatch_failed must not share an outcome string with accepted or any forbidden_* outcome — the caller did nothing wrong here")
+	}
+	if entries[5].Summary != "please fail" {
+		t.Fatalf("dispatch-failure entry Summary = %q, want the caller's request text", entries[5].Summary)
+	}
+	if strings.Contains(entries[5].Summary, secretErr) || strings.Contains(entries[5].Summary, "private-project") || strings.Contains(entries[5].Summary, "git checkout") {
+		t.Fatalf("dispatch-failure audit entry leaked the executor's raw error: %#v", entries[5])
+	}
+	if entries[6].Outcome != "queued" {
+		t.Fatalf("entry 6 outcome = %q, want queued", entries[6].Outcome)
+	}
+	if entries[6].Outcome == entries[0].Outcome || entries[6].Outcome == entries[3].Outcome {
 		t.Fatal("a queued (not dispatched) task must not share an outcome string with an accepted (dispatched) task")
 	}
 }

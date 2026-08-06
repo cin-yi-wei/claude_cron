@@ -17,7 +17,6 @@ type AuditEntry struct {
 	TaskID    string `json:"task_id,omitempty"`
 	Summary   string `json:"summary"`
 	Outcome   string `json:"outcome"`
-	Branch    string `json:"branch,omitempty"`
 }
 
 func AuditPath(root string) string { return filepath.Join(root, "a2a-audit.jsonl") }

@@ -257,6 +257,22 @@ func (s *A2AServer) handleRPC(w http.ResponseWriter, r *http.Request) {
 		if serr := SaveTasks(s.Root, tasks); serr != nil {
 			log.Printf("a2a: failed to persist failed task state for %s/%s: %v", task.Agent, task.ContextID, serr)
 		}
+		// This branch mutates task state (TaskFailed) and must not do so without
+		// a trail. Distinct from both "accepted" and the "forbidden_*" family:
+		// the caller was authorized and the request was well-formed — the
+		// failure was ours, not theirs. Summary stays the caller's request
+		// text, same as every other entry; the executor's raw error (which can
+		// carry worktree paths and internal detail) goes only to log.Printf
+		// above and task.Detail, never into the audit trail.
+		_ = AppendAudit(s.Root, AuditEntry{
+			At:        time.Now().UTC().Format(time.RFC3339),
+			CallerID:  caller.CallerID,
+			Agent:     agent.Name,
+			ContextID: task.ContextID,
+			TaskID:    task.TaskID,
+			Summary:   p.Text,
+			Outcome:   "dispatch_failed",
+		})
 		writeRPC(w, RPCFail(req.ID, RPCInternalError, "dispatch failed"))
 		return
 	}
