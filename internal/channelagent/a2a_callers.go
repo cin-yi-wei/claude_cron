@@ -49,8 +49,10 @@ func LoadCallers(root string) (CallerStore, error) {
 	return s, nil
 }
 
+// SaveCallers 用 0600：這份檔案帶明文 bearer 憑證。AtomicWriteJSON 的預設
+// 0644 被 bindings.json 等共用，不能改，所以走 AtomicWriteJSONMode。
 func SaveCallers(root string, s CallerStore) error {
-	return AtomicWriteJSON(CallersPath(root), s)
+	return AtomicWriteJSONMode(CallersPath(root), s, 0o600)
 }
 
 func (s *CallerStore) Register(id, credential string) error {

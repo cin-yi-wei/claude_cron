@@ -267,5 +267,12 @@ func LoadConfig(root string) (Config, error) {
 	if err := ReadJSON(ConfigPath(root), &cfg); err != nil {
 		return Config{}, err
 	}
+	// A2AConfig 的 docstring 白紙黑字寫著 Listen MUST differ from the admin
+	// address，但從來沒有人驗證過。admin API 能建立可執行 shell 的 binding，
+	// 讓它跟對外監聽器共用位址等於把管理面公開出去。只在 A2A 啟用時檢查，
+	// 於是預設關閉的既有部署行為完全不變。
+	if cfg.A2A.Enabled && cfg.Admin.Listen != "" && cfg.A2AListen() == cfg.Admin.Listen {
+		return Config{}, fmt.Errorf("a2a.listen (%s) must differ from admin.listen: the admin API can create shell-capable bindings and must never be externally reachable", cfg.A2AListen())
+	}
 	return cfg, nil
 }

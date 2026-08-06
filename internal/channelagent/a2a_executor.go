@@ -237,13 +237,14 @@ func (e *SandboxExecutor) Start(ctx context.Context, task A2ATask, prompt string
 		return err
 	}
 
+	// Unique per message, not per context: IngestMessages dedups on
+	// platform:channel:messageID, so a constant ID would silently drop
+	// every follow-up in the same contextId.
+	msgID := nextInjectedMessageID(task.Session)
 	msg := SourceMessage{
 		Platform:  "a2a",
 		ChannelID: task.ContextID,
-		// Unique per message, not per context: IngestMessages dedups on
-		// platform:channel:messageID, so a constant ID would silently drop
-		// every follow-up in the same contextId.
-		MessageID: nextInjectedMessageID(task.Session),
+		MessageID: msgID,
 		AuthorID:  task.CallerID,
 		CreatedAt: time.Now().UTC().Format(time.RFC3339),
 		Content:   prompt,
@@ -252,6 +253,8 @@ func (e *SandboxExecutor) Start(ctx context.Context, task A2ATask, prompt string
 		e.markFailed(task, "inject: "+err.Error())
 		return err
 	}
+	// 記在 row 上，CollectResults 才有東西可以比對來源。
+	task.LastMessageID = msgID
 
 	// From this point the sandbox is genuinely running: EnsureWorkspace,
 	// Start and Inject all succeeded. a2a_server.go treats ANY non-nil error
@@ -375,13 +378,43 @@ func (e *SandboxExecutor) DeliverFollowUp(ctx context.Context, task A2ATask, pro
 	}
 
 	sandboxRoot := SandboxRoot(e.Root, task.Session)
+	msgID := nextInjectedMessageID(task.Session)
 	msg := SourceMessage{
 		Platform:  "a2a",
 		ChannelID: task.ContextID,
-		MessageID: nextInjectedMessageID(task.Session),
+		MessageID: msgID,
 		AuthorID:  task.CallerID,
 		CreatedAt: time.Now().UTC().Format(time.RFC3339),
 		Content:   prompt,
 	}
-	return e.Sessions.Inject(ctx, sandboxRoot, msg)
+	if err := e.Sessions.Inject(ctx, sandboxRoot, msg); err != nil {
+		return err
+	}
+
+	// 跟 Start 同一個道理：CollectResults 用 LastMessageID 比對結果檔的來源，
+	// 沒有這一筆，這則追問的回覆永遠對不上、卡死在 working（buildJobID 把
+	// 每一則被處理的訊息自己的 MessageID 刻進 job_id，追問跟最初派送用的是
+	// 兩個不同的 MessageID）。這裡多一個窗口：session 鎖只擋得住拆除，擋不
+	// 住 hard-timeout 這種純記憶體、不必先拿 session 鎖的狀態轉移，所以落地
+	// 前必須重新核對身分（TaskID + Session）仍然一致 —— 不一致就放棄，寧可
+	// 讓這筆追問的結果永遠沒有機會被撿到，也不能把 LastMessageID 蓋到一個已
+	// 經不是它的 row 上。
+	_ = WithTasks(e.Root, func(tasks *TaskStore) error {
+		cur, ok := tasks.ByContext(task.ContextID)
+		if !ok || cur.TaskID != task.TaskID || cur.Session != task.Session {
+			return errFollowUpIdentityChanged
+		}
+		cur.LastMessageID = msgID
+		tasks.Upsert(cur)
+		return nil
+	})
+	return nil
 }
+
+// errFollowUpIdentityChanged signals, from inside a WithTasks callback, that
+// the row no longer matches the identity DeliverFollowUp started with — the
+// re-check right before recording LastMessageID. Returning it makes WithTasks
+// discard the write rather than stamping a stale MessageID onto a row that a
+// resubmission or a hard-timeout cancel already moved on from while the
+// Inject call above was in flight (outside any lock).
+var errFollowUpIdentityChanged = errors.New("a2a: follow-up target changed identity before LastMessageID could be recorded")

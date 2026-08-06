@@ -59,3 +59,18 @@ func TestSaveAndLoadConfig(t *testing.T) {
 		t.Fatalf("loaded config = %#v", got)
 	}
 }
+
+// A2AConfig 的 docstring 白紙黑字寫著 Listen MUST differ from the admin
+// address，但從來沒有人驗證過。
+func TestLoadConfigRejectsA2AOnTheAdminAddress(t *testing.T) {
+	root := t.TempDir()
+	if err := AtomicWriteJSON(ConfigPath(root), map[string]any{
+		"admin": map[string]any{"listen": "127.0.0.1:8787", "token": "t"},
+		"a2a":   map[string]any{"enabled": true, "listen": "127.0.0.1:8787"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(root); err == nil {
+		t.Fatal("a2a.listen equal to admin.listen must be refused at load time")
+	}
+}

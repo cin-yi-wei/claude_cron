@@ -7,13 +7,18 @@ import (
 	"time"
 )
 
+// resultMsgID is the fixed LastMessageID every writeSandboxResult fixture's
+// job_id is built from, so tasks that need CollectResults to actually accept
+// their result set LastMessageID: resultMsgID.
+const resultMsgID = "msg1"
+
 func writeSandboxResult(t *testing.T, root, session, text string) {
 	t.Helper()
 	dir := pathIn(SandboxRoot(root, session), "outbox", "pending")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	job := OutputJob{Schema: 1, JobID: "r1", Send: true, Text: text}
+	job := OutputJob{Schema: 1, JobID: "20260101T000000Z-" + resultMsgID + "-abcdef012345", Send: true, Text: text}
 	if err := AtomicWriteJSON(filepath.Join(dir, "r1.json"), job); err != nil {
 		t.Fatalf("write result: %v", err)
 	}
@@ -23,7 +28,7 @@ func TestCollectResultsCompletesTaskWhenResultAppears(t *testing.T) {
 	root := t.TempDir()
 	session := SessionNameFor("codereview", "c1")
 	var tasks TaskStore
-	tasks.Upsert(A2ATask{ContextID: "c1", Agent: "codereview", Session: session, State: TaskWorking})
+	tasks.Upsert(A2ATask{ContextID: "c1", Agent: "codereview", Session: session, State: TaskWorking, LastMessageID: resultMsgID})
 	if err := SaveTasks(root, tasks); err != nil {
 		t.Fatalf("SaveTasks: %v", err)
 	}
@@ -102,7 +107,7 @@ func TestCollectResultsMovesConsumedResultFile(t *testing.T) {
 	root := t.TempDir()
 	session := SessionNameFor("codereview", "c1")
 	var tasks TaskStore
-	tasks.Upsert(A2ATask{ContextID: "c1", Agent: "codereview", Session: session, State: TaskWorking})
+	tasks.Upsert(A2ATask{ContextID: "c1", Agent: "codereview", Session: session, State: TaskWorking, LastMessageID: resultMsgID})
 	if err := SaveTasks(root, tasks); err != nil {
 		t.Fatalf("SaveTasks: %v", err)
 	}
@@ -139,7 +144,7 @@ func TestCollectResultsDoesNotResurrectOnContextReuse(t *testing.T) {
 	root := t.TempDir()
 	session := SessionNameFor("codereview", "c1")
 	var tasks TaskStore
-	tasks.Upsert(A2ATask{ContextID: "c1", Agent: "codereview", Session: session, State: TaskWorking})
+	tasks.Upsert(A2ATask{ContextID: "c1", Agent: "codereview", Session: session, State: TaskWorking, LastMessageID: resultMsgID})
 	if err := SaveTasks(root, tasks); err != nil {
 		t.Fatalf("SaveTasks: %v", err)
 	}
@@ -181,5 +186,95 @@ func TestCollectResultsDoesNotResurrectOnContextReuse(t *testing.T) {
 	tk, _ := got.ByContext("c1")
 	if tk.State != TaskWorking {
 		t.Fatalf("reused-context task state = %s, want working (resurrected off a stale result file)", tk.State)
+	}
+}
+
+// failed 沙盒依 forensics 規則保留，session 名又是 contextId 的確定性函式：
+// 同一 caller 之後重用該 contextId 時，殘留在 outbox/pending 的舊結果檔會立刻
+// 把新任務判為完成。
+func TestCollectResultsIgnoresStaleResultFiles(t *testing.T) {
+	root := t.TempDir()
+	session := SessionNameFor("a", "c1")
+	sandbox := SandboxRoot(root, session)
+	if err := Init(sandbox); err != nil {
+		t.Fatal(err)
+	}
+	// 上一輪任務留下的結果檔，job_id 屬於一則早已不存在的訊息。
+	if err := AtomicWriteJSON(pathIn(sandbox, "outbox", "pending", "old.json"), OutputJob{
+		Schema: 1, JobID: "20260101T000000Z-stalemsg-abcdef012345", Send: true, Text: "stale answer",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var s TaskStore
+	s.Upsert(A2ATask{
+		ContextID: "c1", TaskID: "t-new", Agent: "a", Session: session, State: TaskWorking,
+		LastMessageID: session + "-1700000000000000000-7",
+	})
+	_ = SaveTasks(root, s)
+
+	n, err := CollectResults(root, time.Now())
+	if err != nil {
+		t.Fatalf("CollectResults: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("promoted %d task(s) from a stale result file", n)
+	}
+	got, _ := LoadTasks(root)
+	tk, _ := got.ByContext("c1")
+	if tk.State != TaskWorking {
+		t.Fatalf("state = %q, want working", tk.State)
+	}
+}
+
+func TestCollectResultsAcceptsItsOwnResultFile(t *testing.T) {
+	root := t.TempDir()
+	session := SessionNameFor("a", "c1")
+	sandbox := SandboxRoot(root, session)
+	_ = Init(sandbox)
+
+	msgID := session + "-1700000000000000000-7"
+	if err := AtomicWriteJSON(pathIn(sandbox, "outbox", "pending", "mine.json"), OutputJob{
+		Schema: 1, JobID: "20260806T101112Z-" + sanitize(msgID) + "-abcdef012345", Send: true, Text: "done",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var s TaskStore
+	s.Upsert(A2ATask{
+		ContextID: "c1", TaskID: "t1", Agent: "a", Session: session, State: TaskWorking,
+		LastMessageID: msgID,
+	})
+	_ = SaveTasks(root, s)
+
+	if n, err := CollectResults(root, time.Now()); err != nil || n != 1 {
+		t.Fatalf("promoted = %d err = %v, want 1", n, err)
+	}
+	got, _ := LoadTasks(root)
+	tk, _ := got.ByContext("c1")
+	if tk.State != TaskCompleted || tk.Detail != "done" {
+		t.Fatalf("task = %#v", tk)
+	}
+	// 搬檔仍然發生（下次不會再被讀到），但它在鎖外做。
+	if _, err := os.Stat(pathIn(sandbox, "outbox", "pending", "mine.json")); err == nil {
+		t.Fatal("the consumed result file must be moved out of pending")
+	}
+}
+
+// 壞掉的結果檔不能每 10 秒被重讀一次直到永遠。
+func TestCollectResultsQuarantinesUnreadableResultFiles(t *testing.T) {
+	root := t.TempDir()
+	session := SessionNameFor("a", "c1")
+	sandbox := SandboxRoot(root, session)
+	_ = Init(sandbox)
+	if err := os.WriteFile(pathIn(sandbox, "outbox", "pending", "broken.json"), []byte("{not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var s TaskStore
+	s.Upsert(A2ATask{ContextID: "c1", TaskID: "t1", Agent: "a", Session: session, State: TaskWorking, LastMessageID: "m"})
+	_ = SaveTasks(root, s)
+
+	_, _ = CollectResults(root, time.Now())
+	if _, err := os.Stat(pathIn(sandbox, "outbox", "failed", "broken.json")); err != nil {
+		t.Fatalf("an unreadable result file must be moved to outbox/failed: %v", err)
 	}
 }

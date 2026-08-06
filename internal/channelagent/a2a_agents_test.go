@@ -105,3 +105,46 @@ func TestAgentStoreEnabledFiltersDisabled(t *testing.T) {
 		t.Fatalf("Enabled() = %#v", got)
 	}
 }
+
+// Add 會驗證名字，但 Add 沒有正式呼叫端 —— agents.json 目前只能手寫，所以
+// 驗證必須在 Load 這一側。含 '/' 或 '..' 的名字會流進 SessionNameFor →
+// SandboxRoot / SandboxWorktree 與 tmux session 名。
+func TestLoadAgentsSkipsInvalidNames(t *testing.T) {
+	root := t.TempDir()
+	if err := AtomicWriteJSON(AgentsPath(root), map[string]any{"agents": []map[string]any{
+		{"name": "pm", "project_dir": "/p/pm", "enabled": true},
+		{"name": "../../etc", "project_dir": "/p/x", "enabled": true},
+		{"name": "Bad Name", "project_dir": "/p/y", "enabled": true},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadAgents(root)
+	if err != nil {
+		t.Fatalf("LoadAgents: %v", err)
+	}
+	if len(got.Agents) != 1 || got.Agents[0].Name != "pm" {
+		t.Fatalf("agents = %#v, want only pm", got.Agents)
+	}
+}
+
+// 「唯讀輸出」這個不變量目前只靠慣例維持。一個 ChannelID 與某 binding 相同的
+// agent 會讓 dcRoute 把該頻道的人類訊息吃進那個 cc- session。
+func TestLoadAgentsSkipsAgentsSharingABindingChannel(t *testing.T) {
+	root := filepath.Join(t.TempDir(), ".channel-agent")
+	if err := Init(root); err != nil {
+		t.Fatal(err)
+	}
+	seedBinding(t, root, Binding{Name: "w", ChannelID: "chan-1", Worktree: t.TempDir(), Root: pathIn(root, "bindings", "w")})
+
+	var agents AgentStore
+	_ = agents.Add(Agent{Name: "pm", ProjectDir: "/p/pm", ChannelID: "chan-1", Enabled: true})
+	_ = agents.Add(Agent{Name: "ok", ProjectDir: "/p/ok", ChannelID: "chan-2", Enabled: true})
+	if err := SaveAgents(root, agents); err != nil {
+		t.Fatal(err)
+	}
+
+	got, _ := LoadAgents(root)
+	if len(got.Agents) != 1 || got.Agents[0].Name != "ok" {
+		t.Fatalf("agents = %#v; an agent sharing a binding channel must be dropped", got.Agents)
+	}
+}

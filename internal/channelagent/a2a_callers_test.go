@@ -1,6 +1,9 @@
 package channelagent
 
-import "testing"
+import (
+	"os"
+	"testing"
+)
 
 func TestCallerRegisterStartsPending(t *testing.T) {
 	var s CallerStore
@@ -101,5 +104,22 @@ func TestCallerStoreRoundTrip(t *testing.T) {
 	}
 	if _, ok := got.Authenticate("secret-1"); !ok {
 		t.Fatal("approved caller lost across round-trip")
+	}
+}
+
+// callers.json 帶明文 bearer 憑證，不可以世界可讀。
+func TestSaveCallersIsPrivate(t *testing.T) {
+	root := t.TempDir()
+	var s CallerStore
+	_ = s.Register("peer-a", "super-secret")
+	if err := SaveCallers(root, s); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(CallersPath(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("callers.json mode = %o, want 0600", got)
 	}
 }

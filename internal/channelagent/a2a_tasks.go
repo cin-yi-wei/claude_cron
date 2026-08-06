@@ -69,6 +69,11 @@ type A2ATask struct {
 	// 試，成功了才清掉；不論成功與否都完全不動 Session/Worktree（鑑識保留
 	// 不受影響，round 10 review, Important）。
 	SessionStopPending bool `json:"session_stop_pending,omitempty"`
+	// LastMessageID 是最後一次注入這個沙盒的 SourceMessage.MessageID。
+	// pendingResultFile 用它比對結果檔的來源 —— session 名是 contextId 的
+	// 確定性函式，failed 沙盒又依 forensics 規則保留，沒有這個比對，殘留在
+	// outbox/pending 的舊結果檔會把重用同一 contextId 的新任務立刻判為完成。
+	LastMessageID string `json:"last_message_id,omitempty"`
 }
 
 type TaskStore struct {

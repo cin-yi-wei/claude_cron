@@ -3,6 +3,7 @@ package channelagent
 import (
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -36,6 +37,16 @@ var a2aNameRe = regexp.MustCompile(`^[a-z0-9-]+$`)
 
 func AgentsPath(root string) string { return filepath.Join(root, "agents.json") }
 
+// LoadAgents 讀 agents.json，並在回傳前套用兩條驗證。Add 已經驗證過名字，但
+// Add 沒有正式呼叫端（agents.json 目前只能手寫），所以驗證必須在這一側。
+//
+//  1. 名字必須符合 a2aNameRe：含 '/' 或 '..' 的名字會流進 SessionNameFor →
+//     SandboxRoot / SandboxWorktree 與 tmux session 名。
+//  2. ChannelID 不得與任何 binding 的 channel 相同：那會讓 dcRoute
+//     （supervisor.go）把該頻道的人類訊息吃進那個 cc- session，破壞「agent
+//     頻道唯讀輸出」這個不變量。bindings.json 只讀不寫。
+//
+// 兩者都是「跳過並 log」而不是整份載入失敗：一個手寫錯誤不該讓所有 agent 消失。
 func LoadAgents(root string) (AgentStore, error) {
 	var s AgentStore
 	if err := ReadJSON(AgentsPath(root), &s); err != nil {
@@ -44,6 +55,27 @@ func LoadAgents(root string) (AgentStore, error) {
 		}
 		return AgentStore{}, err
 	}
+	bindingChannels := map[string]string{}
+	if reg, err := LoadRegistry(root); err == nil {
+		for _, b := range reg.Bindings {
+			if b.ChannelID != "" {
+				bindingChannels[b.ChannelID] = b.Name
+			}
+		}
+	}
+	kept := s.Agents[:0]
+	for _, a := range s.Agents {
+		if !a2aNameRe.MatchString(a.Name) {
+			log.Printf("a2a: 跳過 agent %q：名稱不合法（只允許小寫字母、數字、連字號）", a.Name)
+			continue
+		}
+		if name, clash := bindingChannels[a.ChannelID]; a.ChannelID != "" && clash {
+			log.Printf("a2a: 跳過 agent %q：它的 channel_id 與 binding %q 相同，那會讓該頻道的人類訊息被 ingest 進 cc- session", a.Name, name)
+			continue
+		}
+		kept = append(kept, a)
+	}
+	s.Agents = kept
 	return s, nil
 }
 
