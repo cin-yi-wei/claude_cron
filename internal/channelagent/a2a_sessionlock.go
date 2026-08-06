@@ -1,0 +1,96 @@
+package channelagent
+
+import "sync"
+
+// sandboxSessionLocks 讓「使用某個 session 名的沙盒」（建立、追問投遞）與
+// 「拆除同一個 session 名的沙盒」不可能同時進行。
+//
+// 為什麼光靠帳面比對不夠：sweep 第 2 步的三個破壞動作（sm.Stop、
+// sm.RemoveWorkspace、os.RemoveAll(SandboxRoot(...))）是對第 1 步記下的
+// 「確定性路徑」執行的。contextId 由呼叫方選、SessionNameFor 與
+// SandboxWorktree 都是它的確定性函式，所以合法的同 contextId 追問會落在完全
+// 相同的路徑上 —— 新起的 session 會被殺、新建的 worktree 會被 --force 刪，而
+// row 完好地指向已不存在的東西，一路掛到 2 小時硬逾時。
+//
+// 只做身分重確認（D3(b)）仍有窗口（確認完到動手之間），只做這把鎖（D3(a)）
+// 擋不住跨行程；兩者一起才完整。
+//
+// 為什麼是 RWMutex 而不是單純的 Mutex：「使用」這個 session 的動作不只一種
+// ——SandboxExecutor.Start 在建立(可能長達 90 秒),SandboxExecutor.DeliverFollowUp
+// 在既有的 dispatching/working row 上投遞追問。這兩者彼此必須可以同時存在:
+// 一個追問送達的時候,同一個 session 的 Start 完全可能還卡在 EnsureWorkspace
+// 裡(這正是既有測試 TestFollowUpDuringInFlightDrainQueueDispatchDoesNotDoubleDispatch
+// 釘住的行為 —— 追問不等整個派送做完就必須送達)。如果兩者搶同一把單純
+// mutex,追問會被迫等到整個派送結束才能送,舊有的、必須維持綠燈的測試就會
+// 死鎖。所以「使用」用共享鎖(RLock):Start 與 DeliverFollowUp 可以並存;
+// sweep 第 2 步的拆除動作用互斥鎖(Lock):它必須等所有正在使用這個 session
+// 的呼叫都放手才能動手,而且一旦它拿到鎖,任何新的使用者都要等它做完
+// (做完之後,一個晚到的 DeliverFollowUp 會在鎖內重新確認 row 還活著,看到
+// row 已經被 sweep 清空就直接拒絕投遞 —— 不會把剛刪掉的目錄重建回來)。
+//
+// 鎖序（違反即死鎖）：lockSandboxSession 系列 → tasksMu。
+// SandboxExecutor.Start、SandboxExecutor.DeliverFollowUp 與 sweep 第 2 步都
+// 照這個順序；WithTasks 的 callback 內永遠不得取得 session 鎖。
+type sessionLock struct {
+	mu   sync.RWMutex
+	refs int
+}
+
+var sandboxSessionLocks = struct {
+	mu sync.Mutex
+	m  map[string]*sessionLock
+}{m: map[string]*sessionLock{}}
+
+// acquireSessionLock 找到（或建立）session 名對應的 *sessionLock，並在
+// sandboxSessionLocks.mu 底下把 refs 加一，好讓釋放時知道能不能刪掉這個
+// map 項目。真正的 RLock/Lock 由呼叫方在拿到 *sessionLock 之後自己做——這一
+// 步只保證同一個 session 名永遠拿到同一個 *sessionLock 物件。
+func acquireSessionLock(session string) *sessionLock {
+	sandboxSessionLocks.mu.Lock()
+	defer sandboxSessionLocks.mu.Unlock()
+	l, ok := sandboxSessionLocks.m[session]
+	if !ok {
+		l = &sessionLock{}
+		sandboxSessionLocks.m[session] = l
+	}
+	l.refs++
+	return l
+}
+
+// releaseSessionLock 是 acquireSessionLock 的另一半：refs 計數讓最後一個
+// 釋放者刪掉 map 項目——contextId 由呼叫方選，沒有這個清理，長期執行下 map
+// 會無上限成長。
+func releaseSessionLock(session string, l *sessionLock) {
+	sandboxSessionLocks.mu.Lock()
+	defer sandboxSessionLocks.mu.Unlock()
+	l.refs--
+	if l.refs == 0 {
+		delete(sandboxSessionLocks.m, session)
+	}
+}
+
+// lockSandboxSession 取得 session 名的共享鎖（RLock），供「使用」這個
+// session 的呼叫方使用（建立中的 SandboxExecutor.Start、投遞追問的
+// SandboxExecutor.DeliverFollowUp）。多個使用者可以同時持有；只有
+// lockSandboxSessionForTeardown 的互斥鎖會被它們擋住，彼此之間不會。
+func lockSandboxSession(session string) func() {
+	l := acquireSessionLock(session)
+	l.mu.RLock()
+	return func() {
+		l.mu.RUnlock()
+		releaseSessionLock(session, l)
+	}
+}
+
+// lockSandboxSessionForTeardown 取得 session 名的互斥鎖（Lock），只供 sweep
+// 第 2 步的拆除動作使用：必須等所有正在使用這個 session 的
+// Start/DeliverFollowUp 呼叫都釋放共享鎖之後才能拿到，且拿到之後任何新的
+// 使用者都要等它做完，才能繼續（那時它們會在鎖內重新確認 row 是否還活著）。
+func lockSandboxSessionForTeardown(session string) func() {
+	l := acquireSessionLock(session)
+	l.mu.Lock()
+	return func() {
+		l.mu.Unlock()
+		releaseSessionLock(session, l)
+	}
+}

@@ -82,10 +82,27 @@ var errTaskAlreadyTerminal = errors.New("task already reached a terminal state")
 // silently revive the row back to task.State (task-8 review round 2,
 // latent-issue finding — unreachable today, but task 11 adds a sweep that
 // would hit it).
+//
+// Prompt is NOT this call's to overwrite (task 7 review finding,
+// a2a_executor.go:156): task is Start's OWN claim-time copy, taken back when
+// DrainQueue (or the handler) first claimed this dispatch. A follow-up
+// (a2a_server.go's message/send follow-up path) can merge a newer Prompt
+// onto this exact row while Start is still between that claim and this call
+// — Start holds the session lock across its whole build, but the follow-up
+// path never needs it (it only touches the row's Prompt field, under
+// tasksMu, before this call ever runs). Blindly Upserting task here would
+// silently regress Prompt back to the stale claim-time value, discarding
+// what the follow-up just recorded — exactly the same class of bug the final
+// locked block in Start (which does `task.Prompt = cur.Prompt`) exists to
+// avoid, just one write earlier. The store's current Prompt is always the
+// latest one actually observed; keep it whenever a row already exists.
 func (e *SandboxExecutor) persist(task A2ATask) error {
 	return WithTasks(e.Root, func(tasks *TaskStore) error {
-		if cur, ok := tasks.ByContext(task.ContextID); ok && isTerminal(cur.State) {
-			return errTaskAlreadyTerminal
+		if cur, ok := tasks.ByContext(task.ContextID); ok {
+			if isTerminal(cur.State) {
+				return errTaskAlreadyTerminal
+			}
+			task.Prompt = cur.Prompt
 		}
 		tasks.Upsert(task)
 		return nil
@@ -125,6 +142,13 @@ func (e *SandboxExecutor) markFailed(task A2ATask, detail string) {
 }
 
 func (e *SandboxExecutor) Start(ctx context.Context, task A2ATask, prompt string) error {
+	// 整段建立過程持有 session 鎖，於是 sweep 不可能在中途把同名 session 的
+	// worktree / sandbox root 拆掉（task 7, D3）。鎖序：session 鎖 →
+	// tasksMu（下面的 persist / WithTasks），全程不得反向 —— WithTasks 的
+	// callback 內永遠不得取得 session 鎖。
+	unlock := lockSandboxSession(task.Session)
+	defer unlock()
+
 	agents, err := LoadAgents(e.Root)
 	if err != nil {
 		return fmt.Errorf("load agents: %w", err)
@@ -292,6 +316,11 @@ func (e *SandboxExecutor) Start(ctx context.Context, task A2ATask, prompt string
 	return nil
 }
 
+// errFollowUpTargetGone signals that, by the time DeliverFollowUp actually
+// tried to deliver, the row it was handed no longer matches a live
+// dispatch — see the staleness re-check below.
+var errFollowUpTargetGone = errors.New("a2a: follow-up target is no longer a live dispatch")
+
 // DeliverFollowUp injects prompt directly into an already-dispatched task's
 // sandbox inbox — no EnsureWorkspace, no TrustFolder, no policy rewrite, no
 // Sessions.Start. handleRPC calls this ONLY for a task it found already in
@@ -303,7 +332,43 @@ func (e *SandboxExecutor) Start(ctx context.Context, task A2ATask, prompt string
 // race task 6 review round 2 found. This never touches task.State: that
 // belongs entirely to whichever call is actually running the dispatch this
 // message is following up on.
+//
+// task carries the row as it stood when handleRPC read it, under tasksMu,
+// BEFORE releasing that lock and calling this method outside it (Inject
+// touches the filesystem and must never run while tasksMu is held). Between
+// that read and the Inject call below, SweepTimeouts can run to completion
+// for this exact session: a task sitting in TaskWorking past HardTimeout is
+// canceled and reclaimed in the very same sweep pass (a2a_lifecycle.go), so
+// task's snapshot can go stale without ever being terminal at read time. If
+// it does, e.Sessions.Inject's underlying IngestMessages calls Init(root)
+// unconditionally — that would recreate sandboxes/<session>/ right after
+// sweep just removed it, leaving a directory holding a pending job that
+// nothing will ever reclaim (task 7 review finding, a2a_server.go:389). The
+// lock below is what makes the re-check race-free rather than merely
+// reducing the odds of losing: sweep's own removal (a2a_lifecycle.go) takes
+// the same session lock before its destructive phase, so either this
+// re-check runs first and wins the lock for the whole Inject call (sweep
+// then blocks until it's done, so nothing can remove out from under it), or
+// sweep's removal already ran and this re-check observes the row's new,
+// non-live state and refuses to deliver. The message itself is then simply
+// dropped (logged by the caller) — accepting that loss is explicitly out of
+// this task's scope; only the directory resurrection is.
 func (e *SandboxExecutor) DeliverFollowUp(ctx context.Context, task A2ATask, prompt string) error {
+	unlock := lockSandboxSession(task.Session)
+	defer unlock()
+
+	live := false
+	_ = WithTasks(e.Root, func(tasks *TaskStore) error {
+		if cur, ok := tasks.ByContext(task.ContextID); ok {
+			live = cur.TaskID == task.TaskID && cur.Session == task.Session &&
+				(cur.State == TaskDispatching || cur.State == TaskWorking)
+		}
+		return errNothingSwept // 只讀不寫，讓 WithTasks 跳過存檔
+	})
+	if !live {
+		return fmt.Errorf("%w: contextId %s", errFollowUpTargetGone, task.ContextID)
+	}
+
 	sandboxRoot := SandboxRoot(e.Root, task.Session)
 	msg := SourceMessage{
 		Platform:  "a2a",

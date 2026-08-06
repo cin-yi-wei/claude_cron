@@ -325,7 +325,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 					if _, err := agent.CollectResults(*root, time.Now()); err != nil {
 						fmt.Fprintf(stdout, "a2a collect: %v\n", err)
 					}
-					if _, _, err := agent.SweepTimeouts(supCtx, *root, agent.TmuxSessionManager{}, time.Now()); err != nil {
+					if _, _, err := agent.SweepTimeouts(supCtx, *root, agent.TmuxSessionManager{}, time.Now(), driver); err != nil {
 						fmt.Fprintf(stdout, "a2a sweep: %v\n", err)
 					}
 					if _, err := agent.DrainQueue(supCtx, *root, ex); err != nil {

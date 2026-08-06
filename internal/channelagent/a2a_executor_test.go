@@ -254,6 +254,78 @@ func TestSandboxExecutorPersistGuardRefusesToReviveTerminalRow(t *testing.T) {
 	}
 }
 
+// TestPersistDoesNotRegressPromptMergedWhileClaimIsInFlight pins a task 7
+// review finding (a2a_executor.go:156, carried over from task 6): persist()
+// used to Upsert task wholesale — Start's OWN claim-time copy, taken back
+// when DrainQueue first claimed this dispatch. A follow-up
+// (a2a_server.go's message/send follow-up path) can land on the very same
+// row and merge a newer Prompt onto it while Start is still between that
+// claim and its own persist() call — Start does not hold tasksMu across that
+// whole span, only around each individual WithTasks call, and the
+// follow-up path never needs the session lock (it only ever touches Prompt,
+// under tasksMu). Interleaving: DrainQueue claims c1 (Prompt "first") and
+// enters Start; a follow-up merges Prompt to "follow up"; Start then reaches
+// persist and, pre-fix, wrote Prompt "first" straight back over it.
+//
+// This is proved with a real goroutine, not a hand-simulated sequence: the
+// test goroutine calling persist() is forced to block on tasksMu (grabbed
+// directly, bypassing WithTasks) until the main goroutine has performed the
+// "follow-up" write and released it — a deterministic hold on the exact
+// window persist() runs in, not a timing gamble. Because tasksMu excludes
+// all access to the store, there is no race for -race to flag; what's under
+// test is pure ordering, and the mutex is what makes that ordering
+// unambiguous rather than probabilistic.
+func TestPersistDoesNotRegressPromptMergedWhileClaimIsInFlight(t *testing.T) {
+	root := t.TempDir()
+	claimTime := A2ATask{
+		ContextID: "c1", TaskID: "t1", Agent: "codereview", CallerID: "peer-a",
+		Session: SessionNameFor("codereview", "c1"), State: TaskDispatching,
+		Level: GrantReadOnly, Prompt: "first",
+	}
+	seedTask(t, root, claimTime)
+
+	ex := NewSandboxExecutor(root, &FakeSessionManager{})
+
+	// 直接搶下 tasksMu(套件內測試可以碰,而 persist 底下的 WithTasks 一定要
+	// 這把鎖才能往下走),逼下面那條呼叫 persist 的 goroutine 卡在它自己的
+	// Lock() 裡 —— 不管排程怎麼跑,它在我們放手之前絕對碰不到 tasks.json。
+	tasksMu.Lock()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- ex.persist(claimTime) // task.Prompt == "first",Start 拿到的舊副本
+	}()
+
+	// 模擬追問在這個窗口內把 Prompt 併過去。因為我們自己握著 tasksMu,直接
+	// 讀寫檔案是安全的(等同 a2a_server.go 的 isFollowUp 分支在 WithTasks
+	// 內做的事,只是這裡沒有巢狀鎖的問題,因為呼叫的是底層 Load/Save 而不是
+	// 再進一次 WithTasks)。
+	live, err := LoadTasks(root)
+	if err != nil {
+		t.Fatalf("LoadTasks: %v", err)
+	}
+	cur, ok := live.ByContext("c1")
+	if !ok {
+		t.Fatal("seeded row must exist")
+	}
+	cur.Prompt = "follow up"
+	live.Upsert(cur)
+	if err := SaveTasks(root, live); err != nil {
+		t.Fatalf("SaveTasks: %v", err)
+	}
+
+	tasksMu.Unlock()
+	if err := <-done; err != nil {
+		t.Fatalf("persist: %v", err)
+	}
+
+	got, _ := LoadTasks(root)
+	tk, _ := got.ByContext("c1")
+	if tk.Prompt != "follow up" {
+		t.Fatalf("Prompt = %q, want %q (persist must not overwrite a follow-up merged after its claim-time copy was taken)", tk.Prompt, "follow up")
+	}
+}
+
 // cancelDuringInject wraps FakeSessionManager and, immediately after a
 // successful Inject, flips the on-disk task row to TaskCanceled —
 // simulating an external actor canceling the task in the narrow window

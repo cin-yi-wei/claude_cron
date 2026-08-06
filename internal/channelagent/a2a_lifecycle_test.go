@@ -131,7 +131,7 @@ func TestSweepDoesNotCancelBeforeHardTimeout(t *testing.T) {
 	_ = SaveTasks(root, s)
 
 	fake := &FakeSessionManager{}
-	canceled, _, err := SweepTimeouts(context.Background(), root, fake, now)
+	canceled, _, err := SweepTimeouts(context.Background(), root, fake, now, nil)
 	if err != nil {
 		t.Fatalf("SweepTimeouts: %v", err)
 	}
@@ -156,7 +156,7 @@ func TestSweepCancelsAfterHardTimeout(t *testing.T) {
 	_ = SaveTasks(root, s)
 
 	fake := &FakeSessionManager{}
-	canceled, _, err := SweepTimeouts(context.Background(), root, fake, now)
+	canceled, _, err := SweepTimeouts(context.Background(), root, fake, now, nil)
 	if err != nil {
 		t.Fatalf("SweepTimeouts: %v", err)
 	}
@@ -195,7 +195,7 @@ func TestSweepPreservesPriorDetailOnHardTimeout(t *testing.T) {
 	_ = SaveTasks(root, s)
 
 	fake := &FakeSessionManager{}
-	canceled, _, err := SweepTimeouts(context.Background(), root, fake, now)
+	canceled, _, err := SweepTimeouts(context.Background(), root, fake, now, nil)
 	if err != nil {
 		t.Fatalf("SweepTimeouts: %v", err)
 	}
@@ -231,7 +231,7 @@ func TestSweepReclaimsCompletedAfterRetention(t *testing.T) {
 	_ = SaveTasks(root, s)
 
 	fake := &FakeSessionManager{}
-	_, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now)
+	_, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now, nil)
 	if err != nil {
 		t.Fatalf("SweepTimeouts: %v", err)
 	}
@@ -254,7 +254,7 @@ func TestSweepLeavesFailedSandboxForensics(t *testing.T) {
 	_ = SaveTasks(root, s)
 
 	fake := &FakeSessionManager{}
-	if _, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now); err != nil || reclaimed != 0 {
+	if _, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now, nil); err != nil || reclaimed != 0 {
 		t.Fatalf("failed sandboxes must be kept: reclaimed=%d err=%v", reclaimed, err)
 	}
 	if len(fake.Stopped) != 0 {
@@ -278,7 +278,7 @@ func TestSweepCancelsWorkingTaskWithEmptyStartedAt(t *testing.T) {
 	_ = SaveTasks(root, s)
 
 	fake := &FakeSessionManager{}
-	canceled, _, err := SweepTimeouts(context.Background(), root, fake, now)
+	canceled, _, err := SweepTimeouts(context.Background(), root, fake, now, nil)
 	if err != nil {
 		t.Fatalf("SweepTimeouts: %v", err)
 	}
@@ -311,7 +311,7 @@ func TestSweepCancelsWorkingTaskWithGarbageStartedAt(t *testing.T) {
 	_ = SaveTasks(root, s)
 
 	fake := &FakeSessionManager{}
-	canceled, _, err := SweepTimeouts(context.Background(), root, fake, now)
+	canceled, _, err := SweepTimeouts(context.Background(), root, fake, now, nil)
 	if err != nil {
 		t.Fatalf("SweepTimeouts: %v", err)
 	}
@@ -345,7 +345,7 @@ func TestSweepReclaimsCompletedTaskWithUnparseableCompletedAt(t *testing.T) {
 	_ = SaveTasks(root, s)
 
 	fake := &FakeSessionManager{}
-	_, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now)
+	_, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now, nil)
 	if err != nil {
 		t.Fatalf("SweepTimeouts: %v", err)
 	}
@@ -382,7 +382,7 @@ func TestSweepRemovesWorktreeOnReclaim(t *testing.T) {
 	}
 
 	fake := &FakeSessionManager{}
-	if _, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now); err != nil || reclaimed != 1 {
+	if _, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now, nil); err != nil || reclaimed != 1 {
 		t.Fatalf("reclaimed = %d err = %v", reclaimed, err)
 	}
 	if len(fake.Removed) != 1 || fake.Removed[0] != "/p/aa-a-c1" {
@@ -410,7 +410,7 @@ func TestSweepRetriesFailedRemoval(t *testing.T) {
 	_ = SaveTasks(root, s)
 
 	fake := &FakeSessionManager{FailOn: "remove"}
-	if _, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now); err != nil || reclaimed != 0 {
+	if _, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now, nil); err != nil || reclaimed != 0 {
 		t.Fatalf("first sweep: reclaimed = %d err = %v, want 0 (removal failed)", reclaimed, err)
 	}
 	got, _ := LoadTasks(root)
@@ -420,7 +420,7 @@ func TestSweepRetriesFailedRemoval(t *testing.T) {
 	}
 
 	fake.FailOn = ""
-	if _, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now); err != nil || reclaimed != 1 {
+	if _, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now, nil); err != nil || reclaimed != 1 {
 		t.Fatalf("retry sweep: reclaimed = %d err = %v, want 1", reclaimed, err)
 	}
 	if len(fake.Removed) != 1 || fake.Removed[0] != "/p/aa-a-c1" {
@@ -475,7 +475,7 @@ func TestSweepSkipsRowChangedDuringTeardown(t *testing.T) {
 		}
 	}
 
-	if _, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now); err != nil || reclaimed != 0 {
+	if _, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now, nil); err != nil || reclaimed != 0 {
 		t.Fatalf("reclaimed = %d err = %v, want 0 (the row now belongs to a different, live task)", reclaimed, err)
 	}
 	got, _ := LoadTasks(root)
@@ -502,7 +502,7 @@ func TestSweepReclaimsWorktreeOnHardTimeoutCancel(t *testing.T) {
 	_ = SaveTasks(root, s)
 
 	fake := &FakeSessionManager{}
-	canceled, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now)
+	canceled, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now, nil)
 	if err != nil {
 		t.Fatalf("SweepTimeouts: %v", err)
 	}
@@ -542,7 +542,7 @@ func TestSweepCapsRetainedFailedSandboxes(t *testing.T) {
 	_ = SaveTasks(root, s)
 
 	fake := &FakeSessionManager{}
-	if _, _, err := SweepTimeouts(context.Background(), root, fake, now); err != nil {
+	if _, _, err := SweepTimeouts(context.Background(), root, fake, now, nil); err != nil {
 		t.Fatalf("SweepTimeouts: %v", err)
 	}
 	if len(fake.Removed) != 5 {
@@ -566,7 +566,7 @@ func TestSweepKeepsFailedSandboxesUnderTheCap(t *testing.T) {
 	_ = SaveTasks(root, s)
 
 	fake := &FakeSessionManager{}
-	_, _, _ = SweepTimeouts(context.Background(), root, fake, now)
+	_, _, _ = SweepTimeouts(context.Background(), root, fake, now, nil)
 	if len(fake.Removed) != 0 {
 		t.Fatalf("a single old failed sandbox must be kept for forensics, got %#v", fake.Removed)
 	}
@@ -587,7 +587,7 @@ func TestSweepLeavesFailedSandboxForensicsEvenWithGarbageTimestamp(t *testing.T)
 	_ = SaveTasks(root, s)
 
 	fake := &FakeSessionManager{}
-	if _, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now); err != nil || reclaimed != 0 {
+	if _, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now, nil); err != nil || reclaimed != 0 {
 		t.Fatalf("failed sandboxes must be kept even with a corrupt timestamp: reclaimed=%d err=%v", reclaimed, err)
 	}
 	if len(fake.Stopped) != 0 {
@@ -613,7 +613,7 @@ func TestSweepFailsStaleDispatchingRows(t *testing.T) {
 	})
 	_ = SaveTasks(root, s)
 
-	if _, _, err := SweepTimeouts(context.Background(), root, &FakeSessionManager{}, now); err != nil {
+	if _, _, err := SweepTimeouts(context.Background(), root, &FakeSessionManager{}, now, nil); err != nil {
 		t.Fatalf("SweepTimeouts: %v", err)
 	}
 	got, _ := LoadTasks(root)
@@ -656,7 +656,7 @@ func TestSweepDoesNotHardTimeoutFreshlyClaimedDispatchingRow(t *testing.T) {
 	// HardTimeout (2h) in the past, which is exactly the condition that must
 	// NOT cancel a dispatching row.
 	sweepAt := now.Add(2 * time.Minute)
-	if _, _, err := SweepTimeouts(context.Background(), root, fake, sweepAt); err != nil {
+	if _, _, err := SweepTimeouts(context.Background(), root, fake, sweepAt, nil); err != nil {
 		t.Fatalf("SweepTimeouts: %v", err)
 	}
 	got, _ := LoadTasks(root)
@@ -687,7 +687,7 @@ func TestSweepPreservesPriorDetailOnStaleDispatch(t *testing.T) {
 	_ = SaveTasks(root, s)
 
 	fake := &FakeSessionManager{}
-	if _, _, err := SweepTimeouts(context.Background(), root, fake, now); err != nil {
+	if _, _, err := SweepTimeouts(context.Background(), root, fake, now, nil); err != nil {
 		t.Fatalf("SweepTimeouts: %v", err)
 	}
 	got, _ := LoadTasks(root)
@@ -702,3 +702,136 @@ func TestSweepPreservesPriorDetailOnStaleDispatch(t *testing.T) {
 		t.Fatalf("Detail = %q, must still contain the sweep's own reason too", tk.Detail)
 	}
 }
+
+// 規格第五節測試 3：既有的 TestSweepSkipsRowChangedDuringTeardown 只驗第 3 步
+// 的帳面守衛。這一條驗第 2 步 —— 拆除的動作本身不得碰到新身分。
+func TestSweepDoesNotDestroyAResubmittedIdentity(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	var s TaskStore
+	s.Upsert(A2ATask{
+		ContextID: "c1", TaskID: "t-old", Agent: "a", Session: "aa-a-c1",
+		Worktree: "/p/aa-a-c1", State: TaskCompleted,
+		CompletedAt: now.Add(-time.Hour).Format(time.RFC3339),
+	})
+	_ = SaveTasks(root, s)
+
+	fake := &FakeSessionManager{}
+	// 在拆除窗口正中間模擬同 contextId 的合法重新提交。
+	fake.OnRemove = func() {
+		_ = WithTasks(root, func(tasks *TaskStore) error {
+			tasks.Upsert(A2ATask{
+				ContextID: "c1", TaskID: "t-new", Agent: "a", Session: "aa-a-c1",
+				Worktree: "/p/aa-a-c1", State: TaskDispatching, Level: GrantDevelop,
+				StartedAt: now.Format(time.RFC3339), DispatchedAt: now.Format(time.RFC3339),
+			})
+			return nil
+		})
+	}
+	if _, _, err := SweepTimeouts(context.Background(), root, fake, now, nil); err != nil {
+		t.Fatalf("SweepTimeouts: %v", err)
+	}
+
+	got, _ := LoadTasks(root)
+	tk, _ := got.ByContext("c1")
+	if tk.TaskID != "t-new" || tk.Session == "" || tk.Worktree == "" {
+		t.Fatalf("the resubmitted identity was corrupted: %#v", tk)
+	}
+}
+
+// D4：sweep 必須在動手之前先停掉還活著的 driver。Stop 阻塞到 goroutine 真的
+// 結束，那正是回收需要的保證 —— 否則下一輪 RunWorkerOnce 的 Init(root) 會把
+// 剛刪掉的目錄樹重建回來。
+func TestSweepStopsDriversBeforeRemoving(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	var s TaskStore
+	s.Upsert(A2ATask{
+		ContextID: "c1", TaskID: "t1", Agent: "a", Session: "aa-a-c1",
+		Worktree: "/p/aa-a-c1", State: TaskCompleted,
+		CompletedAt: now.Add(-time.Hour).Format(time.RFC3339),
+	})
+	_ = SaveTasks(root, s)
+
+	stopper := &recordingStopper{}
+	fake := &FakeSessionManager{}
+	fake.OnRemove = func() {
+		if len(stopper.stopped) == 0 {
+			t.Error("the worktree was removed before the driver was stopped")
+		}
+	}
+	if _, _, err := SweepTimeouts(context.Background(), root, fake, now, stopper); err != nil {
+		t.Fatalf("SweepTimeouts: %v", err)
+	}
+	if len(stopper.stopped) != 1 || stopper.stopped[0] != "aa-a-c1" {
+		t.Fatalf("stopped = %#v", stopper.stopped)
+	}
+}
+
+// TestFollowUpAfterSweepReclaimDoesNotResurrectSandboxDir pins a task 7
+// review finding (a2a_server.go:389, carried over from task 6): handleRPC
+// reads its followUpTask snapshot under tasksMu, releases that lock, and
+// only THEN calls DeliverFollowUp outside it (Inject touches the
+// filesystem and must never run while tasksMu is held). If SweepTimeouts
+// runs to completion for this exact session in that gap — a task sitting in
+// TaskWorking past HardTimeout is canceled and reclaimed in the very same
+// pass, see the "for canceled rows" loop in SweepTimeouts — the snapshot
+// handed to DeliverFollowUp is stale even though it was never terminal at
+// the moment handleRPC read it. Pre-fix, DeliverFollowUp injected
+// unconditionally; Inject's underlying IngestMessages calls Init(root)
+// unconditionally, which would recreate sandboxes/<session>/ right after
+// this sweep just removed it — a directory holding a pending job nothing
+// will ever reclaim.
+//
+// This does not need real goroutines to be a genuine proof: it reproduces
+// the exact ordering handleRPC would observe — capture the snapshot, THEN
+// let sweep run to completion for that session, THEN attempt delivery —
+// deterministically, by simply doing those three steps in that order.
+// There is no data race in question here (nothing touches shared state
+// concurrently); what's under test is whether a stale snapshot is rejected
+// rather than blindly acted on, which a fixed ordering already proves
+// unambiguously.
+func TestFollowUpAfterSweepReclaimDoesNotResurrectSandboxDir(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	const session = "aa-a-c1"
+	seed := A2ATask{
+		ContextID: "c1", TaskID: "t1", Agent: "a", CallerID: "peer-a",
+		Session: session, State: TaskWorking, Level: GrantReadOnly,
+		StartedAt: now.Add(-HardTimeout - time.Minute).Format(time.RFC3339),
+	}
+	var s TaskStore
+	s.Upsert(seed)
+	if err := SaveTasks(root, s); err != nil {
+		t.Fatalf("SaveTasks: %v", err)
+	}
+
+	// 沙盒真的存在過(模擬 Start 早就 Init 過)。
+	if err := Init(SandboxRoot(root, session)); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	// handleRPC 在 tasksMu 之內讀到的、還沒過期的舊快照 —— 這是它會交給
+	// DeliverFollowUp 的那份，狀態仍是 working。
+	staleSnapshot := seed
+
+	// sweep 在追問真正送達之前就跑完了一整趟：同一輪內硬逾時取消 + 回收。
+	if _, reclaimed, err := SweepTimeouts(context.Background(), root, &FakeSessionManager{}, now, nil); err != nil || reclaimed != 1 {
+		t.Fatalf("SweepTimeouts: reclaimed=%d err=%v, want reclaimed=1", reclaimed, err)
+	}
+	if _, err := os.Stat(SandboxRoot(root, session)); !os.IsNotExist(err) {
+		t.Fatalf("sandbox root must be gone after sweep, stat err = %v", err)
+	}
+
+	ex := &SandboxExecutor{Root: root, Sessions: &realInjectSessionManager{FakeSessionManager: &FakeSessionManager{}}}
+	if err := ex.DeliverFollowUp(context.Background(), staleSnapshot, "late follow up"); err == nil {
+		t.Fatal("DeliverFollowUp must refuse a snapshot sweep already reclaimed, not silently deliver")
+	}
+	if _, err := os.Stat(SandboxRoot(root, session)); !os.IsNotExist(err) {
+		t.Fatalf("DeliverFollowUp must not resurrect the sandbox root sweep just removed, stat err = %v", err)
+	}
+}
+
+type recordingStopper struct{ stopped []string }
+
+func (r *recordingStopper) Stop(session string) { r.stopped = append(r.stopped, session) }

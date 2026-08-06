@@ -139,6 +139,16 @@ type reclaimCandidate struct {
 	state                                            TaskState
 }
 
+// SandboxStopper 只有一個方法，讓 sweep 可以在動手之前先停掉還活著的 driver
+// 而不必認識整個 SandboxDriver。nil 代表不停（測試用）。
+// SandboxDriver.Stop 阻塞到 goroutine 真的結束，那正是回收需要的保證 ——
+// cycle 的順序是 collect → sweep → drain → EnsureSandboxDrivers，所以 sweep
+// 動手時 driver 還活著；它下一輪 RunWorkerOnce 的第一件事就是 Init(root)，
+// 會把剛刪掉的目錄樹重建回來（task 7, D4）。
+type SandboxStopper interface {
+	Stop(session string)
+}
+
 // SweepTimeouts cancels tasks past HardTimeout and tears down completed and
 // canceled sandboxes, reclaiming their worktree and sandbox root — not just
 // the tmux session. A canceled task is not a failed one, so the forensics
@@ -162,9 +172,18 @@ type reclaimCandidate struct {
 //     yet for anything this pass wants to reclaim), recording each
 //     candidate's own TaskID/State/Worktree/Session as they stood at
 //     selection time.
-//  2. Outside the lock: stop sessions, then attempt each candidate's
-//     removal. A failure is logged and left for a later sweep to retry — the
-//     candidate stays out of the "succeeded" list below.
+//  2. Outside the lock: stop any still-running driver for a candidate's
+//     session (stopper, D4), then stop sessions, then — while holding that
+//     session's exclusive teardown lock (lockSandboxSessionForTeardown,
+//     D3(a); it waits for every in-flight Start/DeliverFollowUp on this
+//     session to release their shared lock first) and only after
+//     re-confirming under the lock that the row hasn't changed identity
+//     since step 1 (candidateStillMatches, D3(b)) — attempt each
+//     candidate's removal. A failure is logged and left for a later sweep to
+//     retry — the candidate stays out of the "succeeded" list below. A
+//     candidate that no longer matches is skipped entirely: nothing about it
+//     is touched, on disk or in the row, because what step 1 selected no
+//     longer exists at that identity.
 //  3. Take the lock again and, for each succeeded candidate, clear
 //     Worktree/Session ONLY if the row at that contextId still has the
 //     exact same TaskID, State, Worktree and Session recorded in step 1. A
@@ -187,7 +206,7 @@ type reclaimCandidate struct {
 // cleared for it. reclaimed is independent of whether step 3's SaveTasks
 // call itself succeeds; if it doesn't, the next sweep simply retries an
 // already-removed path, which os.RemoveAll and RemoveWorktree both tolerate.
-func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time.Time) (int, int, error) {
+func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time.Time, stopper SandboxStopper) (int, int, error) {
 	canceled, reclaimed := 0, 0
 	// Sessions to stop are collected under the lock but stopped after it is
 	// released: sm.Stop shells out to tmux, and nothing that touches a
@@ -375,31 +394,60 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 		return canceled, 0, err
 	}
 
-	// --- Step 2: outside the lock, stop sessions and attempt removal. ---
+	// --- Step 2: 鎖外。先停 driver，再停 session，最後才動磁碟。 ---
+	//
+	// 先停 driver 不是可有可無：cycle 的順序是 collect → sweep → drain →
+	// EnsureSandboxDrivers，所以 sweep 動手時 driver 還活著。它下一輪
+	// RunWorkerOnce 的第一件事就是 Init(root)，會把剛刪掉的目錄樹重建回來
+	// （而第 3 步已經把該 row 的 Session/Worktree 清空 → 永不回收的目錄）；
+	// 而 git worktree remove --force 會在 claude 行程正把該目錄當 cwd 時執行。
+	if stopper != nil {
+		// toStop 與 candidates 本就會重疊（同一個 session 的 row 硬逾時時,
+		// 先進 toStop 停 tmux,同一輪又因為狀態轉成 canceled 被下面「掃過所有
+		// canceled row」那段撿成 candidate）。SandboxDriver.Stop 本身可重複
+		// 呼叫沒有副作用,但仍在這裡去重,好讓每個 session 的 driver 只被
+		// 要求停一次。
+		stopped := make(map[string]bool, len(candidates)+len(toStop))
+		for _, c := range candidates {
+			if c.session != "" && !stopped[c.session] {
+				stopper.Stop(c.session)
+				stopped[c.session] = true
+			}
+		}
+		for _, session := range toStop {
+			if session != "" && !stopped[session] {
+				stopper.Stop(session)
+				stopped[session] = true
+			}
+		}
+	}
 	for _, session := range toStop {
 		_ = sm.Stop(ctx, session)
 	}
+
+	// 動手前用同一個 session 的互斥鎖擋掉合法的同 contextId 追問（D3(a)）——
+	// 拿到這把鎖代表這個瞬間沒有任何 Start/DeliverFollowUp 正在使用這個
+	// session，且拿到之後任何新的使用者都要等這裡做完——並在鎖內重新確認這一
+	// 列還是第 1 步選中的那一列（D3(b) candidateStillMatches）。兩者缺一都留
+	// 有窗口：只做重確認，窗口是「確認完到動手之間」；只做鎖，擋不住「確認
+	// 前」就已經換身分的情況。四欄位比對跟第 3 步同一組，但這裡是用來決定
+	// 「要不要動手」，不是「要不要清欄位」—— 保住磁碟，不只保住帳。
 	var succeeded []reclaimCandidate
 	for _, c := range candidates {
-		ok := true
-		if c.worktree != "" {
-			if rmErr := sm.RemoveWorkspace(ctx, c.projectDir, c.worktree); rmErr != nil {
-				log.Printf("a2a: sweep: failed to remove worktree %s for context %s (left in place, will retry next sweep): %v", c.worktree, c.contextID, rmErr)
-				ok = false
+		if c.session == "" {
+			if removeCandidate(ctx, root, sm, c) {
+				succeeded = append(succeeded, c)
 			}
+			continue
 		}
-		if c.session != "" {
-			if rmErr := os.RemoveAll(SandboxRoot(root, c.session)); rmErr != nil {
-				log.Printf("a2a: sweep: failed to remove sandbox root for context %s (left in place, will retry next sweep): %v", c.contextID, rmErr)
-				ok = false
-			}
-			// 政策檔與沙盒同生共死。清不掉只 log,不影響回收判定 —— 下一趟
-			// sweep 會重試,而一份指向已不存在 worktree 的政策檔本身無害
-			// (gate 只在該 session 名的 hook 行程裡才會讀到它)。
-			if rmErr := RemoveSandboxPolicy(root, c.session); rmErr != nil {
-				log.Printf("a2a: sweep: 刪除 %s 的政策檔失敗(下一趟重試): %v", c.session, rmErr)
-			}
+		unlock := lockSandboxSessionForTeardown(c.session)
+		if !candidateStillMatches(root, c) {
+			log.Printf("a2a: sweep: context %s 在拆除前已換身分，跳過（不動它的 session/worktree）", c.contextID)
+			unlock()
+			continue
 		}
+		ok := removeCandidate(ctx, root, sm, c)
+		unlock()
 		if ok {
 			succeeded = append(succeeded, c)
 		}
@@ -464,4 +512,47 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 	}
 
 	return canceled, reclaimed, nil
+}
+
+// candidateStillMatches 在真的動手之前，用一次短的 WithTasks 重新確認該
+// contextId 的 row 仍是同一身分（TaskID / State / Worktree / Session 四欄位，
+// 與第 3 步同一組比較）。第 3 步的比對只決定「要不要清欄位」—— 保住了帳，
+// 沒保住磁碟；這一條才保住磁碟。呼叫方必須在持有
+// lockSandboxSessionForTeardown(c.session) 期間呼叫這個函式並緊接著呼叫
+// removeCandidate，否則「確認完到動手之間」仍有窗口。
+func candidateStillMatches(root string, c reclaimCandidate) bool {
+	match := false
+	_ = WithTasks(root, func(tasks *TaskStore) error {
+		if t, ok := tasks.ByContext(c.contextID); ok {
+			match = t.TaskID == c.taskID && t.State == c.state &&
+				t.Worktree == c.worktree && t.Session == c.session
+		}
+		return errNothingSwept // 只讀不寫
+	})
+	return match
+}
+
+// removeCandidate 執行實際的磁碟回收。任何一項失敗就回 false，該 candidate
+// 留在原地由下一趟 sweep 重試。
+func removeCandidate(ctx context.Context, root string, sm SessionManager, c reclaimCandidate) bool {
+	ok := true
+	if c.worktree != "" {
+		if err := sm.RemoveWorkspace(ctx, c.projectDir, c.worktree); err != nil {
+			log.Printf("a2a: sweep: failed to remove worktree %s for context %s (left in place, will retry next sweep): %v", c.worktree, c.contextID, err)
+			ok = false
+		}
+	}
+	if c.session != "" {
+		if err := os.RemoveAll(SandboxRoot(root, c.session)); err != nil {
+			log.Printf("a2a: sweep: failed to remove sandbox root for context %s (left in place, will retry next sweep): %v", c.contextID, err)
+			ok = false
+		}
+		// 政策檔與沙盒同生共死。清不掉只 log,不影響回收判定 —— 下一趟
+		// sweep 會重試,而一份指向已不存在 worktree 的政策檔本身無害
+		// (gate 只在該 session 名的 hook 行程裡才會讀到它)。
+		if err := RemoveSandboxPolicy(root, c.session); err != nil {
+			log.Printf("a2a: sweep: 刪除 %s 的政策檔失敗(下一趟重試): %v", c.session, err)
+		}
+	}
+	return ok
 }
