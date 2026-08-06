@@ -198,17 +198,19 @@ func (s *A2AServer) handleRPC(w http.ResponseWriter, r *http.Request) {
 	// contextId is caller-controlled. Without an ownership check, a second
 	// caller could reuse another caller's contextId and overwrite its task row
 	// (CallerID, Session, State), making the original task unbookkeepable. A
-	// caller may only reuse a contextId that is unclaimed, terminal, or
-	// already theirs. The load, ownership check and upsert all happen inside
-	// one WithTasks call so a concurrent request can never interleave between
-	// the check and the write (the lost-update bug this task closes).
+	// caller may only reuse a contextId that is unclaimed or already theirs.
+	// The load, ownership check and upsert all happen inside one WithTasks
+	// call so a concurrent request can never interleave between the check and
+	// the write (the lost-update bug this task closes).
+	//
+	// Ownership applies regardless of state. Session and worktree names are
+	// caller-independent and EnsureWorktree no-ops on an existing path, so a
+	// different caller reusing even a FINISHED contextId would inherit the
+	// original caller's checkout, branch and sandbox root.
 	var hasCapacity bool
 	err = WithTasks(s.Root, func(tasks *TaskStore) error {
-		if existing, ok := tasks.ByContext(p.ContextID); ok {
-			active := existing.State == TaskSubmitted || existing.State == TaskWorking
-			if active && existing.CallerID != caller.CallerID {
-				return errContextHijack
-			}
+		if existing, ok := tasks.ByContext(p.ContextID); ok && existing.CallerID != caller.CallerID {
+			return errContextHijack
 		}
 		tasks.Upsert(task)
 		hasCapacity = HasCapacity(*tasks)

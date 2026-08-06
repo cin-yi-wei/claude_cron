@@ -489,6 +489,60 @@ func TestServerWritesAuditOnAcceptAndDeny(t *testing.T) {
 // Finding 5: an Authorization header that is present but malformed (wrong
 // scheme, or "Bearer" with no token) must be rejected exactly like a missing
 // header — not accidentally treated as a valid credential.
+// Task 6: ownership must be enforced regardless of task state. SessionNameFor
+// and SandboxWorktree are caller-independent, and EnsureWorktree no-ops when
+// the path already exists, so a second caller reusing even a terminal (e.g.
+// completed) contextId would otherwise inherit the original caller's checkout
+// — its uncommitted files, its branch, its sandbox root.
+func TestTerminalContextIDCannotBeTakenOverByAnotherCaller(t *testing.T) {
+	s, root := newTestA2AServer(t)
+
+	callers, _ := LoadCallers(root)
+	_ = callers.Register("peer-b", "secret-2")
+	callers.Approve("peer-b", []string{"read"})
+	_ = SaveCallers(root, callers)
+
+	// peer-a's task on c1 has finished.
+	var tasks TaskStore
+	tasks.Upsert(A2ATask{
+		ContextID: "c1", Agent: "codereview", CallerID: "peer-a",
+		Session: SessionNameFor("codereview", "c1"), State: TaskCompleted,
+	})
+	_ = SaveTasks(root, tasks)
+
+	rec := postRPC(t, s.Handler(), "secret-2",
+		`{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"agent":"codereview","contextId":"c1","text":"take over"}}`)
+	var resp RPCResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	if resp.Error == nil || resp.Error.Code != RPCForbidden {
+		t.Fatalf("a different caller must not reuse a terminal contextId, got %#v", resp.Error)
+	}
+
+	got, _ := LoadTasks(root)
+	tk, _ := got.ByContext("c1")
+	if tk.CallerID != "peer-a" {
+		t.Fatalf("original owner overwritten: %q", tk.CallerID)
+	}
+}
+
+func TestSameCallerMayReuseItsOwnTerminalContextID(t *testing.T) {
+	s, root := newTestA2AServer(t)
+	var tasks TaskStore
+	tasks.Upsert(A2ATask{
+		ContextID: "c1", Agent: "codereview", CallerID: "peer-a",
+		Session: SessionNameFor("codereview", "c1"), State: TaskCompleted,
+	})
+	_ = SaveTasks(root, tasks)
+
+	rec := postRPC(t, s.Handler(), "secret-1",
+		`{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"agent":"codereview","contextId":"c1","text":"follow up"}}`)
+	var resp RPCResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	if resp.Error != nil {
+		t.Fatalf("the owning caller must be able to follow up: %#v", resp.Error)
+	}
+}
+
 func TestMalformedAuthorizationHeaderRejected(t *testing.T) {
 	s, _ := newTestA2AServer(t)
 	cases := []struct {
