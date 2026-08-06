@@ -369,6 +369,30 @@ func TestOversizedBodyNeverProducesATask(t *testing.T) {
 	}
 }
 
+// Task 12: every accepted/rejected delegation must leave a durable audit
+// trail — the endpoint is externally reachable with no interactive prompt,
+// so this log is the only record of who asked for what.
+func TestServerWritesAuditOnAcceptAndDeny(t *testing.T) {
+	s, root := newTestA2AServer(t)
+	postRPC(t, s.Handler(), "secret-1", `{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"agent":"codereview","contextId":"c1","text":"ok"}}`)
+
+	agents, _ := LoadAgents(root)
+	agents.Agents[0].Capabilities = []string{"write"}
+	_ = SaveAgents(root, agents)
+	postRPC(t, s.Handler(), "secret-1", `{"jsonrpc":"2.0","id":2,"method":"message/send","params":{"agent":"codereview","contextId":"c2","text":"denied"}}`)
+
+	entries, err := ReadAudit(root)
+	if err != nil {
+		t.Fatalf("ReadAudit: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("audit entries = %d, want 2", len(entries))
+	}
+	if entries[0].Outcome != "accepted" || entries[1].Outcome != "forbidden" {
+		t.Fatalf("outcomes = %q, %q", entries[0].Outcome, entries[1].Outcome)
+	}
+}
+
 // Finding 5: an Authorization header that is present but malformed (wrong
 // scheme, or "Bearer" with no token) must be rejected exactly like a missing
 // header — not accidentally treated as a valid credential.

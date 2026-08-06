@@ -152,6 +152,14 @@ func (s *A2AServer) handleRPC(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, need := range agent.Capabilities {
 		if !caller.Allows(need) {
+			_ = AppendAudit(s.Root, AuditEntry{
+				At:        time.Now().UTC().Format(time.RFC3339),
+				CallerID:  caller.CallerID,
+				Agent:     p.Agent,
+				ContextID: p.ContextID,
+				Summary:   p.Text,
+				Outcome:   "forbidden",
+			})
 			writeRPC(w, RPCFail(req.ID, RPCForbidden, "caller lacks capability "+need))
 			return
 		}
@@ -219,6 +227,16 @@ func (s *A2AServer) handleRPC(w http.ResponseWriter, r *http.Request) {
 		writeRPC(w, RPCFail(req.ID, RPCInternalError, "dispatch failed"))
 		return
 	}
+
+	_ = AppendAudit(s.Root, AuditEntry{
+		At:        time.Now().UTC().Format(time.RFC3339),
+		CallerID:  caller.CallerID,
+		Agent:     agent.Name,
+		ContextID: task.ContextID,
+		TaskID:    task.TaskID,
+		Summary:   p.Text,
+		Outcome:   "accepted",
+	})
 
 	writeRPC(w, RPCOK(req.ID, map[string]any{
 		"contextId": task.ContextID,
