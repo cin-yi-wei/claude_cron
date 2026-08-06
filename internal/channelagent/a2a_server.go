@@ -245,10 +245,27 @@ func (s *A2AServer) handleMessageSend(w http.ResponseWriter, r *http.Request, re
 	}
 	// 目的地由 operator 記在 caller 記錄裡。請求裡出現任何 callback 欄位就
 	// 拒絕整個請求（不是忽略）—— 忽略會讓呼叫方以為自己設定成功了。
+	//
+	// 逐個 key 精確比對在 round-12-review Minor 4 被戳破：這裡的黑名單比對
+	// 本身是大小寫敏感的字串比較，攻擊者送 "CallbackUrl" 或
+	// "callbackurl"（跟清單裡的 "callbackUrl" 只差大小寫）就逐字比對不中，
+	// 放它過去——回應看起來「成功」，呼叫方會誤以為自己真的設定了回呼目
+	// 的地（沒有 SSRF 風險，因為沒有任何程式碼真的去讀這幾個欄位，但這個
+	// 檢查存在的理由正是「告知呼叫方目的地被忽略」，悄悄放行就等於違反了
+	// 這個檢查自己的目的）。改成把每個 key 轉小寫再比對，蓋掉任何大小寫變
+	// 體。
+	forbiddenCallbackKeys := map[string]bool{
+		"callbackurl":    true,
+		"callback_url":   true,
+		"webhookurl":     true,
+		"webhook_url":    true,
+		"callbacktoken":  true,
+		"callback_token": true,
+	}
 	var rawParams map[string]json.RawMessage
 	_ = json.Unmarshal(req.Params, &rawParams)
-	for _, k := range []string{"callbackUrl", "callback_url", "webhookUrl", "webhook_url", "callbackToken", "callback_token"} {
-		if _, present := rawParams[k]; present {
+	for k := range rawParams {
+		if forbiddenCallbackKeys[strings.ToLower(k)] {
 			s.auditBadRequest(r, caller.CallerID, p.Agent, p.ContextID, "request supplied a callback destination")
 			writeRPC(w, RPCFail(req.ID, RPCInvalidParams, "callback destinations are configured by the operator, not per request"))
 			return
