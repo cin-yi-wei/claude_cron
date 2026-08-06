@@ -67,6 +67,158 @@ func TestAdminA2AAgentCRUD(t *testing.T) {
 	}
 }
 
+// Gap 1（2026-08-06 follow-up）：更新只碰使用者真的送進來的欄位，沒送的欄位
+// 原樣保留——比照 approve 的「送整份覆寫」不同，這裡刻意用 pointer 語意，
+// 讓 CLI「只改一個欄位」時不會把其餘欄位意外清空。
+func TestAdminA2AAgentUpdatePartial(t *testing.T) {
+	h, root := newA2AAdmin(t)
+	rec := adminReq(t, h, http.MethodPost, "/api/a2a/agents",
+		`{"name":"pm","project_dir":"/p/pm","description":"pm agent","capabilities":["plan"],"channel_id":"chan-1","enabled":true}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create = %d %s", rec.Code, rec.Body.String())
+	}
+
+	// 只改 description，其餘欄位（project_dir/capabilities/channel_id/enabled）
+	// 完全沒出現在請求 body 裡，必須維持原值。
+	rec = adminReq(t, h, http.MethodPost, "/api/a2a/agents/pm/update", `{"description":"pm agent v2"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("update = %d %s", rec.Code, rec.Body.String())
+	}
+	got, _ := LoadAgents(root)
+	if len(got.Agents) != 1 {
+		t.Fatalf("agents = %#v", got.Agents)
+	}
+	a := got.Agents[0]
+	if a.Name != "pm" {
+		t.Fatalf("Name changed to %q, want immutable pm", a.Name)
+	}
+	if a.Description != "pm agent v2" {
+		t.Fatalf("Description = %q, want the updated value", a.Description)
+	}
+	if a.ProjectDir != "/p/pm" {
+		t.Fatalf("ProjectDir = %q, changed even though the request never mentioned it", a.ProjectDir)
+	}
+	if len(a.Capabilities) != 1 || a.Capabilities[0] != "plan" {
+		t.Fatalf("Capabilities = %#v, changed even though the request never mentioned them", a.Capabilities)
+	}
+	if a.ChannelID != "chan-1" {
+		t.Fatalf("ChannelID = %q, changed even though the request never mentioned it", a.ChannelID)
+	}
+	if !a.Enabled {
+		t.Fatal("Enabled flipped by /update; enable state must only change via /enable or /disable")
+	}
+}
+
+// 多個可變欄位一次改完：project_dir、capabilities、channel_id 全部套用。
+func TestAdminA2AAgentUpdateMultipleFields(t *testing.T) {
+	h, root := newA2AAdmin(t)
+	rec := adminReq(t, h, http.MethodPost, "/api/a2a/agents",
+		`{"name":"pm","project_dir":"/p/pm","description":"pm agent","enabled":true}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create = %d %s", rec.Code, rec.Body.String())
+	}
+
+	rec = adminReq(t, h, http.MethodPost, "/api/a2a/agents/pm/update",
+		`{"project_dir":"/p/pm2","capabilities":["plan","read"],"channel_id":"chan-2"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("update = %d %s", rec.Code, rec.Body.String())
+	}
+	got, _ := LoadAgents(root)
+	a := got.Agents[0]
+	if a.ProjectDir != "/p/pm2" {
+		t.Fatalf("ProjectDir = %q", a.ProjectDir)
+	}
+	if len(a.Capabilities) != 2 || a.Capabilities[0] != "plan" || a.Capabilities[1] != "read" {
+		t.Fatalf("Capabilities = %#v", a.Capabilities)
+	}
+	if a.ChannelID != "chan-2" {
+		t.Fatalf("ChannelID = %q", a.ChannelID)
+	}
+}
+
+// name 是 agent 的身分，SessionNameFor / SandboxWorktree 都拿它派生 session 名
+// 與 worktree 路徑——改名等於讓正在跑的沙盒失去自己的記錄。/update 必須拒絕
+// 任何試圖改名的請求，而不是靜靜忽略掉（忽略會讓呼叫方以為改名成功了）。
+func TestAdminA2AAgentUpdateRejectsRename(t *testing.T) {
+	h, root := newA2AAdmin(t)
+	rec := adminReq(t, h, http.MethodPost, "/api/a2a/agents",
+		`{"name":"pm","project_dir":"/p/pm","description":"pm agent","enabled":true}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create = %d %s", rec.Code, rec.Body.String())
+	}
+
+	rec = adminReq(t, h, http.MethodPost, "/api/a2a/agents/pm/update", `{"name":"pm-renamed","description":"x"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("rename attempt = %d %s, want 400", rec.Code, rec.Body.String())
+	}
+	got, _ := LoadAgents(root)
+	if len(got.Agents) != 1 || got.Agents[0].Name != "pm" {
+		t.Fatalf("agents = %#v, name must be unchanged after a rejected rename", got.Agents)
+	}
+	if got.Agents[0].Description != "pm agent" {
+		t.Fatalf("Description = %q, a rejected request must not apply any of its other fields either", got.Agents[0].Description)
+	}
+}
+
+func TestAdminA2AAgentUpdateUnknownAgentIs404(t *testing.T) {
+	h, _ := newA2AAdmin(t)
+	rec := adminReq(t, h, http.MethodPost, "/api/a2a/agents/ghost/update", `{"description":"x"}`)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("update unknown agent = %d %s, want 404", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAdminA2AAgentUpdateWrongMethodIs405(t *testing.T) {
+	h, _ := newA2AAdmin(t)
+	_ = adminReq(t, h, http.MethodPost, "/api/a2a/agents", `{"name":"pm","project_dir":"/p/pm","enabled":true}`)
+	rec := adminReq(t, h, http.MethodGet, "/api/a2a/agents/pm/update", "")
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET .../update = %d, want 405", rec.Code)
+	}
+}
+
+// Gap 1 的核心動機：一個宣告零 capabilities 的 agent 在 a2a_server.go 會被
+// 永久 fail-closed（TestZeroCapabilityAgentDeniedByDefault），過去唯一的救法
+// 是刪掉重建——這會丟掉任何跟它綁在一起的東西。/update 讓它可以直接被修好。
+func TestAdminA2AAgentUpdateFixesZeroCapabilities(t *testing.T) {
+	h, root := newA2AAdmin(t)
+	rec := adminReq(t, h, http.MethodPost, "/api/a2a/agents",
+		`{"name":"pm","project_dir":"/p/pm","description":"pm agent","enabled":true}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create = %d %s", rec.Code, rec.Body.String())
+	}
+
+	var callers CallerStore
+	_ = callers.Register("peer-a", "secret-1")
+	callers.Approve("peer-a", []string{"read"})
+	if err := SaveCallers(root, callers); err != nil {
+		t.Fatalf("SaveCallers: %v", err)
+	}
+	s := &A2AServer{Root: root, BaseURL: "https://example.test/a2a", Executor: &StubExecutor{}}
+
+	rec2 := postRPC(t, s.Handler(), "secret-1", `{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"agent":"pm","contextId":"c1","text":"hi"}}`)
+	var respBefore RPCResponse
+	_ = json.Unmarshal(rec2.Body.Bytes(), &respBefore)
+	if respBefore.Error == nil || respBefore.Error.Code != RPCForbidden {
+		t.Fatalf("before fix: want forbidden for a zero-capability agent, got %#v", respBefore.Error)
+	}
+
+	rec = adminReq(t, h, http.MethodPost, "/api/a2a/agents/pm/update", `{"capabilities":["read"]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("update = %d %s", rec.Code, rec.Body.String())
+	}
+
+	rec2 = postRPC(t, s.Handler(), "secret-1", `{"jsonrpc":"2.0","id":2,"method":"message/send","params":{"agent":"pm","contextId":"c2","text":"hi"}}`)
+	// 用全新的 struct 接第二個回應——RPCResponse.Error 帶 omitempty，若跟
+	// 上面共用同一個變數，成功回應（JSON 裡沒有 "error" 這個 key）不會清掉
+	// 上一次失敗留下的舊 pointer，會讓這個斷言看到假的失敗。
+	var respAfter RPCResponse
+	_ = json.Unmarshal(rec2.Body.Bytes(), &respAfter)
+	if respAfter.Error != nil {
+		t.Fatalf("after fix: want success, got %#v", respAfter.Error)
+	}
+}
+
 // credential 只在 POST /api/a2a/callers 的回應裡出現一次；任何 GET 都不得回傳它。
 func TestAdminA2ACallerCredentialIsNeverListed(t *testing.T) {
 	h, _ := newA2AAdmin(t)

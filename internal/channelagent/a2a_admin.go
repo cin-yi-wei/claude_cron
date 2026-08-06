@@ -207,6 +207,14 @@ func (h AdminHandler) a2aAgentAction(w http.ResponseWriter, r *http.Request, res
 		writeJSONResponse(w, map[string]string{"status": "enabled"})
 		return
 	}
+	if name, ok := strings.CutSuffix(rest, "/update"); ok {
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w)
+			return
+		}
+		h.updateA2AAgent(w, r, name)
+		return
+	}
 	if r.Method != http.MethodDelete {
 		methodNotAllowed(w)
 		return
@@ -233,6 +241,79 @@ func (h AdminHandler) a2aAgentAction(w http.ResponseWriter, r *http.Request, res
 		return
 	}
 	writeJSONResponse(w, map[string]string{"status": "removed"})
+}
+
+// adminAgentUpdateDTO 是 PATCH 語意的 update 請求體：每個欄位都是 pointer，
+// 「這個 key 完全沒出現在 JSON 裡」與「出現、值是空字串/空陣列」必須分得出
+// 來——前者代表「不要動這個欄位」，後者代表「操作者明確要把它清空」。用
+// 一般的 value 型別（像 create 用的 adminAgentDTO）做不到這件事：CLI
+// 只改一個欄位時，其餘沒帶的欄位會被 JSON 預設值（""、nil）整批覆寫過去，
+// 這正是 Gap 1 報告裡點名要避免的「改一個欄位卻清空其他欄位」。
+//
+// Name 只用來偵測「這個請求想改名」並拒絕它——name 是 agent 的身分，
+// SessionNameFor／SandboxWorktree 都拿它派生 session 名與 worktree 路徑，
+// 改名會讓正在跑的沙盒（如果有）失去自己的記錄，且沒有任何程式碼會去搬移
+// 一個活著的 tmux session 或 worktree 去對上新名字。要換名字得刪除重建。
+//
+// Enabled 刻意不在這裡：enable/disable 各自有專用路由，/update 完全不碰
+// 這個欄位，維持單一權責。
+type adminAgentUpdateDTO struct {
+	Name         *string   `json:"name"`
+	ProjectDir   *string   `json:"project_dir"`
+	Description  *string   `json:"description"`
+	Capabilities *[]string `json:"capabilities"`
+	ChannelID    *string   `json:"channel_id"`
+}
+
+// updateA2AAgent 改一個既有 agent 的 project_dir / description / capabilities /
+// channel_id。跟 enable 用同一個 Get → 改本地副本 → Remove → Add 手法（見上面
+// a2aAgentAction 的 /enable 分支），一樣包在單次 WithAgents 呼叫裡，讀-改-寫
+// 對併發請求是原子的。
+//
+// 這條路由正是修掉 Gap 1 第二個問題的辦法：a2a_server.go 對零 capabilities 的
+// agent 是永久 fail-closed（TestZeroCapabilityAgentDeniedByDefault），過去只
+// 能刪除重建才能補上 capabilities，把任何跟這個 agent 綁在一起的東西都丟掉。
+// 現在操作者可以直接送一次 {"capabilities":[...]} 補救。
+func (h AdminHandler) updateA2AAgent(w http.ResponseWriter, r *http.Request, name string) {
+	var in adminAgentUpdateDTO
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if in.Name != nil && *in.Name != name {
+		http.Error(w, "agent name is immutable (it derives session and worktree names); delete and recreate to rename", http.StatusBadRequest)
+		return
+	}
+	missing := false
+	if err := WithAgents(h.Root, func(agents *AgentStore) error {
+		a, ok := agents.Get(name)
+		if !ok {
+			missing = true
+			return errA2AStoreUnchanged
+		}
+		if in.ProjectDir != nil {
+			a.ProjectDir = *in.ProjectDir
+		}
+		if in.Description != nil {
+			a.Description = *in.Description
+		}
+		if in.Capabilities != nil {
+			a.Capabilities = *in.Capabilities
+		}
+		if in.ChannelID != nil {
+			a.ChannelID = *in.ChannelID
+		}
+		agents.Remove(name)
+		return agents.Add(a)
+	}); err != nil {
+		if missing {
+			http.Error(w, "unknown agent", http.StatusNotFound)
+			return
+		}
+		http.Error(w, "cannot save agents", http.StatusInternalServerError)
+		return
+	}
+	writeJSONResponse(w, map[string]string{"status": "updated"})
 }
 
 func (h AdminHandler) listA2ACallers(w http.ResponseWriter) {

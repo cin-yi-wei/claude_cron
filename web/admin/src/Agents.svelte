@@ -103,6 +103,42 @@
     del(`/api/a2a/agents/${encodeURIComponent(name)}`);
   }
 
+  // --- agents: edit (project_dir / description / capabilities / channel) ---
+  // name 與 enabled 不在編輯表單裡：name 是身分（session/worktree 名稱都拿它
+  // 派生），改名會讓活著的沙盒失去自己的記錄，後端 /update 會直接拒絕；
+  // enabled 已經有專用的 enable/disable 按鈕，維持單一權責。
+  let editTarget = $state(''); // 正在編輯的 agent name，'' = 對話框關閉
+  let ef = $state({ project_dir: '', description: '', capabilities: '', channel_id: '' });
+
+  function openEditAgent(a) {
+    editTarget = a.name;
+    ef = {
+      project_dir: a.project_dir || '',
+      description: a.description || '',
+      capabilities: (a.capabilities || []).join(', '),
+      channel_id: a.channel_id || '',
+    };
+  }
+  function cancelEditAgent() { editTarget = ''; }
+  async function confirmEditAgent() {
+    if (submitting) return;
+    submitting = true;
+    const name = editTarget;
+    err = ''; msg = '';
+    try {
+      await sendJSON(token, 'POST', `/api/a2a/agents/${encodeURIComponent(name)}/update`, {
+        project_dir: ef.project_dir.trim(),
+        description: ef.description.trim(),
+        capabilities: parseCaps(ef.capabilities),
+        channel_id: ef.channel_id.trim(),
+      });
+      editTarget = '';
+      msg = t('agents.agent.updated', { name });
+      await load();
+    } catch (e) { err = String(e); }
+    finally { submitting = false; }
+  }
+
   // --- callers: register (shows a one-time credential), approve, revoke ---
   let addingCaller = $state(false);
   let cf = $state({ caller_id: '', credential: '' });
@@ -247,6 +283,7 @@
               <td>{(a.capabilities || []).join(', ')}</td>
               <td>{a.enabled ? '✅' : '—'}</td>
               <td class="actions">
+                <button class="mini secondary" onclick={() => openEditAgent(a)}>{t('agents.action.edit')}</button>
                 {#if a.enabled}
                   <button class="mini secondary" onclick={() => post(`/api/a2a/agents/${encodeURIComponent(a.name)}/disable`)}>{t('agents.action.disable')}</button>
                 {:else}
@@ -381,6 +418,22 @@
       </table>
     </div>
   </article>
+{/if}
+
+{#if editTarget}
+  <dialog open>
+    <article>
+      <header><strong>{t('agents.editAgent.title', { name: editTarget })}</strong></header>
+      <label>{t('agents.agent.project')} <input bind:value={ef.project_dir} /></label>
+      <label>{t('agents.agent.desc')} <input bind:value={ef.description} /></label>
+      <label>{t('agents.col.caps')} <input bind:value={ef.capabilities} placeholder={t('agents.agent.capsPlaceholder')} /></label>
+      <label>{t('agents.agent.channel')} <input bind:value={ef.channel_id} /></label>
+      <footer>
+        <button class="secondary" onclick={cancelEditAgent}>{t('common.cancel')}</button>
+        <button onclick={confirmEditAgent} disabled={submitting}>{t('agents.editAgent.submit')}</button>
+      </footer>
+    </article>
+  </dialog>
 {/if}
 
 {#if approveTarget}

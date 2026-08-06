@@ -181,6 +181,78 @@ func TestA2ACLIAgentAddEnabledIsABareFlag(t *testing.T) {
 	}
 }
 
+// agent update 只該把使用者真的帶的 --flag 放進請求 body：admin API 的
+// /update 用 pointer 語意分辨「沒帶」跟「帶了空值」，CLI 這一側如果對每個
+// 選項都塞一個預設值（沒帶的用 ""/nil），就會把使用者沒提到的欄位一起清空
+// ——這正是 Gap 1 報告點名要避免的情況。這裡只帶 --description，body 不該
+// 出現 project_dir/capabilities/channel_id 任何一個 key。
+func TestA2ACLIAgentUpdateOnlySendsProvidedFields(t *testing.T) {
+	var gotPath, gotBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.Method + " " + r.URL.Path
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"updated"}`))
+	}))
+	defer srv.Close()
+	root := seedA2ARoot(t, strings.TrimPrefix(srv.URL, "http://"))
+
+	var out, errOut bytes.Buffer
+	code := runA2ACommand([]string{"agent", "update", "pm", "--description=new desc", "--root", root}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, errOut.String())
+	}
+	if gotPath != "POST /api/a2a/agents/pm/update" {
+		t.Fatalf("path = %q", gotPath)
+	}
+	var body map[string]any
+	if err := json.Unmarshal([]byte(gotBody), &body); err != nil {
+		t.Fatalf("body not JSON: %s", gotBody)
+	}
+	if body["description"] != "new desc" {
+		t.Fatalf("body = %s, missing description", gotBody)
+	}
+	for _, key := range []string{"project_dir", "capabilities", "channel_id", "name", "enabled"} {
+		if _, present := body[key]; present {
+			t.Fatalf("body = %s, key %q must be absent when its flag was never passed (would wipe the field server-side)", gotBody, key)
+		}
+	}
+}
+
+// 帶多個 --flag 時全部要出現在 body 裡，capabilities 要被拆成陣列。
+func TestA2ACLIAgentUpdateMultipleFlags(t *testing.T) {
+	var gotBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"updated"}`))
+	}))
+	defer srv.Close()
+	root := seedA2ARoot(t, strings.TrimPrefix(srv.URL, "http://"))
+
+	var out, errOut bytes.Buffer
+	code := runA2ACommand([]string{
+		"agent", "update", "pm",
+		"--project=/p/pm2", "--capabilities=plan,read", "--channel=chan-2", "--root", root,
+	}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, errOut.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal([]byte(gotBody), &body); err != nil {
+		t.Fatalf("body not JSON: %s", gotBody)
+	}
+	if body["project_dir"] != "/p/pm2" || body["channel_id"] != "chan-2" {
+		t.Fatalf("body = %s", gotBody)
+	}
+	caps, ok := body["capabilities"].([]any)
+	if !ok || len(caps) != 2 || caps[0] != "plan" || caps[1] != "read" {
+		t.Fatalf("capabilities = %#v", body["capabilities"])
+	}
+}
+
 // --root must accept both `--root <dir>` and `--root=<dir>` — runBusyCommand
 // (main.go:745) already accepts both forms; a2a silently ignoring the
 // latter and falling back to ./.channel-agent would target the wrong tree.
