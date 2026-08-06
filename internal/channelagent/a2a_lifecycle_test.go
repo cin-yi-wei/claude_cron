@@ -1310,6 +1310,22 @@ func TestDrainQueueFailsRowsWhoseCallerWasRevoked(t *testing.T) {
 	if !tk.DetailSafe {
 		t.Fatal("DetailSafe = false, want true — an empty prior Detail plus a caller-input-only drain-reject reason must compose as safe")
 	}
+	// I1 的原始防線：拒絕排空必須留下稽核紀錄。這條斷言在補 DetailSafe 時被
+	// 整段換掉，於是「撤銷的呼叫方被靜默 continue 掉」這個回歸一度沒有任何
+	// 測試守著。兩件事要一起驗，不是二選一。
+	entries, err := ReadAudit(root)
+	if err != nil {
+		t.Fatalf("ReadAudit: %v", err)
+	}
+	var rejected bool
+	for _, e := range entries {
+		if e.Outcome == "drain_rejected" && e.ContextID == "c1" {
+			rejected = true
+		}
+	}
+	if !rejected {
+		t.Fatalf("audit = %#v, want a drain_rejected entry for c1", entries)
+	}
 }
 
 // task 8 (D6)：disabling an agent must also stop its already-queued backlog
