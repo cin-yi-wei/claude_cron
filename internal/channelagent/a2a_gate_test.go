@@ -166,23 +166,27 @@ func TestSandboxGateWebAndMCPByLevel(t *testing.T) {
 // 沙盒沒有人可以問。gate 不得寫 pending 檔、不得等 timeout，必須立刻返回 ——
 // 這正是 2026-08-05 規格第 58 行「執行當下不再詢問」的意思。
 //
-// review Minor 3：這個測試原本沒斷言 decision 是什麼，於是它在修 fail-open
-// 之前也會通過（舊的 cc- fail-open 分支一樣立刻回、一樣不寫 pending 檔，
-// 只是理由字串不同）——沒有斷言就等於沒有鎖住任何東西。現在斷言 reason 含
-// "a2a gate:"：這個字串只會出現在沙盒分支自己的回覆裡，修好之前這裡必然
-// 拿到 cc- fail-open 的 "no binding for cwd" 而失敗，證明測試真的有鎖住東
-// 西。decision 本身是 allow：develop 允許 rm 是既有設計（Bash 只做
-// allowlist + metacharacter，不做路徑侷限，規格第五節列的已知限制），這裡
-// 測的不是「該不該擋 rm -rf /」，是「沙盒分支有沒有立刻自己回答，不問人」。
+// review Minor 3（第一輪）：這個測試原本沒斷言 decision 是什麼，於是它在
+// 修 fail-open 之前也會通過（舊的 cc- fail-open 分支一樣立刻回、一樣不寫
+// pending 檔，只是理由字串不同）——沒有斷言就等於沒有鎖住任何東西。
+//
+// review Minor（第二輪）：上一輪的修法連 decision 本身（"allow"）也一起
+// 斷言了——develop 目前允許 rm 是既有設計，但這條測試的目的是「沙盒分支有
+// 沒有立刻自己回答，不問人」，不是「該不該放行 rm -rf /」。把 verdict 也
+// 鎖進去，將來任何限縮 develop 路徑寫入範圍的改動（哪怕是正確、加分的改
+// 動）都會被這裡誤判成回歸。只斷言 reason 含 "a2a gate:"：這個字串只會出
+// 現在沙盒分支自己的回覆裡，舊的 cc- fail-open 回的是完全不同的字串
+// （"permission gate: no binding for cwd, allowing"），足以證明「是沙盒分
+// 支在立刻回答」，不需要也不該綁死 verdict。
 func TestSandboxGateNeverAsksChannel(t *testing.T) {
 	root, registryRoot, worktree := seedSandbox(t, GrantDevelop)
 	start := time.Now()
-	d, r := gateOutput(t, registryRoot, `{"cwd":"`+worktree+`","tool_name":"Bash","tool_input":{"command":"rm -rf /"}}`)
+	_, r := gateOutput(t, registryRoot, `{"cwd":"`+worktree+`","tool_name":"Bash","tool_input":{"command":"rm -rf /"}}`)
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
 		t.Fatalf("sandbox gate blocked for %s; it must answer immediately", elapsed)
 	}
-	if d != "allow" || !strings.Contains(r, "a2a gate:") {
-		t.Fatalf("sandbox gate decision = %q (%s); want allow from the sandbox branch itself, not the cc- fail-open", d, r)
+	if !strings.Contains(r, "a2a gate:") {
+		t.Fatalf("sandbox gate reason = %q; want it to come from the sandbox branch itself, not the cc- fail-open", r)
 	}
 	for _, dir := range []string{registryRoot, root} {
 		entries, _ := os.ReadDir(filepath.Join(dir, "permissions", "pending"))
@@ -304,10 +308,15 @@ func TestSandboxGatePolicySelfConsistencyEnforced(t *testing.T) {
 	}
 }
 
-// review Minor 2：readonly（develop 也一樣經過 readonlyGitSubs 的 "remote"）
-// 原本沒檢查 `git remote` 自己的子命令——set-url 可以把 origin 換掉，develop
-// 允許的 git push 接著就把東西送到攻擊者的遠端。安全的用法（列出/顯示）仍
-// 要放行，否則 readonly 連看 remote 設定都不能看。
+// review Minor 2（第一輪）：readonly（develop 也一樣經過 readonlyGitSubs 的
+// "remote"）原本沒檢查 `git remote` 自己的子命令——set-url 可以把 origin 換
+// 掉，develop 允許的 git push 接著就把東西送到攻擊者的遠端。安全的用法（列
+// 出）仍要放行，否則 readonly 連看 remote 設定都不能看。
+//
+// review Important（第二輪）：`git remote show origin` 已從允許清單移除
+// （見 gitDecision 旁的說明：不帶 -n 會連網查詢，readonly 規格是
+// no-outbound）——這裡的期望值從上一輪的 "allow" 改成 "deny"，並用
+// TestSandboxGateGitRemoteShowDeniedNetwork 額外驗證帶 URL 的形式。
 func TestSandboxGateGitRemoteMutationDenied(t *testing.T) {
 	for _, c := range []struct {
 		cmd  string
@@ -315,8 +324,8 @@ func TestSandboxGateGitRemoteMutationDenied(t *testing.T) {
 	}{
 		{"git remote", "allow"},
 		{"git remote -v", "allow"},
-		{"git remote show origin", "allow"},
 		{"git remote get-url origin", "allow"},
+		{"git remote show origin", "deny"},
 		{"git remote set-url origin https://evil.example/x.git", "deny"},
 		{"git remote add evil https://evil.example/x.git", "deny"},
 		{"git remote remove origin", "deny"},
@@ -327,6 +336,178 @@ func TestSandboxGateGitRemoteMutationDenied(t *testing.T) {
 		if d, r := gateOutput(t, registryRoot, hook); d != c.want {
 			t.Errorf("cmd=%q -> %q (%s), want %q", c.cmd, d, r, c.want)
 		}
+	}
+}
+
+// review Important（第二輪）：`git remote show` 沒有 -n 會對遠端發網路查
+// 詢——用真的 `git remote show --help` 驗證過官方文件寫「-n do not query
+// remotes」。readonly 規格明講 no-outbound，兩種寫法（已設定好的 remote 名
+// 字、憑空一個 URL）都必須擋。
+func TestSandboxGateGitRemoteShowDeniedNetwork(t *testing.T) {
+	for _, cmd := range []string{
+		"git remote show origin",
+		"git remote show https://evil.example/x",
+	} {
+		_, registryRoot, worktree := seedSandbox(t, GrantReadOnly)
+		body, _ := json.Marshal(map[string]any{"command": cmd})
+		hook := `{"cwd":"` + worktree + `","tool_name":"Bash","tool_input":` + string(body) + `}`
+		if d, r := gateOutput(t, registryRoot, hook); d != "deny" {
+			t.Fatalf("cmd=%q -> %q (%s); must deny (network)", cmd, d, r)
+		}
+	}
+}
+
+// review Critical（第二輪）：`git diff --output=/path` 真的把目標檔案清空
+// 重寫過——--output 是 diff/log/show 共用同一套 machinery 的旗標，不是 shell
+// 重定向，bashMetaChars 的 ">" 檢查完全看不到它。三個子命令都要擋，且 log/
+// show 各自的正常用法（--oneline、-p、--stat……）仍要放行。
+func TestSandboxGateGitDiffLogShowOutputFlagDenied(t *testing.T) {
+	for _, cmd := range []string{
+		"git diff --output=/etc/hosts",
+		"git log --output=/etc/hosts",
+		"git show --output=/etc/hosts",
+	} {
+		_, registryRoot, worktree := seedSandbox(t, GrantReadOnly)
+		body, _ := json.Marshal(map[string]any{"command": cmd})
+		hook := `{"cwd":"` + worktree + `","tool_name":"Bash","tool_input":` + string(body) + `}`
+		if d, r := gateOutput(t, registryRoot, hook); d != "deny" {
+			t.Fatalf("cmd=%q -> %q (%s); must deny (writes to arbitrary file)", cmd, d, r)
+		}
+	}
+	for _, cmd := range []string{"git diff --stat", "git log --oneline", "git show -p"} {
+		_, registryRoot, worktree := seedSandbox(t, GrantReadOnly)
+		body, _ := json.Marshal(map[string]any{"command": cmd})
+		hook := `{"cwd":"` + worktree + `","tool_name":"Bash","tool_input":` + string(body) + `}`
+		if d, _ := gateOutput(t, registryRoot, hook); d != "allow" {
+			t.Errorf("legitimate cmd=%q got %q, want allow", cmd, d)
+		}
+	}
+}
+
+// review Important（第二輪）：`git branch -D <name>` 真的刪掉了分支——分支
+// 存在主 repo 底下，是所有從它切出去的 worktree 共用的；readonly 動得了分
+// 支，就等於動得了跟這個沙盒共用同一個主 repo 的其他 ~40 個 cc- binding。
+// -m（改名）同一類風險，一起擋。列出用的旗標（-a、-r、-v、--list）仍要放
+// 行，否則 readonly 連看分支清單都不能看。
+func TestSandboxGateGitBranchMutationDenied(t *testing.T) {
+	for _, c := range []struct {
+		cmd  string
+		want string
+	}{
+		{"git branch", "allow"},
+		{"git branch -a", "allow"},
+		{"git branch -r", "allow"},
+		{"git branch --list", "allow"},
+		{"git branch -D evil-target", "deny"},
+		{"git branch -m new-name", "deny"},
+		{"git branch -M new-name", "deny"},
+		{"git branch -d some-branch", "deny"},
+	} {
+		_, registryRoot, worktree := seedSandbox(t, GrantReadOnly)
+		body, _ := json.Marshal(map[string]any{"command": c.cmd})
+		hook := `{"cwd":"` + worktree + `","tool_name":"Bash","tool_input":` + string(body) + `}`
+		if d, r := gateOutput(t, registryRoot, hook); d != c.want {
+			t.Errorf("cmd=%q -> %q (%s), want %q", c.cmd, d, r, c.want)
+		}
+	}
+}
+
+// review Critical（第二輪）：`find <path> -name '*.go' -delete` 真的刪除
+// 了檔案——第一輪只擋了 -exec 系列，-delete 完全沒擋到，這正是黑名單模式
+// 的漏洞。-fprint/-fprint0/-fls 是同一類（把輸出寫進攻擊者指定的檔案），一
+// 併驗證。單純用來過濾的用法（-name、-type、-maxdepth）仍要放行。
+func TestSandboxGateFindDeleteAndFprintEscapesDenied(t *testing.T) {
+	for _, cmd := range []string{
+		`find /x -name '*.go' -delete`,
+		`find /x -fprint /tmp/exfil.txt`,
+		`find /x -fprint0 /tmp/exfil.txt`,
+		`find /x -fls /tmp/exfil.txt`,
+	} {
+		_, registryRoot, worktree := seedSandbox(t, GrantReadOnly)
+		body, _ := json.Marshal(map[string]any{"command": cmd})
+		hook := `{"cwd":"` + worktree + `","tool_name":"Bash","tool_input":` + string(body) + `}`
+		if d, r := gateOutput(t, registryRoot, hook); d != "deny" {
+			t.Fatalf("cmd=%q -> %q (%s); must deny", cmd, d, r)
+		}
+	}
+	for _, cmd := range []string{`find /x -name '*.go'`, `find /x -type f -maxdepth 2`} {
+		_, registryRoot, worktree := seedSandbox(t, GrantReadOnly)
+		body, _ := json.Marshal(map[string]any{"command": cmd})
+		hook := `{"cwd":"` + worktree + `","tool_name":"Bash","tool_input":` + string(body) + `}`
+		if d, _ := gateOutput(t, registryRoot, hook); d != "allow" {
+			t.Errorf("legitimate cmd=%q got %q, want allow", cmd, d)
+		}
+	}
+}
+
+// review Critical（第二輪）：`rg --pre=/usr/bin/id x f.txt` 用 ripgrep 官方
+// 支援的 --pre 旗標執行任意程式（ripgrep 文件：對每個檔案改成搜尋
+// COMMAND PATH 的標準輸出，COMMAND 就是攻擊者指定的那個）。--pre=/bin/rm
+// 是同一個旗標的另一個 payload。一般的搜尋旗標（-i、-n、-r）仍要放行。
+func TestSandboxGateRipgrepPreFlagDenied(t *testing.T) {
+	for _, cmd := range []string{
+		`rg --pre=/usr/bin/id x f.txt`,
+		`rg --pre=/bin/rm x f.txt`,
+	} {
+		_, registryRoot, worktree := seedSandbox(t, GrantReadOnly)
+		body, _ := json.Marshal(map[string]any{"command": cmd})
+		hook := `{"cwd":"` + worktree + `","tool_name":"Bash","tool_input":` + string(body) + `}`
+		if d, r := gateOutput(t, registryRoot, hook); d != "deny" {
+			t.Fatalf("cmd=%q -> %q (%s); must deny (arbitrary exec)", cmd, d, r)
+		}
+	}
+	for _, cmd := range []string{"rg -in TODO .", "rg -r TODO ."} {
+		_, registryRoot, worktree := seedSandbox(t, GrantReadOnly)
+		body, _ := json.Marshal(map[string]any{"command": cmd})
+		hook := `{"cwd":"` + worktree + `","tool_name":"Bash","tool_input":` + string(body) + `}`
+		if d, _ := gateOutput(t, registryRoot, hook); d != "allow" {
+			t.Errorf("legitimate cmd=%q got %q, want allow", cmd, d)
+		}
+	}
+}
+
+// review Minor（第二輪）：`tree -o FILE` 與 `file -C -m x` 都是「用一個沒被
+// 想到的旗標寫檔案」的同一個模式，用真的指令行為驗證過（tree 的 man page：
+// -o Output to file instead of stdout；file 的 -C：build a compiled magic
+// file，會落地成 <magic>.mgc）。純顯示用法仍要放行。
+func TestSandboxGateTreeAndFileWriteFlagsDenied(t *testing.T) {
+	for _, cmd := range []string{"tree -o /tmp/exfil.txt .", "file -C -m x"} {
+		_, registryRoot, worktree := seedSandbox(t, GrantReadOnly)
+		body, _ := json.Marshal(map[string]any{"command": cmd})
+		hook := `{"cwd":"` + worktree + `","tool_name":"Bash","tool_input":` + string(body) + `}`
+		if d, r := gateOutput(t, registryRoot, hook); d != "deny" {
+			t.Fatalf("cmd=%q -> %q (%s); must deny (writes a file)", cmd, d, r)
+		}
+	}
+	for _, cmd := range []string{"tree -a .", "file -b x"} {
+		_, registryRoot, worktree := seedSandbox(t, GrantReadOnly)
+		body, _ := json.Marshal(map[string]any{"command": cmd})
+		hook := `{"cwd":"` + worktree + `","tool_name":"Bash","tool_input":` + string(body) + `}`
+		if d, _ := gateOutput(t, registryRoot, hook); d != "allow" {
+			t.Errorf("legitimate cmd=%q got %q, want allow", cmd, d)
+		}
+	}
+}
+
+// review Minor（第二輪）：<worktree>/.mcp.json 是 gate-adjacent 設定
+// （registers commands Claude Code will run）——跟 settings.local.json 是
+// 同一類風險，三個等級都不能改。<worktree>/.claude/settings.json（非
+// local）刻意不擋：hooks 合併疊加，改那個檔案沒辦法拿掉閘門自己的 hook。
+func TestSandboxGateCannotWriteMCPConfig(t *testing.T) {
+	for _, level := range []GrantLevel{GrantReadOnly, GrantDevelop, GrantFull} {
+		_, registryRoot, worktree := seedSandbox(t, level)
+		target := filepath.Join(worktree, ".mcp.json")
+		hook := `{"cwd":"` + worktree + `","tool_name":"Write","tool_input":{"file_path":"` + target + `"}}`
+		if d, r := gateOutput(t, registryRoot, hook); d != "deny" {
+			t.Fatalf("level %s: write to .mcp.json got %q (%s); must deny", level, d, r)
+		}
+	}
+	// settings.json（非 local）刻意留著能寫：hooks 是合併，不是覆蓋。
+	_, registryRoot, worktree := seedSandbox(t, GrantDevelop)
+	target := filepath.Join(worktree, ".claude", "settings.json")
+	hook := `{"cwd":"` + worktree + `","tool_name":"Write","tool_input":{"file_path":"` + target + `"}}`
+	if d, _ := gateOutput(t, registryRoot, hook); d != "allow" {
+		t.Errorf(".claude/settings.json (non-local) write got denied; hooks merge so this isn't gate-adjacent")
 	}
 }
 
