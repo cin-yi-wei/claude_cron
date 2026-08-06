@@ -4,6 +4,7 @@
   import Settings from './Settings.svelte';
   import CreateBinding from './CreateBinding.svelte';
   import ChatLayout from './ChatLayout.svelte';
+  import Agents from './Agents.svelte';
   import { t, getLocale, setLocale, LOCALES } from './lib/i18n.svelte.js';
 
   let token = $state(localStorage.getItem('cc_admin_token') || '');
@@ -35,8 +36,21 @@
     { id: 'chat', key: 'nav.chat', href: '#/chat' },
     { id: 'create', key: 'nav.create', href: '#/create' },
     { id: 'triggers', key: 'nav.triggers', href: '#/triggers' },
+    { id: 'agents', key: 'nav.agents', href: '#/agents' },
     { id: 'settings', key: 'nav.settings', href: '#/settings' },
   ];
+
+  // A2A 頁只在 /api/config 回報 a2a_enabled 為真時才顯示在 nav 上；即使
+  // 沒顯示，直接打 #/agents 這個 hash 還是進得去 —— Agents.svelte 自己會
+  // 在該情境下把後端 404 轉譯成「A2A 已停用」的提示，不是硬藏路由。
+  let a2aEnabled = $state(false);
+  $effect(() => {
+    fetch('/api/config', { headers: token ? { Authorization: 'Bearer ' + token } : {} })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((c) => (a2aEnabled = !!(c && c.a2a_enabled)))
+      .catch(() => (a2aEnabled = false));
+  });
+  const visibleNav = $derived(nav.filter((n) => n.id !== 'agents' || a2aEnabled));
 </script>
 
 <nav class="container-fluid topnav">
@@ -53,7 +67,7 @@
       </svg>
       <strong>claude_cron</strong>
     </li>
-    {#each nav as n}
+    {#each visibleNav as n}
       <li><a href={n.href} class={route.view === n.id ? 'active' : ''}>{t(n.key)}</a></li>
     {/each}
     <li class="spacer"></li>
@@ -77,6 +91,8 @@
     <CreateBinding {token} onCreated={() => (location.hash = '#/bindings')} />
   {:else if route.view === 'triggers'}
     <Triggers {token} />
+  {:else if route.view === 'agents'}
+    <Agents {token} />
   {:else if route.view === 'settings'}
     <Settings bind:token />
   {:else if route.view === 'chat'}
