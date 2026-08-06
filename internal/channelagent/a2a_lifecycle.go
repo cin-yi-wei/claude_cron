@@ -135,19 +135,24 @@ func parseRFC3339(s string) (time.Time, bool) {
 // unrecoverable-orphan class finding 1 exists to close, reintroduced through
 // the bookkeeping step meant to fix it.
 //
-// stopSession records whether this candidate's tmux session (and driver)
-// should actually be stopped as part of teardown, or whether it was already
-// stopped earlier and stopping it again here would be redundant (the
-// canceled-row scan below picks up every TaskCanceled row, including ones
-// canceled by an EARLIER sweep pass whose session was stopped back then).
-// This must be re-verified under the same session lock as the rest of
-// teardown, same as everything else here (task 7 review round 2, critical
-// finding): stopping is exactly as destructive as removing, so it gets
-// exactly the same guard, never one done outside it and one done inside.
+// Stopping this candidate's session (and driver) is NOT conditional on how
+// it got here (task 7 review round 3, critical finding): step 2 always
+// attempts sm.Stop/stopper.Stop for a non-empty session, on every single
+// pass that reaches this candidate, whether or not an earlier pass already
+// canceled or attempted it. A per-pass flag recording "does THIS pass need
+// to stop it" (this type used to carry one, derived from a map of rows
+// canceled in the CURRENT pass only) cannot survive a pass where the
+// teardown lock was busy: the candidate is skipped entirely that pass, and
+// on the NEXT pass the row is no longer "freshly canceled", so a
+// per-pass-derived flag would read false and let removeCandidate delete the
+// worktree/sandbox root while the tmux session (and its driver) keep
+// running untouched — a live pane with a deleted cwd, referenced by no row,
+// findable by no future sweep. sm.Stop/stopper.Stop on an already-stopped
+// or never-started session is a harmless no-op, so re-attempting it every
+// pass has no downside and closes this hole completely.
 type reclaimCandidate struct {
 	taskID, contextID, projectDir, worktree, session string
 	state                                            TaskState
-	stopSession                                      bool
 }
 
 // stopTarget is a session this sweep pass wants to stop but does NOT want
@@ -159,6 +164,22 @@ type reclaimCandidate struct {
 // up. It never becomes a reclaimCandidate, so without its own identity
 // snapshot it would have no guard at all against the same resubmission race
 // candidates are guarded against (task 7 review round 2, critical finding).
+//
+// Appended once, at the exact instant of the TaskDispatching→TaskFailed
+// transition — deliberately NOT re-derived by scanning every TaskFailed row
+// on later passes (see the "why one-shot" note at its one call site in
+// SweepTimeouts's step 1). Its Session is also never cleared afterward, even
+// on a successful stop: clearing it alone (keeping Worktree) was tried and
+// reverted (task 7 review round 3, important finding) — it left a row with
+// Worktree != "" and Session == "", which is exactly the identity-less state
+// the reclaimCandidate loop below refuses to touch. A row can legitimately
+// be both a stopTarget (this pass) and a reclaimCandidate later (the
+// failed-sandbox-cap trim, if it also holds a Worktree) — that overlap means
+// its session can be stopped twice across the two loops in the same pass;
+// harmless (sm.Stop/stopper.Stop no-op on an already-stopped session), but
+// step 3 has no write-back for stopTarget at all, so there is no spurious
+// "changed before its session-stop could be recorded" log from this
+// overlap (task 7 review round 3, minor finding).
 type stopTarget struct {
 	taskID, contextID, session string
 	state                      TaskState
@@ -215,9 +236,20 @@ type SandboxStopper interface {
 //     inside this same lock-then-verify block; none of them ever runs
 //     before or outside it (task 7 review round 2, critical finding: a
 //     tmux stop issued outside this guard can kill a brand-new session a
-//     resubmission just created at the same deterministic name). A removal
-//     failure is logged and left for a later sweep to retry — the candidate
-//     stays out of the "succeeded" list below.
+//     resubmission just created at the same deterministic name). The stop
+//     is unconditional on every attempt that reaches it — never gated by
+//     whether an EARLIER pass might already have stopped it (task 7 review
+//     round 3, critical finding: a flag derived fresh each pass cannot
+//     survive a pass where the lock was busy, so a later pass would delete
+//     the worktree/sandbox root having never actually stopped the live
+//     session; sm.Stop/stopper.Stop on an already-stopped session is a
+//     no-op, so repeating it costs nothing). A reclaimCandidate with no
+//     session name at all is never touched by this step — there is no
+//     lock to take on an empty name, so there is no safe way to re-verify
+//     it right before acting (task 7 review round 3, important finding);
+//     it is logged and left for manual inspection rather than risked. A
+//     removal failure is logged and left for a later sweep to retry — the
+//     candidate stays out of the "succeeded" list below.
 //  3. Take the lock again and, for each succeeded candidate, clear
 //     Worktree/Session ONLY if the row at that contextId still has the
 //     exact same TaskID, State, Worktree and Session recorded in step 1. A
@@ -245,15 +277,9 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 	// Sessions to stop are collected under the lock but stopped after it is
 	// released: sm.Stop shells out to tmux, and nothing that touches a
 	// session or process may run while tasksMu is held (the same rule the
-	// executor's dispatch follows for the same reason). justCanceled tracks,
-	// by contextId, which rows this very pass transitioned to TaskCanceled
-	// below — the canceled-row scan further down uses it to decide whether a
-	// reclaimCandidate it builds for that row still needs its session
-	// stopped (freshly canceled this pass) or was already stopped by an
-	// earlier sweep pass (an older TaskCanceled row).
+	// executor's dispatch follows for the same reason).
 	var stopOnly []stopTarget
 	var candidates []reclaimCandidate
-	justCanceled := map[string]bool{}
 
 	// A task only records its owning agent's name, not its ProjectDir, so
 	// resolve it here the same way SandboxExecutor.Start does. A load failure
@@ -350,7 +376,6 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 				default:
 					continue
 				}
-				justCanceled[t.ContextID] = true
 				t.State = TaskCanceled
 				// 保留卡住前就已經留在 Detail 裡的線索(最常見的是 task 4 的
 				// TrustFolder 失敗警告):如果只用 sweep 自己的 reason 蓋掉它,
@@ -384,7 +409,6 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 				candidates = append(candidates, reclaimCandidate{
 					taskID: t.TaskID, contextID: t.ContextID, projectDir: projectDirFor(t.Agent),
 					worktree: t.Worktree, session: t.Session, state: t.State,
-					stopSession: t.Session != "",
 				})
 			}
 		}
@@ -394,13 +418,11 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 		// a worktree or session is reclaim-eligible — including one just
 		// transitioned above this same pass (tasks.Tasks already reflects
 		// that mutation here), one canceled by an earlier sweep, and one
-		// whose earlier removal attempt failed and is being retried. Whether
-		// its session still needs stopping depends on whether THIS pass is
-		// the one that canceled it (justCanceled — its session is still
-		// live, teardown proper hasn't happened yet) or an earlier pass
-		// already did (its session was already stopped back then; stopping
-		// again here would be redundant, not incorrect, but stopSession
-		// keeps it precise).
+		// whose earlier removal attempt failed and is being retried. Step 2
+		// always attempts to stop a non-empty session before removing it,
+		// regardless of whether THIS pass or an earlier one did the
+		// canceling — see reclaimCandidate's doc comment for why a
+		// per-pass-derived "already stopped" flag is unsafe here.
 		for i := range tasks.Tasks {
 			t := tasks.Tasks[i]
 			if t.State != TaskCanceled {
@@ -412,7 +434,6 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 			candidates = append(candidates, reclaimCandidate{
 				taskID: t.TaskID, contextID: t.ContextID, projectDir: projectDirFor(t.Agent),
 				worktree: t.Worktree, session: t.Session, state: t.State,
-				stopSession: justCanceled[t.ContextID],
 			})
 		}
 
@@ -440,7 +461,6 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 				candidates = append(candidates, reclaimCandidate{
 					taskID: t.TaskID, contextID: t.ContextID, projectDir: projectDirFor(t.Agent),
 					worktree: t.Worktree, session: t.Session, state: t.State,
-					stopSession: t.Session != "",
 				})
 			}
 		}
@@ -464,32 +484,37 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 
 	// --- Step 2: 鎖外。每個 session 一把鎖，鎖內才准動手，動不了就放棄。 ---
 	//
-	// stopOnly 的 session（TaskFailed 殘留、只停不拆）先處理：成功停掉的記
-	// 進 succeededStops，供第 3 步清掉 Session（只清這一欄，Worktree/Detail
-	// 留給鑑識）——沒有這一步，下一趟 sweep 的 TaskFailed 掃描會看到同一個
-	// Session 又跑一次 stop（無害但多餘），而且沒有任何訊號告訴下一趟「這個
-	// 已經停過了」。
-	var succeededStops []stopTarget
+	// stopOnly 的 session（TaskFailed 殘留、只停不拆）先處理。刻意不追蹤
+	// 「哪些成功了」、也不對 row 做任何寫回：這個 stopTarget 本身就是一次性
+	// 判定（見 stopTarget 的說明），Session 欄位留給鑑識原封不動——task 7
+	// review round 3, important finding 證明了「只清 Session、不清
+	// Worktree」會讓一列失去唯一能安全重新確認它的識別資訊，之後任何路徑
+	// 想再動它的 worktree 都沒有 session 名可以鎖。不清欄位就沒有這個問題。
 	for _, st := range stopOnly {
-		if stopSessionGuarded(ctx, root, sm, stopper, st) {
-			succeededStops = append(succeededStops, st)
-		}
+		stopSessionGuarded(ctx, root, sm, stopper, st)
 	}
 
 	// candidates 這邊，「要不要動手」與「動手」發生在同一把鎖之內，任何一個
 	// 破壞性動作（停 driver、停 tmux session、刪 worktree、刪 sandbox
 	// root）都不例外（task 7 review round 2, critical finding：只要有一項
 	// 漏在鎖外或查核之前，這個 session 就可能是合法追問剛剛重新建起來的活
-	// 東西，不是第 1 步選中的那個）。
+	// 東西，不是第 1 步選中的那個）。停 session 不再看任何「這一輪是不是剛
+	// 好轉換」的旗標——每一次真的要動手拆除，都無條件先停一次 driver 與
+	// tmux（對已經停過的呼叫本身無害），這樣「這一輪被鎖擋下、下一輪才真正
+	// 動手」的重試序列，停止動作永遠跟拆除動作綁在同一次嘗試裡，不會漏掉
+	// （task 7 review round 3, critical finding）。
 	var succeeded []reclaimCandidate
 	for _, c := range candidates {
 		if c.session == "" {
-			// 沒有 session 可鎖：這個 candidate 只有 worktree 要清，理論上
-			// 不會發生（Worktree 一律搭配 Session 產生），但沒有 session 名
-			// 就沒有東西可能被合法追問重新建立，直接動手不需要鎖。
-			if removeCandidate(ctx, root, sm, c) {
-				succeeded = append(succeeded, c)
-			}
+			// 沒有 session 名可鎖：這代表這一列已經失去「用哪個 session 名
+			// 確定性推導出這條 worktree」的識別資訊——理論上不會發生
+			// （Worktree 一律搭配 Session 產生），而且沒有 session 名就沒有
+			// 鎖可拿，連 candidateStillMatches 的「查完再動手」都會在查完
+			// 之後、動手之中留一個沒有任何機制能關閉的窗口（task 7 review
+			// round 3, important finding）。與其冒風險做一次形同沒做的檢
+			// 查，直接跳過、等有人補上識別資訊或人工處理，絕不在沒有辦法
+			// 安全重新確認的情況下刪任何東西。
+			log.Printf("a2a: sweep: context %s 的 worktree %s 沒有 session 身分可以安全重新確認，本輪跳過（需要人工檢查）", c.contextID, c.worktree)
 			continue
 		}
 		unlock, ok := tryLockSandboxSessionForTeardown(c.session)
@@ -502,17 +527,15 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 			unlock()
 			continue
 		}
-		if c.stopSession {
-			// 先停 driver 再停 tmux，最後才動磁碟：cycle 的順序是 collect →
-			// sweep → drain → EnsureSandboxDrivers，所以 sweep 動手時 driver
-			// 還活著，它下一輪 RunWorkerOnce 的第一件事就是 Init(root)，會把
-			// 即將刪掉的目錄樹重建回來（task 7, D4）。三者現在都在同一把鎖、
-			// 同一次身分確認之後才執行，缺一都不行。
-			if stopper != nil {
-				stopper.Stop(c.session)
-			}
-			_ = sm.Stop(ctx, c.session)
+		// 先停 driver 再停 tmux，最後才動磁碟：cycle 的順序是 collect →
+		// sweep → drain → EnsureSandboxDrivers，所以 sweep 動手時 driver 還
+		// 活著，它下一輪 RunWorkerOnce 的第一件事就是 Init(root)，會把即將
+		// 刪掉的目錄樹重建回來（task 7, D4）。三者現在都在同一把鎖、同一次
+		// 身分確認之後、每一次嘗試都無條件執行，缺一都不行。
+		if stopper != nil {
+			stopper.Stop(c.session)
 		}
+		_ = sm.Stop(ctx, c.session)
 		ok2 := removeCandidate(ctx, root, sm, c)
 		unlock()
 		if ok2 {
@@ -538,7 +561,7 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 	// keeps whatever fields it currently has, and if it is genuinely still
 	// the same reclaim candidate (e.g. a transient mismatch that wasn't
 	// actually a race), the next sweep picks it up again.
-	if len(succeeded) > 0 || len(succeededStops) > 0 {
+	if len(succeeded) > 0 {
 		err2 := WithTasks(root, func(tasks *TaskStore) error {
 			changed := false
 			for _, c := range succeeded {
@@ -555,28 +578,6 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 					t.Session = ""
 					tasks.Tasks[i] = t
 					reclaimed++
-					changed = true
-					break
-				}
-			}
-			// stopOnly successes only ever clear Session — Worktree, Detail
-			// and CompletedAt stay exactly as they are, since the forensics
-			// exemption for this TaskFailed row is untouched by stopping its
-			// lingering tmux session. Session == "" is also what makes the
-			// TaskFailed scan in step 1 stop re-deriving a stopTarget for
-			// this row on every future pass.
-			for _, st := range succeededStops {
-				for i := range tasks.Tasks {
-					t := tasks.Tasks[i]
-					if t.ContextID != st.contextID {
-						continue
-					}
-					if t.TaskID != st.taskID || t.State != st.state || t.Session != st.session {
-						log.Printf("a2a: sweep: context %s changed before its session-stop could be recorded (now task %s, state %s); leaving it untouched", st.contextID, t.TaskID, t.State)
-						break
-					}
-					t.Session = ""
-					tasks.Tasks[i] = t
 					changed = true
 					break
 				}
@@ -609,25 +610,24 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 // driver 收掉）。拿不到鎖，或鎖內重新確認發現身分已經變了，都直接放棄，留
 // 給下一次 sweep —— 跟 candidates 那邊同一套規則，絕不在查核之前或鎖外做
 // 任何破壞性動作。
-func stopSessionGuarded(ctx context.Context, root string, sm SessionManager, stopper SandboxStopper, st stopTarget) bool {
+func stopSessionGuarded(ctx context.Context, root string, sm SessionManager, stopper SandboxStopper, st stopTarget) {
 	if st.session == "" {
-		return false
+		return
 	}
 	unlock, ok := tryLockSandboxSessionForTeardown(st.session)
 	if !ok {
 		log.Printf("a2a: sweep: context %s 的 session %s 目前正在使用中，本輪跳過停止，留給下一次 sweep", st.contextID, st.session)
-		return false
+		return
 	}
 	defer unlock()
 	if !stopTargetStillMatches(root, st) {
 		log.Printf("a2a: sweep: context %s 在停止前已換身分，跳過（不動它的 session）", st.contextID)
-		return false
+		return
 	}
 	if stopper != nil {
 		stopper.Stop(st.session)
 	}
 	_ = sm.Stop(ctx, st.session)
-	return true
 }
 
 // stopTargetStillMatches 是 stopSessionGuarded 專用的重確認：只比對

@@ -712,18 +712,22 @@ func TestSweepPreservesPriorDetailOnStaleDispatch(t *testing.T) {
 // review round 2, important 3：原本這裡用 FakeSessionManager.OnRemove 在
 // RemoveWorkspace 裡面才模擬重新提交,但那已經是 tryLockSandboxSessionForTeardown
 // 成功、candidateStillMatches 也通過之後的事了 —— 測到的其實是第 3 步既有
-// 的帳面比對,不是這個任務新加的鎖／重確認。把 candidateStillMatches 與鎖整
-// 段刪掉,這個舊寫法照樣會過(os.RemoveAll 對不存在的路徑回 nil,斷言只讀
-// row)。
+// 的帳面比對,不是這個任務新加的鎖／重確認。
 //
-// 改成把「持有共享鎖」這個真正的把柄移到 sweep 開始「之前」：直接呼叫
-// lockSandboxSession（session 鎖同一顆物件、同一個 RWMutex）模擬一個正在
-// 建立中的 Start（或正在投遞的 DeliverFollowUp）持有它，並在持有期間把 row
-// 換成新身分（等同真正 Start 的 persist() 會做的事）。這是真正的鎖競爭
-// （tryLockSandboxSessionForTeardown 底下呼叫的是同一個 RWMutex 的
-// TryLock），不是計時賭注：只要共享鎖還被握著，TryLock 不管排程如何都會失
-// 敗。斷言也從「row 沒被清空」升級成「stop 與 remove 兩類破壞性動作全部沒
-// 發生、sandbox root 目錄真的還在磁碟上」。
+// review round 3：修成「在呼叫 sweep 之前就把 row 換成新身分」之後,又踩到
+// 完全同一類問題,只是搬了位置：新身分一旦在 sweep 呼叫之前就寫進 row,第 1
+// 步根本不會把舊身分選成 candidate,sweep 不管有沒有守衛都什麼都不做——刪
+// 掉 tryLockSandboxSessionForTeardown 跟 candidateStillMatches 整段,這個版
+// 本一樣會過。
+//
+// 真正修法：用一個真正的 goroutine 模擬「一個正在建立中的 Start」——它先搶
+// 下共享鎖,發訊號說「鎖已經握住」,然後卡住不動,等主測試 goroutine 明確放
+// 行才把新身分寫進 row。sweep 必須在「鎖已經握住、但 row 還沒被覆寫」這個真
+// 實存在、由 <-entered 精確釘死的瞬間執行——這正是真正的 Start 在拿到鎖與呼
+// 叫 persist() 之間會有的那個窗口,不是計時賭注,因為 entered 通道保證這個
+// 順序不會被排程打亂。sweep 執行的那一刻,第 1 步看到的還是舊身分（真的被
+// 選成 candidate),第 2 步嘗試拿鎖時鎖確定被握著（TryLock 保證失敗，不是機
+// 率性的),所以這個版本能同時證明「候選有被選中」與「守衛擋下了它」。
 func TestSweepDoesNotDestroyAResubmittedIdentity(t *testing.T) {
 	root := t.TempDir()
 	now := time.Now().UTC()
@@ -742,48 +746,206 @@ func TestSweepDoesNotDestroyAResubmittedIdentity(t *testing.T) {
 		t.Fatalf("Init: %v", err)
 	}
 
-	// 在 sweep 開始之前就把共享鎖握住並換成新身分 —— 這正是 D3(a) 要擋的窗口
-	// 本身，不是它的事後結果。
-	unlock := lockSandboxSession(session)
-	if err := WithTasks(root, func(tasks *TaskStore) error {
-		tasks.Upsert(A2ATask{
-			ContextID: "c1", TaskID: "t-new", Agent: "a", Session: session,
-			Worktree: "/p/aa-a-c1", State: TaskDispatching, Level: GrantDevelop,
-			StartedAt: now.Format(time.RFC3339), DispatchedAt: now.Format(time.RFC3339),
+	entered := make(chan struct{})
+	hold := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		// 一個真正的 Start 會先搶共享鎖，再呼叫 persist() 覆寫 row —— 這兩
+		// 件事之間有真實的窗口：鎖已經握住，row 還是舊的。
+		unlock := lockSandboxSession(session)
+		defer unlock()
+		close(entered)
+		<-hold
+		_ = WithTasks(root, func(tasks *TaskStore) error {
+			tasks.Upsert(A2ATask{
+				ContextID: "c1", TaskID: "t-new", Agent: "a", Session: session,
+				Worktree: "/p/aa-a-c1", State: TaskDispatching, Level: GrantDevelop,
+				StartedAt: now.Format(time.RFC3339), DispatchedAt: now.Format(time.RFC3339),
+			})
+			return nil
 		})
-		return nil
-	}); err != nil {
-		unlock()
-		t.Fatalf("WithTasks (simulate resubmission): %v", err)
-	}
+	}()
+	<-entered // 共享鎖已經握住；row 這一刻仍是舊身分。
 
 	fake := &FakeSessionManager{}
 	stopper := &recordingStopper{}
 	_, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now, stopper)
-	unlock()
 	if err != nil {
+		close(hold)
+		wg.Wait()
 		t.Fatalf("SweepTimeouts: %v", err)
 	}
 	if reclaimed != 0 {
+		close(hold)
+		wg.Wait()
 		t.Fatalf("reclaimed = %d, want 0 (the session is in use, sweep must not have touched it at all)", reclaimed)
 	}
 	if len(fake.Stopped) != 0 {
+		close(hold)
+		wg.Wait()
 		t.Fatalf("sweep stopped a tmux session that is currently in use: %#v", fake.Stopped)
 	}
 	if len(fake.Removed) != 0 {
+		close(hold)
+		wg.Wait()
 		t.Fatalf("sweep removed a worktree that is currently in use: %#v", fake.Removed)
 	}
 	if len(stopper.stopped) != 0 {
+		close(hold)
+		wg.Wait()
 		t.Fatalf("sweep stopped a driver whose session is currently in use: %#v", stopper.stopped)
 	}
 	if _, err := os.Stat(SandboxRoot(root, session)); err != nil {
+		close(hold)
+		wg.Wait()
 		t.Fatalf("sandbox root must survive on disk while the session is in use: %v", err)
 	}
+
+	close(hold) // 放行「建立」，讓它把新身分寫進去，跟真正的 Start 一樣。
+	wg.Wait()
 
 	got, _ := LoadTasks(root)
 	tk, _ := got.ByContext("c1")
 	if tk.TaskID != "t-new" || tk.Session == "" || tk.Worktree == "" {
 		t.Fatalf("the resubmitted identity was corrupted: %#v", tk)
+	}
+	if _, err := os.Stat(SandboxRoot(root, session)); err != nil {
+		t.Fatalf("resubmitted identity's sandbox root must still be on disk: %v", err)
+	}
+}
+
+// TestSweepStopsSessionAfterASkippedPassBeforeReclaiming pins the task 7
+// review round 3 critical finding: a skipped teardown pass must not lose
+// the session-stop permanently. Sequence, matching the reviewer's own
+// probe: pass N has c1 TaskWorking past HardTimeout — step 1 flips it to
+// TaskCanceled (pure bookkeeping, unaffected by any lock), but the session
+// is busy (a legitimate Start/DeliverFollowUp holds the shared lock) so
+// step 2's teardown lock attempt fails and NOTHING is stopped or removed.
+// Pass N+1, ten seconds later, the session is free. Before this fix,
+// whether step 2 would stop the session on THIS pass was decided by
+// justCanceled[contextId] — a map rebuilt fresh every pass from ONLY the
+// rows that switch-case transitioned to TaskCanceled during THIS exact
+// pass. c1 already became TaskCanceled back on pass N, so pass N+1 never
+// re-enters that branch, justCanceled[c1] is false, stopSession reads
+// false, and removeCandidate deletes the worktree, sandbox root and policy
+// file having never called sm.Stop or stopper.Stop even once — a live
+// tmux pane whose cwd was just deleted, referenced by no row, and (because
+// the driver was never told to stop either) still able to re-Init() that
+// same root a moment later. The fix derives "stop it" from the row's own,
+// durable Session field — read fresh every pass via step 1 — rather than a
+// per-pass transition flag, so a skipped pass simply retries the exact same
+// stop-then-remove attempt next time, atomically, never one without the
+// other.
+func TestSweepStopsSessionAfterASkippedPassBeforeReclaiming(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	const session = "aa-a-c1"
+	var s TaskStore
+	s.Upsert(A2ATask{
+		ContextID: "c1", TaskID: "t1", Agent: "a", Session: session,
+		Worktree: "/p/aa-a-c1", State: TaskWorking,
+		StartedAt: now.Add(-HardTimeout - time.Minute).Format(time.RFC3339),
+	})
+	if err := SaveTasks(root, s); err != nil {
+		t.Fatalf("SaveTasks: %v", err)
+	}
+	if err := Init(SandboxRoot(root, session)); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	fake := &FakeSessionManager{}
+
+	// Pass N：session 忙碌。硬逾時取消的帳面動作照常發生（跟鎖無關），但整
+	// 段拆除（含停 session）被跳過。
+	unlock := lockSandboxSession(session)
+	if _, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now, nil); err != nil || reclaimed != 0 {
+		unlock()
+		t.Fatalf("pass N: reclaimed=%d err=%v, want 0 (the session is in use)", reclaimed, err)
+	}
+	unlock()
+	if len(fake.Stopped) != 0 {
+		t.Fatalf("pass N stopped a session that was in use: %#v", fake.Stopped)
+	}
+	got, _ := LoadTasks(root)
+	tk, _ := got.ByContext("c1")
+	if tk.State != TaskCanceled {
+		t.Fatalf("pass N state = %s, want canceled (bookkeeping must proceed regardless of the session lock)", tk.State)
+	}
+	if tk.Session != session || tk.Worktree == "" {
+		t.Fatalf("pass N must not have cleared anything it never removed: %#v", tk)
+	}
+
+	// Pass N+1：session 現在閒置。修好之前，這裡會直接刪掉 worktree/sandbox
+	// root，卻從來沒有停過 session —— probe 印出的正是
+	// "pass N+1: reclaimed=1 stopped=[] removed=[/p/aa-a-c1]"。
+	if _, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now, nil); err != nil || reclaimed != 1 {
+		t.Fatalf("pass N+1: reclaimed=%d err=%v, want 1", reclaimed, err)
+	}
+	if len(fake.Stopped) != 1 || fake.Stopped[0] != session {
+		t.Fatalf("pass N+1 must stop the session before reclaiming it, stopped = %#v", fake.Stopped)
+	}
+	if len(fake.Removed) != 1 || fake.Removed[0] != "/p/aa-a-c1" {
+		t.Fatalf("pass N+1 removed = %#v, want exactly the worktree", fake.Removed)
+	}
+	if _, err := os.Stat(SandboxRoot(root, session)); !os.IsNotExist(err) {
+		t.Fatalf("sandbox root should be gone after the retried reclaim, stat err = %v", err)
+	}
+}
+
+// TestSweepNeverRemovesAWorktreeWithNoSessionIdentity pins the task 7
+// review round 3 important finding: a row with Worktree != "" but
+// Session == "" carries no identity a lock can be taken against
+// (lockSandboxSession/tryLockSandboxSessionForTeardown are both keyed on
+// session name), so removeCandidate's c.session == "" branch used to run
+// completely unguarded — no lock, and (before this fix) not even
+// candidateStillMatches. The reviewer's probe reached this state via
+// stopSessionGuarded's step-3 write-back clearing ONLY Session for a
+// dispatch-stalled row while leaving Worktree alone; that write-back has
+// since been removed entirely (stopTarget's Session is never cleared, see
+// its doc comment) precisely so this state can no longer arise through any
+// sweep path. This test proves the OTHER half of the fix: even confronted
+// with a row already in this state (e.g. hand-edited tasks.json, or any
+// future code that reintroduces it), the failed-sandbox-cap trim path
+// refuses to remove it at all, rather than attempting a check-then-act that
+// cannot actually close its own window (there being no lock to hold
+// between the check and the act).
+func TestSweepNeverRemovesAWorktreeWithNoSessionIdentity(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	var s TaskStore
+	// 故意產生一列 Worktree != "" 但 Session == "" 的 TaskFailed row —— 沒
+	// 有任何目前的 sweep 路徑會製造這個狀態，這裡直接手動構造，模擬「萬一
+	// 某個未來的 bug 或手動編輯又造出這種列」的邊界情況。
+	s.Upsert(A2ATask{
+		ContextID: "cold", TaskID: "t-cold", Agent: "a", Worktree: "/p/aa-a-cold",
+		State: TaskFailed, CompletedAt: now.Add(-48 * time.Hour).Format(time.RFC3339),
+	})
+	for i := 0; i < MaxRetainedFailedSandboxes; i++ {
+		id := fmt.Sprintf("recent%02d", i)
+		s.Upsert(A2ATask{
+			ContextID: id, TaskID: "t-" + id, Agent: "a", Session: "aa-a-" + id,
+			Worktree: "/p/aa-a-" + id, State: TaskFailed,
+			CompletedAt: now.Add(-time.Duration(i) * time.Minute).Format(time.RFC3339),
+		})
+	}
+	if err := SaveTasks(root, s); err != nil {
+		t.Fatalf("SaveTasks: %v", err)
+	}
+
+	fake := &FakeSessionManager{}
+	if _, _, err := SweepTimeouts(context.Background(), root, fake, now, nil); err != nil {
+		t.Fatalf("SweepTimeouts: %v", err)
+	}
+
+	if len(fake.Removed) != 0 {
+		t.Fatalf("a session-less candidate must never be removed, no lock can guard it: %#v", fake.Removed)
+	}
+	got, _ := LoadTasks(root)
+	tk, _ := got.ByContext("cold")
+	if tk.Worktree != "/p/aa-a-cold" {
+		t.Fatalf("the session-less row must be left completely untouched: %#v", tk)
 	}
 }
 
