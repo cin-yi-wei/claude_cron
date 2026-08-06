@@ -338,3 +338,96 @@ func TestEnsureSandboxSettingsRewritesStaleSessionStartHook(t *testing.T) {
 		t.Fatal("EnsureSandboxSettings rewrote an already-correct sandbox settings file")
 	}
 }
+
+// TestEnsureSandboxSettingsIgnoresSessionStartMentionOutsideHooks pins the
+// structural check: detection must be "does hooks.SessionStart exist as a
+// key", not "does the string SessionStart appear anywhere in the file". A
+// file that merely mentions the word (e.g. in an unrelated comment-like
+// field) must be left completely untouched — a raw substring scan would
+// wrongly rewrite it.
+func TestEnsureSandboxSettingsIgnoresSessionStartMentionOutsideHooks(t *testing.T) {
+	sandbox := t.TempDir()
+	settingsPath := filepath.Join(sandbox, ".claude", "settings.local.json")
+	if err := os.MkdirAll(filepath.Dir(settingsPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const content = `{"note":"no SessionStart hook configured here","hooks":{"PreToolUse":[]}}`
+	if err := os.WriteFile(settingsPath, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := EnsureSandboxSettings(sandbox); err != nil {
+		t.Fatalf("EnsureSandboxSettings: %v", err)
+	}
+
+	after, err := os.Stat(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !before.ModTime().Equal(after.ModTime()) {
+		t.Fatal("EnsureSandboxSettings rewrote a file that only MENTIONS SessionStart, not one that actually has a hooks.SessionStart key — detection must be structural, not a substring scan")
+	}
+	got, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != content {
+		t.Fatalf("content changed: got %s, want unchanged %s", got, content)
+	}
+}
+
+// TestEnsureSandboxSettingsRewritePreservesUnrelatedKeys pins the
+// "delete only hooks.SessionStart, don't clobber the rest" requirement: a
+// wholesale overwrite with sandboxAgentSettings would silently drop any
+// hand-added key sitting alongside SessionStart (a custom top-level setting,
+// or a sibling hook type). The targeted delete must leave everything else —
+// including keys stripSessionStartHook has never heard of — exactly in
+// place.
+func TestEnsureSandboxSettingsRewritePreservesUnrelatedKeys(t *testing.T) {
+	sandbox := t.TempDir()
+	settingsPath := filepath.Join(sandbox, ".claude", "settings.local.json")
+	if err := os.MkdirAll(filepath.Dir(settingsPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const content = `{
+  "customToolConfig": {"handAdded": true},
+  "hooks": {
+    "SessionStart": [{"hooks": [{"type": "command", "command": "claude-cron session-hook"}]}],
+    "PostToolUse": [{"matcher": "Edit", "hooks": [{"type": "command", "command": "some-other-tool"}]}]
+  }
+}`
+	if err := os.WriteFile(settingsPath, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := EnsureSandboxSettings(sandbox); err != nil {
+		t.Fatalf("EnsureSandboxSettings: %v", err)
+	}
+
+	blob, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(blob, &parsed); err != nil {
+		t.Fatalf("rewritten file is not valid JSON: %v", err)
+	}
+	custom, ok := parsed["customToolConfig"].(map[string]any)
+	if !ok || custom["handAdded"] != true {
+		t.Fatalf("hand-added top-level key was dropped by the rewrite: %#v", parsed["customToolConfig"])
+	}
+	hooks, ok := parsed["hooks"].(map[string]any)
+	if !ok {
+		t.Fatalf("hooks key was dropped by the rewrite: %#v", parsed)
+	}
+	if _, has := hooks["SessionStart"]; has {
+		t.Fatal("hooks.SessionStart must be gone after the rewrite")
+	}
+	if _, has := hooks["PostToolUse"]; !has {
+		t.Fatal("a sibling hook type (PostToolUse) was dropped by the rewrite — only SessionStart should be removed")
+	}
+}

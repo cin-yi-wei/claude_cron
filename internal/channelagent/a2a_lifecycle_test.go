@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -169,6 +170,49 @@ func TestSweepCancelsAfterHardTimeout(t *testing.T) {
 	tk, _ := got.ByContext("c1")
 	if tk.State != TaskCanceled {
 		t.Fatalf("state = %s, want canceled", tk.State)
+	}
+}
+
+// TestSweepPreservesPriorDetailOnHardTimeout pins the fix for the exact
+// scenario task 4 exists to address: TrustFolder fails, SandboxExecutor.Start
+// leaves a warning on Detail while the task is Working, the sandbox wedges
+// on a dialog nobody can answer, and two hours later the hard-timeout sweep
+// cancels it. Without this fix, the sweep's own `t.Detail = reason`
+// unconditionally overwrote that warning with "hard timeout exceeded",
+// silently erasing the one clue that would have told an operator WHY it
+// wedged — reproducing the "no reason visible anywhere" symptom on the very
+// row meant to surface it.
+func TestSweepPreservesPriorDetailOnHardTimeout(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	const trustNote = "預先信任 worktree 失敗,沙盒仍會啟動但可能卡在資料夾信任對話框: fake trust failure"
+	var s TaskStore
+	s.Upsert(A2ATask{
+		ContextID: "c1", Session: "aa-a-c1", State: TaskWorking,
+		StartedAt: now.Add(-3 * time.Hour).Format(time.RFC3339),
+		Detail:    trustNote,
+	})
+	_ = SaveTasks(root, s)
+
+	fake := &FakeSessionManager{}
+	canceled, _, err := SweepTimeouts(context.Background(), root, fake, now)
+	if err != nil {
+		t.Fatalf("SweepTimeouts: %v", err)
+	}
+	if canceled != 1 {
+		t.Fatalf("canceled = %d, want 1", canceled)
+	}
+
+	got, _ := LoadTasks(root)
+	tk, _ := got.ByContext("c1")
+	if tk.State != TaskCanceled {
+		t.Fatalf("state = %s, want canceled", tk.State)
+	}
+	if !strings.Contains(tk.Detail, trustNote) {
+		t.Fatalf("Detail = %q, must still contain the trust-failure note %q", tk.Detail, trustNote)
+	}
+	if !strings.Contains(tk.Detail, "hard timeout exceeded") {
+		t.Fatalf("Detail = %q, must still contain the sweep's own reason too", tk.Detail)
 	}
 }
 

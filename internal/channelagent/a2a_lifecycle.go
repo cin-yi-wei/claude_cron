@@ -221,6 +221,14 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 				}
 				toStop = append(toStop, t.Session)
 				t.State = TaskCanceled
+				// 保留卡住前就已經留在 Detail 裡的線索(最常見的是 task 4 的
+				// TrustFolder 失敗警告):如果只用 sweep 自己的 reason 蓋掉它,
+				// 「信任失敗 → 沙盒卡在對話框 → 兩小時後被 sweep 收掉」這整條
+				// 因果就會在最後一步斷掉,使用者看到的只剩「hard timeout
+				// exceeded」,跟這個 task 原本要修的「什麼原因都看不到」一樣。
+				if t.Detail != "" {
+					reason = t.Detail + "; " + reason
+				}
 				t.Detail = reason
 				t.CompletedAt = now.UTC().Format(time.RFC3339)
 				tasks.Tasks[i] = t

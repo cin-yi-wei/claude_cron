@@ -5,7 +5,44 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
 )
+
+// staleTempAge bounds how old a leftover <base>.tmp-* sibling must be before
+// sweepStaleTemp will remove it. A unique-per-call temp name (see
+// AtomicWriteFile) no longer self-recycles the way the old fixed ".tmp" name
+// did, so a write that never reaches its rename (SIGKILL, OOM) now orphans a
+// distinct file forever instead of getting overwritten by the next write to
+// the same path. The sweep only targets files clearly past any plausible
+// write duration — a FRESH sibling is very likely a concurrent writer's temp
+// file still being written to, and deleting it out from under that writer
+// would corrupt (or simply fail) their write.
+var staleTempAge = 10 * time.Minute
+
+// sweepStaleTemp best-effort removes orphaned <base>.tmp-* files in dir left
+// behind by a past AtomicWriteFile call that crashed before its rename.
+// Harmless to readers either way (nothing ever pointed at these), so this
+// only matters for disk usage — never let a failure here fail the caller's
+// actual write; every error is swallowed.
+func sweepStaleTemp(dir, base string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	prefix := base + ".tmp-"
+	cutoff := time.Now().Add(-staleTempAge)
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasPrefix(e.Name(), prefix) {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil || info.ModTime().After(cutoff) {
+			continue
+		}
+		_ = os.Remove(filepath.Join(dir, e.Name()))
+	}
+}
 
 func AtomicWriteJSON(path string, v any) error {
 	return AtomicWriteJSONMode(path, v, 0o644)
@@ -28,6 +65,10 @@ func AtomicWriteFile(path string, payload []byte, mode os.FileMode) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
+	// Best-effort: clears out any old orphaned temp file from a past crashed
+	// write before adding our own. See sweepStaleTemp's doc for why this is
+	// safe to do unconditionally on every write.
+	sweepStaleTemp(dir, filepath.Base(path))
 
 	// The temp file MUST have a unique name, not a fixed path+".tmp": two
 	// concurrent writers to the same path (e.g. two sandboxes both calling

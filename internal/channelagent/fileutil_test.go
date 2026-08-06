@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestAtomicWriteJSONCreatesFinalFile(t *testing.T) {
@@ -110,5 +111,52 @@ func TestAtomicWriteFileConcurrentWritersDoNotCorrupt(t *testing.T) {
 	}
 	if len(entries) != 1 {
 		t.Fatalf("dir has %d entries after %d concurrent writers, want exactly 1 (no leftover temp files): %v", len(entries), n, entries)
+	}
+}
+
+// TestAtomicWriteFileSweepsOnlyStaleOrphanTemp pins the fix for the
+// unbounded-orphan minor: unlike the old fixed ".tmp" name (self-recycled by
+// the next write), each unique os.CreateTemp file left behind by a crashed
+// write (SIGKILL/OOM before rename) now has a distinct name and would
+// otherwise never get cleaned up. AtomicWriteFile must sweep old orphans —
+// but must NOT touch a sibling temp file that is still fresh, since that
+// could be a concurrent writer mid-write; deleting it out from under them
+// would break their write. staleTempAge is a package var specifically so
+// this test can shrink it instead of sleeping for the real 10-minute default.
+func TestAtomicWriteFileSweepsOnlyStaleOrphanTemp(t *testing.T) {
+	old := staleTempAge
+	staleTempAge = 10 * time.Millisecond
+	defer func() { staleTempAge = old }()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "target.json")
+	base := filepath.Base(path)
+
+	staleOrphan := filepath.Join(dir, base+".tmp-STALE123")
+	if err := os.WriteFile(staleOrphan, []byte("leftover from a crashed write"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Backdate it past staleTempAge so the sweep considers it eligible —
+	// a brand new file wouldn't be swept regardless of how old the
+	// threshold is set, which would let this test pass for the wrong reason.
+	stale := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(staleOrphan, stale, stale); err != nil {
+		t.Fatal(err)
+	}
+
+	freshSibling := filepath.Join(dir, base+".tmp-FRESH456")
+	if err := os.WriteFile(freshSibling, []byte("pretend concurrent writer, still mid-write"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := AtomicWriteFile(path, []byte(`{"ok":true}`), 0o644); err != nil {
+		t.Fatalf("AtomicWriteFile: %v", err)
+	}
+
+	if _, err := os.Stat(staleOrphan); !os.IsNotExist(err) {
+		t.Fatalf("stale orphan temp file was not swept: stat err = %v", err)
+	}
+	if _, err := os.Stat(freshSibling); err != nil {
+		t.Fatalf("fresh sibling temp file was wrongly swept (could be a live concurrent writer): %v", err)
 	}
 }

@@ -2,6 +2,7 @@ package channelagent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -199,23 +200,63 @@ const sandboxAgentSettings = `{
 }
 `
 
+// stripSessionStartHook 結構性地檢查既有 settings.local.json 是不是帶著
+// hooks.SessionStart——不是對整份檔案做字串掃描(那樣任何只是「提到」這個
+// 字的檔案,例如放在別的欄位裡當註解或範例值,都會被誤判成該重寫)。有的話
+// 只刪掉那一個 key,其餘內容(包含使用者或別的流程手動加上的任何 key,例如
+// permissions 之外自訂的規則)原封不動保留,回傳重新編碼後的完整內容與
+// changed=true;呼叫端據此決定要不要真的落地。沒有 hooks 或沒有
+// hooks.SessionStart 都回傳 changed=false。existing 若不是合法 JSON,回傳
+// error——沒辦法結構性確認的檔案不能亂猜著重寫。
+func stripSessionStartHook(existing []byte) (rewritten []byte, changed bool, err error) {
+	var cfg map[string]any
+	if err := json.Unmarshal(existing, &cfg); err != nil {
+		return nil, false, err
+	}
+	hooks, ok := cfg["hooks"].(map[string]any)
+	if !ok {
+		return nil, false, nil
+	}
+	if _, has := hooks["SessionStart"]; !has {
+		return nil, false, nil
+	}
+	delete(hooks, "SessionStart")
+	out, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return nil, false, err
+	}
+	return append(out, '\n'), true, nil
+}
+
 // EnsureSandboxSettings 把 aa- 沙盒的權限設定寫進 dir。與 EnsureAgentSettings/
 // EnsureControlSettings 不同,既有檔案不是永遠不動:如果既有 settings.local.json
-// 帶著 SessionStart hook,代表這個 worktree 是升級前的舊二進位留下的(那正是
-// 這個 task 要拔掉的閘的來源),必須整份重寫成不含 SessionStart 的版本,否則
-// 這個沙盒開機時還是會卡在同一個 managed-settings 閘上,升級等於沒修。不帶
-// SessionStart 的既有檔案(已經是沙盒版本、或使用者自訂)照舊不動。
-// writeAgentSettings/EnsureAgentSettings 的「已存在則不動」行為完全不受影響。
+// 結構上帶著 hooks.SessionStart,代表這個 worktree 是升級前的舊二進位留下的
+// (那正是這個 task 要拔掉的閘的來源),必須把那一個 key 拔掉,否則這個沙盒
+// 開機時還是會卡在同一個 managed-settings 閘上,升級等於沒修。拔除是針對性
+// 的(只刪 hooks.SessionStart,見 stripSessionStartHook),不是整份蓋掉
+// sandboxAgentSettings——這樣才不會把使用者或別的流程手動加在同一份檔案裡
+// 的其他 key 一起沖掉。落地走 AtomicWriteFile(跟 EnsureFolderTrusted 一樣),
+// 不是直接 os.WriteFile:一個正在跑的 claude 行程可能同時在讀這份設定檔,
+// 直接寫會讓它讀到寫一半的截斷內容。不帶 SessionStart 的既有檔案(已經是
+// 沙盒版本、或不相關的自訂內容)照舊不動。writeAgentSettings/
+// EnsureAgentSettings 的「已存在則不動」行為完全不受影響。
 func EnsureSandboxSettings(dir string) error {
 	settingsPath := filepath.Join(dir, ".claude", "settings.local.json")
 	existing, err := os.ReadFile(settingsPath)
 	switch {
 	case err == nil:
-		if !strings.Contains(string(existing), "SessionStart") {
+		rewritten, changed, perr := stripSessionStartHook(existing)
+		if perr != nil {
+			return fmt.Errorf("parse existing sandbox settings %s: %w", settingsPath, perr)
+		}
+		if !changed {
 			return nil // 已經是沙盒版本(或不相關的自訂內容),不動
 		}
-		// 舊二進位留下的 worker 版本設定,帶著會卡死沙盒的 SessionStart hook,
-		// 必須整份換成 sandboxAgentSettings。
+		mode := os.FileMode(0o644)
+		if info, statErr := os.Stat(settingsPath); statErr == nil {
+			mode = info.Mode()
+		}
+		return AtomicWriteFile(settingsPath, rewritten, mode)
 	case os.IsNotExist(err):
 		// 第一次開機,走跟 writeAgentSettings 一樣的建立路徑。
 	default:
