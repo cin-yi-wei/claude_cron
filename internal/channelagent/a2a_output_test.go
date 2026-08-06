@@ -2,6 +2,7 @@ package channelagent
 
 import (
 	"context"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -22,7 +23,7 @@ func TestAgentOutputSinkSendLineDegradesToSilenceWithNoChannel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	sink := newAgentOutputSink(ctx, root, send)
 
-	sink.SendLine("ghost", "ctx1", "should never be sent")
+	sink.Bind("ghost").SendLine("ctx1", "should never be sent")
 	// Give the sender goroutine a window to (wrongly) act, since SendLine only
 	// enqueues — the assertion is about what the goroutine does with it.
 	time.Sleep(50 * time.Millisecond)
@@ -56,7 +57,7 @@ func TestAgentOutputSinkSendLinePrefixesWithContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	sink := newAgentOutputSink(ctx, root, send)
 
-	sink.SendLine("pm", "ctx7", "hello from the sandbox")
+	sink.Bind("pm").SendLine("ctx7", "hello from the sandbox")
 
 	select {
 	case msg := <-got:
@@ -81,7 +82,9 @@ func TestAgentOutputSinkSendLinePrefixesWithContext(t *testing.T) {
 // synchronously from a sandbox driver's loop. A direct DiscordSender.Send
 // there would stall that sandbox's drive cadence for up to discordSendBudget
 // (12s) on a throttled/429'd/hung channel — this proves the decoupling holds
-// even when the consumer never keeps up.
+// even when the consumer never keeps up. Bind is called once, up front, the
+// same way a driver's loop() calls it once per sandbox — the loop below only
+// exercises the repeated SendLine calls, which do no I/O of their own.
 func TestAgentOutputSinkSendLineNeverBlocksOnSlowSend(t *testing.T) {
 	root := t.TempDir()
 	agents := AgentStore{}
@@ -104,6 +107,7 @@ func TestAgentOutputSinkSendLineNeverBlocksOnSlowSend(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	sink := newAgentOutputSink(ctx, root, slowSend)
+	channel := sink.Bind("pm")
 
 	start := time.Now()
 	// Enough sends to fill the queue well past capacity. If SendLine ever
@@ -112,7 +116,7 @@ func TestAgentOutputSinkSendLineNeverBlocksOnSlowSend(t *testing.T) {
 	// finishing near-instantly.
 	const n = agentOutputQueueSize + 50
 	for i := 0; i < n; i++ {
-		sink.SendLine("pm", "ctx1", "line")
+		channel.SendLine("ctx1", "line")
 	}
 	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
 		t.Fatalf("SendLine blocked the caller: %d calls took %v", n, elapsed)
@@ -122,6 +126,49 @@ func TestAgentOutputSinkSendLineNeverBlocksOnSlowSend(t *testing.T) {
 	}
 
 	close(release)
+	cancel()
+	sink.Wait()
+}
+
+// The regression this whole fix targets: SendLine must do NO agents.json
+// read of its own — only Bind does, once. Proven by deleting agents.json
+// entirely right after Bind and confirming SendLine keeps delivering: if
+// SendLine re-resolved the channel per call (the bug), the agent would look
+// "unknown" the moment the file vanished and every line would silently drop.
+func TestAgentChannelSendLineDoesNoDiskIOAfterBind(t *testing.T) {
+	root := t.TempDir()
+	agents := AgentStore{}
+	if err := agents.Add(Agent{Name: "pm", ChannelID: "chan-pm", Enabled: true}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if err := SaveAgents(root, agents); err != nil {
+		t.Fatalf("SaveAgents: %v", err)
+	}
+
+	got := make(chan string, 1)
+	send := func(_ context.Context, _, text string) error {
+		got <- text
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	sink := newAgentOutputSink(ctx, root, send)
+
+	channel := sink.Bind("pm") // the ONLY agents.json read this test expects
+
+	if err := os.Remove(AgentsPath(root)); err != nil {
+		t.Fatalf("remove agents.json: %v", err)
+	}
+
+	channel.SendLine("ctx1", "still delivered")
+
+	select {
+	case text := <-got:
+		if !strings.Contains(text, "still delivered") {
+			t.Fatalf("text = %q", text)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("SendLine stopped delivering after agents.json vanished — it must be re-reading the agent per call")
+	}
 	cancel()
 	sink.Wait()
 }

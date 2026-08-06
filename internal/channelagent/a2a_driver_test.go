@@ -335,6 +335,9 @@ func TestSandboxDriverStreamsActivityToAgentChannel(t *testing.T) {
 // actual job — a hung/slow agent-channel send is a visibility loss, not
 // something that may delay message delivery to the sandbox's real caller.
 func TestSandboxDriverDeliversJobWhileAgentChannelSendHangs(t *testing.T) {
+	var sent []string
+	stubTmuxPane(t, "", &sent) // no real tmux: capture-pane always returns empty
+
 	root := t.TempDir()
 	agents := AgentStore{}
 	if err := agents.Add(Agent{Name: "codereview", ChannelID: "chan-cr", Enabled: true}); err != nil {

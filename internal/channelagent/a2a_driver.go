@@ -34,8 +34,9 @@ type SandboxDriver struct {
 	// activity) to each task's agent channel. Guarded by its own mutex (not mu)
 	// since SetOutputSink is typically called once at startup while loop()
 	// goroutines may already be reading it. Nil is a valid, common state (no
-	// AgentOutputSink wired, e.g. most tests): emit() is then a no-op, exactly
-	// like an agent with no ChannelID.
+	// AgentOutputSink wired, e.g. most tests): bindOutputChannel then returns
+	// the zero AgentChannel, which is a silent no-op — exactly like an agent
+	// with no ChannelID.
 	sinkMu sync.RWMutex
 	sink   *AgentOutputSink
 }
@@ -58,27 +59,25 @@ func NewSandboxDriver(root string, timeout time.Duration) *SandboxDriver {
 // SetOutputSink wires the driver's per-sandbox visibility lines (lifecycle,
 // errors, and transcript activity — see loop()) to sink, which delivers each
 // line to its task's agent channel. Safe to call before or after Ensure has
-// started loops: emit() reads the field under sinkMu on every use. Passing
-// nil (the zero-value default) turns emission back off.
+// started loops: bindOutputChannel reads the field under sinkMu. Passing nil
+// (the zero-value default) turns emission back off.
 func (d *SandboxDriver) SetOutputSink(sink *AgentOutputSink) {
 	d.sinkMu.Lock()
 	d.sink = sink
 	d.sinkMu.Unlock()
 }
 
-// emit hands one already-unlabelled line to the wired output sink (which
-// prefixes it with SandboxOutputPrefix(task.ContextID) and resolves
-// task.Agent's channel — see AgentOutputSink.SendLine). No-op when no sink is
-// wired, exactly mirroring an agent with no ChannelID: silent, no error, no
-// latency. Never blocks: SendLine itself is non-blocking.
-func (d *SandboxDriver) emit(task A2ATask, line string) {
+// bindOutputChannel resolves task.Agent's output channel ONCE (a single
+// agents.json read via AgentOutputSink.Bind) and returns a handle whose
+// SendLine calls do no further disk I/O for the rest of this loop's
+// lifetime — see loop(), which calls this exactly once per sandbox rather
+// than once per emitted line. No sink wired → the zero AgentChannel, which
+// is a silent, I/O-free no-op, exactly mirroring an agent with no ChannelID.
+func (d *SandboxDriver) bindOutputChannel(task A2ATask) AgentChannel {
 	d.sinkMu.RLock()
 	sink := d.sink
 	d.sinkMu.RUnlock()
-	if sink == nil {
-		return
-	}
-	sink.SendLine(task.Agent, task.ContextID, line)
+	return sink.Bind(task.Agent)
 }
 
 // Ensure starts a driver for the task's sandbox if one is not already running.
@@ -129,8 +128,12 @@ func (d *SandboxDriver) loop(ctx context.Context, task A2ATask, inj Injector) {
 	}()
 
 	sandbox := SandboxRoot(d.root, session)
-	d.emit(task, "🟢 driver started")
-	defer d.emit(task, "🔴 driver stopped")
+	// Resolved ONCE for this loop's whole lifetime (see bindOutputChannel) —
+	// not per line — so per-line emission below (a CollectActivity burst can
+	// yield many lines per tick) never re-reads agents.json from disk.
+	channel := d.bindOutputChannel(task)
+	channel.SendLine(task.ContextID, "🟢 driver started")
+	defer channel.SendLine(task.ContextID, "🔴 driver stopped")
 	// lastConfirmHash debounces the auto-answer: it's the hash of the last
 	// dialog this loop actually answered, so a dialog that hasn't dismissed
 	// yet by the next capture (pane not redrawn) is not re-typed into — a
@@ -164,7 +167,7 @@ func (d *SandboxDriver) loop(ctx context.Context, task A2ATask, inj Injector) {
 		processed, err := RunWorkerOnce(ctx, sandbox, inj, d.timeout)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "a2a driver %s: %v\n", session, err)
-			d.emit(task, "⚠️ "+err.Error())
+			channel.SendLine(task.ContextID, "⚠️ "+err.Error())
 		}
 		// Stream the sandbox's transcript activity (thinking/tool-use) to its
 		// agent channel — the "what is this sandbox actually doing" visibility
@@ -173,7 +176,7 @@ func (d *SandboxDriver) loop(ctx context.Context, task A2ATask, inj Injector) {
 		// the sandbox's own root/worktree so its state/activity.json offset is
 		// independent of any cc- binding's.
 		for _, line := range CollectActivity(sandbox, task.Worktree) {
-			d.emit(task, line)
+			channel.SendLine(task.ContextID, line)
 		}
 		if processed {
 			continue // more may be queued; drain before idling
