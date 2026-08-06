@@ -3,6 +3,7 @@ package channelagent
 import (
 	"context"
 	"testing"
+	"time"
 )
 
 func TestHasCapacityRespectsCap(t *testing.T) {
@@ -100,5 +101,116 @@ func TestDrainQueueStopsAtCapacity(t *testing.T) {
 	}
 	if n != 0 || stub.Calls != 0 {
 		t.Fatalf("must not start work when full: started=%d calls=%d", n, stub.Calls)
+	}
+}
+
+func TestSweepTimeoutsConstants(t *testing.T) {
+	if SoftTimeout != 30*time.Minute {
+		t.Fatalf("SoftTimeout = %v, want 30m", SoftTimeout)
+	}
+	if HardTimeout != 2*time.Hour {
+		t.Fatalf("HardTimeout = %v, want 2h", HardTimeout)
+	}
+	if RetainAfterComplete != 10*time.Minute {
+		t.Fatalf("RetainAfterComplete = %v, want 10m", RetainAfterComplete)
+	}
+}
+
+func TestSweepDoesNotCancelBeforeHardTimeout(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	var s TaskStore
+	s.Upsert(A2ATask{
+		ContextID: "c1", Session: "aa-a-c1", State: TaskWorking,
+		StartedAt: now.Add(-45 * time.Minute).Format(time.RFC3339), // past soft, before hard
+	})
+	_ = SaveTasks(root, s)
+
+	fake := &FakeSessionManager{}
+	canceled, _, err := SweepTimeouts(context.Background(), root, fake, now)
+	if err != nil {
+		t.Fatalf("SweepTimeouts: %v", err)
+	}
+	if canceled != 0 {
+		t.Fatalf("canceled = %d, want 0 (soft timeout must not kill)", canceled)
+	}
+	got, _ := LoadTasks(root)
+	tk, _ := got.ByContext("c1")
+	if tk.State != TaskWorking {
+		t.Fatalf("state = %s, want still working", tk.State)
+	}
+}
+
+func TestSweepCancelsAfterHardTimeout(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	var s TaskStore
+	s.Upsert(A2ATask{
+		ContextID: "c1", Session: "aa-a-c1", State: TaskWorking,
+		StartedAt: now.Add(-3 * time.Hour).Format(time.RFC3339),
+	})
+	_ = SaveTasks(root, s)
+
+	fake := &FakeSessionManager{}
+	canceled, _, err := SweepTimeouts(context.Background(), root, fake, now)
+	if err != nil {
+		t.Fatalf("SweepTimeouts: %v", err)
+	}
+	if canceled != 1 {
+		t.Fatalf("canceled = %d, want 1", canceled)
+	}
+	if len(fake.Stopped) != 1 || fake.Stopped[0] != "aa-a-c1" {
+		t.Fatalf("session not stopped: %#v", fake.Stopped)
+	}
+	got, _ := LoadTasks(root)
+	tk, _ := got.ByContext("c1")
+	if tk.State != TaskCanceled {
+		t.Fatalf("state = %s, want canceled", tk.State)
+	}
+}
+
+func TestSweepReclaimsCompletedAfterRetention(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	var s TaskStore
+	s.Upsert(A2ATask{
+		ContextID: "c1", Session: "aa-a-c1", State: TaskCompleted,
+		CompletedAt: now.Add(-15 * time.Minute).Format(time.RFC3339),
+	})
+	s.Upsert(A2ATask{
+		ContextID: "c2", Session: "aa-a-c2", State: TaskCompleted,
+		CompletedAt: now.Add(-2 * time.Minute).Format(time.RFC3339), // still in retention
+	})
+	_ = SaveTasks(root, s)
+
+	fake := &FakeSessionManager{}
+	_, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now)
+	if err != nil {
+		t.Fatalf("SweepTimeouts: %v", err)
+	}
+	if reclaimed != 1 {
+		t.Fatalf("reclaimed = %d, want 1", reclaimed)
+	}
+	if len(fake.Stopped) != 1 || fake.Stopped[0] != "aa-a-c1" {
+		t.Fatalf("wrong session reclaimed: %#v", fake.Stopped)
+	}
+}
+
+func TestSweepLeavesFailedSandboxForensics(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	var s TaskStore
+	s.Upsert(A2ATask{
+		ContextID: "c1", Session: "aa-a-c1", State: TaskFailed,
+		CompletedAt: now.Add(-3 * time.Hour).Format(time.RFC3339),
+	})
+	_ = SaveTasks(root, s)
+
+	fake := &FakeSessionManager{}
+	if _, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now); err != nil || reclaimed != 0 {
+		t.Fatalf("failed sandboxes must be kept: reclaimed=%d err=%v", reclaimed, err)
+	}
+	if len(fake.Stopped) != 0 {
+		t.Fatalf("failed sandbox must not be torn down: %#v", fake.Stopped)
 	}
 }

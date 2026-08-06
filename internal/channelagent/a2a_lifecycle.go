@@ -1,6 +1,9 @@
 package channelagent
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // MaxConcurrentSandboxes caps simultaneous aa-*-<ctx> instances. Industry
 // guidance for parallel agent worktrees is 8-10; 8 is the conservative end and
@@ -49,4 +52,71 @@ func DrainQueue(ctx context.Context, root string, ex TaskExecutor) (int, error) 
 		started++
 	}
 	return started, nil
+}
+
+const (
+	// SoftTimeout only flips reporting: A2A natively supports long-running
+	// tasks, and real agent work routinely exceeds half an hour.
+	SoftTimeout = 30 * time.Minute
+	// HardTimeout is the backstop against a wedged sandbox holding a worktree
+	// and memory forever.
+	HardTimeout = 2 * time.Hour
+	// RetainAfterComplete keeps the sandbox alive briefly so the caller can ask
+	// a follow-up in the same contextId without paying to rebuild it.
+	RetainAfterComplete = 10 * time.Minute
+)
+
+func parseRFC3339(s string) (time.Time, bool) {
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
+}
+
+// SweepTimeouts cancels tasks past HardTimeout and tears down completed
+// sandboxes past RetainAfterComplete. Failed sandboxes are deliberately left in
+// place for forensics.
+func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time.Time) (int, int, error) {
+	tasks, err := LoadTasks(root)
+	if err != nil {
+		return 0, 0, err
+	}
+	canceled, reclaimed, changed := 0, 0, false
+
+	for i := range tasks.Tasks {
+		t := tasks.Tasks[i]
+		switch t.State {
+		case TaskWorking, TaskSubmitted:
+			started, ok := parseRFC3339(t.StartedAt)
+			if !ok || now.Sub(started) < HardTimeout {
+				continue
+			}
+			_ = sm.Stop(ctx, t.Session)
+			t.State = TaskCanceled
+			t.Detail = "hard timeout exceeded"
+			t.CompletedAt = now.UTC().Format(time.RFC3339)
+			tasks.Tasks[i] = t
+			canceled++
+			changed = true
+		case TaskCompleted:
+			done, ok := parseRFC3339(t.CompletedAt)
+			if !ok || now.Sub(done) < RetainAfterComplete {
+				continue
+			}
+			if t.Session == "" {
+				continue
+			}
+			_ = sm.Stop(ctx, t.Session)
+			t.Session = "" // mark reclaimed; branch is kept
+			tasks.Tasks[i] = t
+			reclaimed++
+			changed = true
+		}
+	}
+
+	if !changed {
+		return canceled, reclaimed, nil
+	}
+	return canceled, reclaimed, SaveTasks(root, tasks)
 }
