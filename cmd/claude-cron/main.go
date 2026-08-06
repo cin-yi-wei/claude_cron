@@ -226,17 +226,25 @@ func run(args []string, stdout, stderr io.Writer) int {
 				Handler: a2a.Handler(),
 				// This listener is internet-facing (separate port from the
 				// admin API), so it must not let a slow or idle client hold a
-				// connection open indefinitely. The handler itself is fast —
-				// dispatch is now detached from the request (see
-				// A2AServer.DispatchContext) and runs to completion in the
-				// background regardless of these timeouts — so headers/body/
-				// response all fit comfortably inside a few seconds; these
-				// values just bound how long a misbehaving connection can be
-				// held before being cut loose.
+				// connection open indefinitely. Headers and the (size-capped)
+				// body are small, so ReadHeaderTimeout/ReadTimeout stay tight.
 				ReadHeaderTimeout: 10 * time.Second,
 				ReadTimeout:       30 * time.Second,
-				WriteTimeout:      30 * time.Second,
-				IdleTimeout:       120 * time.Second,
+				// WriteTimeout is measured by net/http from header-read to the
+				// end of the response write, so it spans the ENTIRE synchronous
+				// dispatch: handleRPC calls SandboxExecutor.Start inline and
+				// blocks on it — EnsureWorkspace (git worktree add), Sessions.Start
+				// (tmux, bounded by sessionBootDelay = 90s in worktree.go) and
+				// Inject all run before the handler writes its response.
+				// DispatchContext (see A2AServer) only detaches dispatch from
+				// request CANCELLATION; it does NOT run dispatch in the
+				// background or return the response early. 180s gives real
+				// headroom over the 90s session-boot bound plus a cold
+				// git worktree add — do not shrink this back toward the other
+				// timeouts, that would silently fail (no response, or a reset)
+				// a request whose dispatch actually succeeded server-side.
+				WriteTimeout: 180 * time.Second,
+				IdleTimeout:  120 * time.Second,
 			}
 			go func() {
 				fmt.Fprintf(stdout, "a2a server listening on %s\n", cfg.A2AListen())
