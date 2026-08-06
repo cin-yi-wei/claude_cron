@@ -49,6 +49,12 @@ const DispatchStaleAfter = 5 * time.Minute
 // 容量在同一個 critical section 內預留：翻成 dispatching 的那一刻起，這一列
 // 就計入 RunningCount，下一次並發呼叫（handler 或另一次 DrainQueue）看到的
 // 就是扣掉這一列之後的真實空位數 —— 同時修掉 I2。
+//
+// 認領之後、呼叫 Start 之前（鎖外），每一列都重讀 callers.json / agents.json
+// 重新驗證一次（task 8, I1）：核准在 message/send 那一刻查過，不代表十次
+// cycle 之後、backlog 真的被排空那一刻仍然成立。這是每次呼叫都做的，不是
+// 只在第一次派送時做——撤銷要對已經排隊、還沒起沙盒的工作生效，不能只擋
+// 未來的新請求。
 func DrainQueue(ctx context.Context, root string, ex TaskExecutor) (int, error) {
 	var claimed []A2ATask
 	err := WithTasks(root, func(tasks *TaskStore) error {
@@ -77,14 +83,81 @@ func DrainQueue(ctx context.Context, root string, ex TaskExecutor) (int, error) 
 		return 0, err
 	}
 
+	// 撤銷必須對已排隊的工作生效，不只對新請求生效。每次呼叫都重讀
+	// callers.json / agents.json：一個被 operator 撤銷的呼叫方，它先前灌進
+	// 佇列的 backlog 不可以繼續被排空成新沙盒。拒絕的 row 轉 TaskFailed 並
+	// 寫明 Detail + 一筆稽核 —— 不是靜默 continue（那正是 I1 的形態）。
+	callers, cerr := LoadCallers(root)
+	agents, aerr := LoadAgents(root)
 	started := 0
 	for _, t := range claimed {
+		if reason := drainRejectReason(callers, agents, cerr, aerr, t); reason != "" {
+			failDrainedTask(root, t, reason)
+			continue
+		}
 		if err := ex.Start(ctx, t, t.Prompt); err != nil {
 			continue // executor 已經把失敗記在 row 上了
 		}
 		started++
 	}
 	return started, nil
+}
+
+// drainRejectReason 回傳這一列不該被派送的理由，可派送則回 ""。
+func drainRejectReason(callers CallerStore, agents AgentStore, cerr, aerr error, t A2ATask) string {
+	if cerr != nil {
+		return "caller store unavailable: " + cerr.Error()
+	}
+	if aerr != nil {
+		return "agent store unavailable: " + aerr.Error()
+	}
+	var caller Caller
+	found := false
+	for _, c := range callers.Callers {
+		if c.CallerID == t.CallerID {
+			caller, found = c, true
+			break
+		}
+	}
+	if !found || caller.Status != CallerApproved {
+		return "caller " + t.CallerID + " is no longer approved (revoked or removed)"
+	}
+	a, ok := agents.Get(t.Agent)
+	if !ok {
+		return "agent " + t.Agent + " no longer exists"
+	}
+	if !a.Enabled {
+		return "agent " + t.Agent + " is disabled"
+	}
+	// row 記錄的等級高於該 caller 目前的授權 → 拒絕。降級（例如 full 改成
+	// develop）也算：一個排隊中的 full 任務不該在授權被降之後仍以 full 起跑。
+	if grantRank(t.Level) > grantRank(caller.EffectiveGrantLevel()) {
+		return "task level " + string(t.Level) + " exceeds the caller's current grant"
+	}
+	return ""
+}
+
+func failDrainedTask(root string, t A2ATask, reason string) {
+	_ = WithTasks(root, func(tasks *TaskStore) error {
+		cur, ok := tasks.ByContext(t.ContextID)
+		if !ok || !CanTransition(cur.State, TaskFailed) {
+			return errNothingToDrain
+		}
+		cur.State = TaskFailed
+		cur.Detail = reason
+		cur.CompletedAt = time.Now().UTC().Format(time.RFC3339)
+		tasks.Upsert(cur)
+		return nil
+	})
+	_ = AppendAudit(root, AuditEntry{
+		At:        time.Now().UTC().Format(time.RFC3339),
+		CallerID:  t.CallerID,
+		Agent:     t.Agent,
+		ContextID: t.ContextID,
+		TaskID:    t.TaskID,
+		Summary:   reason,
+		Outcome:   "drain_rejected",
+	})
 }
 
 const (
@@ -103,6 +176,11 @@ const (
 // sandbox forever is itself an unbounded disk-growth path; the newest are the
 // ones worth inspecting.
 const MaxRetainedFailedSandboxes = 20
+
+// LivenessGrace 是一列進入 working / dispatching 之後，多久才開始檢查它的
+// tmux session 還在不在。剛起來的 session 有 tmux server 尚未就緒的窗口，
+// 沒有寬限期會把健康的任務誤殺。
+const LivenessGrace = 2 * time.Minute
 
 func parseRFC3339(s string) (time.Time, bool) {
 	t, err := time.Parse(time.RFC3339, s)
@@ -212,6 +290,18 @@ type SandboxStopper interface {
 // tmux/git/filesystem work happening in between, outside the lock (WithTasks'
 // mutex is non-reentrant, so nesting a second WithTasks call inside the first
 // would deadlock):
+//
+// Between step 1 and step 2 (task 8, I7) sits a third, independent lock-out-
+// lock-in round trip: every TaskWorking/TaskDispatching row whose session was
+// claimed at least LivenessGrace ago is checked with sm.Alive (shelling out to
+// tmux, so outside the lock, same as everything else that touches a session)
+// and, if its session has actually vanished, transitioned straight to
+// TaskFailed with a re-verified identity check — the same forensics-preserving
+// terminal state a HardTimeout cancel does NOT get, because a crashed sandbox
+// is a failure, not an operator cancellation. This is deliberately a separate
+// round trip rather than folded into step 1's single pass: step 1 never shells
+// out to anything, and Alive must run outside the tasksMu lock like every
+// other tmux call in this file.
 //
 //  1. Identify candidates (state transitions for hard-timeout cancels are
 //     applied and persisted here, but no Worktree/Session field is cleared
@@ -480,6 +570,60 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 	// success.
 	if err != nil && !errors.Is(err, errNothingSwept) {
 		return canceled, 0, err
+	}
+
+	// --- 存活偵測（I7）。挑清單在鎖內，tmux 呼叫在鎖外，落帳再回鎖內。 ---
+	var liveCheck []A2ATask
+	_ = WithTasks(root, func(tasks *TaskStore) error {
+		for _, t := range tasks.Tasks {
+			if t.State != TaskWorking && t.State != TaskDispatching {
+				continue
+			}
+			if t.Session == "" {
+				continue
+			}
+			ref := t.StartedAt
+			if t.State == TaskDispatching && t.DispatchedAt != "" {
+				ref = t.DispatchedAt
+			}
+			if at, ok := parseRFC3339(ref); ok && now.Sub(at) < LivenessGrace {
+				continue
+			}
+			liveCheck = append(liveCheck, t)
+		}
+		return errNothingSwept // 只讀不寫
+	})
+	var vanished []A2ATask
+	for _, t := range liveCheck {
+		alive, err := sm.Alive(ctx, t.Session)
+		if err != nil {
+			log.Printf("a2a: sweep: 檢查 %s 存活失敗，這一趟先當它還活著: %v", t.Session, err)
+			continue
+		}
+		if !alive {
+			vanished = append(vanished, t)
+		}
+	}
+	if len(vanished) > 0 {
+		_ = WithTasks(root, func(tasks *TaskStore) error {
+			changed := false
+			for _, v := range vanished {
+				cur, ok := tasks.ByContext(v.ContextID)
+				// 身分必須還是同一個，否則就是拆除窗口內的重新提交。
+				if !ok || cur.TaskID != v.TaskID || cur.State != v.State || cur.Session != v.Session {
+					continue
+				}
+				cur.State = TaskFailed
+				cur.Detail = "sandbox session vanished"
+				cur.CompletedAt = now.UTC().Format(time.RFC3339)
+				tasks.Upsert(cur)
+				changed = true
+			}
+			if !changed {
+				return errNothingSwept
+			}
+			return nil
+		})
 	}
 
 	// --- Step 2: 鎖外。每個 session 一把鎖，鎖內才准動手，動不了就放棄。 ---

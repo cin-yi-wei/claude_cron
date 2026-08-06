@@ -159,6 +159,11 @@ func (e *SandboxExecutor) Start(ctx context.Context, task A2ATask, prompt string
 		e.markFailed(task, err.Error())
 		return err
 	}
+	if !agent.Enabled {
+		err := fmt.Errorf("agent %q is disabled", task.Agent)
+		e.markFailed(task, err.Error())
+		return err
+	}
 
 	// 沒有有效等級的 row 不可以起沙盒:政策檔會寫不出可用的 Level,gate 會
 	// 全面拒絕,結果是一個活著卻什麼都做不了、還佔著併發額度的殭屍。

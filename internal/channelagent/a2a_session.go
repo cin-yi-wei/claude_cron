@@ -24,6 +24,10 @@ type SessionManager interface {
 	// 是 ~/.claude.json,那是這台機器上所有 claude 行程共用的活檔,一個直接
 	// 呼叫它的單元測試會改寫 operator 的線上設定。
 	TrustFolder(ctx context.Context, worktree string) error
+	// Alive 回報這個 tmux session 是否還在。沙盒死掉（機器重開、session 被砍）
+	// 沒有任何其他偵測管道 —— 任務會停在 working 兩小時，然後被判成 canceled
+	// 而不是 failed，forensics 保留規則因此套錯邊。
+	Alive(ctx context.Context, session string) (bool, error)
 }
 
 // TmuxSessionManager is the production implementation, delegating to the same
@@ -50,6 +54,21 @@ func (TmuxSessionManager) TrustFolder(_ context.Context, worktree string) error 
 
 func (TmuxSessionManager) Stop(ctx context.Context, session string) error {
 	return StopTmuxSession(ctx, session)
+}
+
+func (TmuxSessionManager) Alive(ctx context.Context, session string) (bool, error) {
+	return TmuxSessionAlive(ctx, session)
+}
+
+// TmuxSessionAlive 用 `tmux has-session -t` 判斷。非零離開碼一律解讀為
+// 「不存在」：tmux 不區分「沒有這個 session」與「tmux server 沒起來」，而後
+// 者對一個應該有 session 在跑的沙盒來說結論相同 —— 它沒在跑。sweep 的
+// LivenessGrace 就是為了不讓一次瞬間的誤判殺掉剛起來的任務。
+func TmuxSessionAlive(ctx context.Context, session string) (bool, error) {
+	if err := runExternalCommand(ctx, "tmux", "has-session", "-t", session); err != nil {
+		return false, nil
+	}
+	return true, nil
 }
 
 func (TmuxSessionManager) RemoveWorkspace(ctx context.Context, projectDir, worktree string) error {
@@ -108,6 +127,12 @@ type FakeSessionManager struct {
 	// an actual sleep.
 	EnsureWorkspaceHold    chan struct{}
 	EnsureWorkspaceEntered chan struct{}
+	// AliveSessions scripts the Alive method: nil (the zero value) means every
+	// session reads as alive, so existing tests that never mention liveness
+	// are unaffected. When set, only the sessions explicitly present with
+	// value true are alive — everything else (absent key, or explicit false)
+	// reads as dead, letting a test simulate a vanished session precisely.
+	AliveSessions map[string]bool
 	// mu 序列化每個方法對上面那些切片的存取。task 6 之前所有測試都是單一
 	// goroutine 呼叫 fake,不需要鎖;task 6 的併發測試 (N 條 goroutine 各自
 	// message/send、或 handler 與 DrainQueue 並發) 會從多條 goroutine 同時
@@ -196,4 +221,16 @@ func (f *FakeSessionManager) TrustFolder(_ context.Context, worktree string) err
 	// 只記錄呼叫,絕不碰真實的 ~/.claude.json。
 	f.Trusted = append(f.Trusted, worktree)
 	return nil
+}
+
+func (f *FakeSessionManager) Alive(_ context.Context, session string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.FailOn == "alive" {
+		return false, errors.New("fake alive failure")
+	}
+	if f.AliveSessions == nil {
+		return true, nil // 未腳本化時視為活著，既有測試不受影響
+	}
+	return f.AliveSessions[session], nil
 }

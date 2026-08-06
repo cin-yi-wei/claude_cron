@@ -41,6 +41,10 @@ type SandboxDriver struct {
 	// with no ChannelID.
 	sinkMu sync.RWMutex
 	sink   *AgentOutputSink
+
+	// alive 讓 driver 分辨「這一輪剛好失敗」與「沙盒根本不在了」。可在測試中
+	// 覆寫，於是驗證這條邏輯不需要真的起 tmux。
+	alive func(ctx context.Context, session string) (bool, error)
 }
 
 // sandboxLoop tracks one running driver goroutine: cancel requests its exit,
@@ -55,7 +59,7 @@ type sandboxLoop struct {
 }
 
 func NewSandboxDriver(root string, timeout time.Duration) *SandboxDriver {
-	return &SandboxDriver{root: root, timeout: timeout, running: map[string]*sandboxLoop{}}
+	return &SandboxDriver{root: root, timeout: timeout, running: map[string]*sandboxLoop{}, alive: TmuxSessionAlive}
 }
 
 // SetOutputSink wires the driver's per-sandbox visibility lines (lifecycle,
@@ -158,6 +162,11 @@ func (d *SandboxDriver) loop(ctx context.Context, task A2ATask, inj Injector) {
 	// and without this a two-hour hang can push ~7200 identical lines before
 	// the sweep finally kills it. See driverErrorThrottle.
 	throttle := newDriverErrorThrottle()
+	// consecutiveErrors counts RunWorkerOnce failures in a row, reset to 0 on
+	// any success. Reaching 3 triggers a liveness check (below) — a sandbox
+	// whose session has actually vanished would otherwise fail every tick for
+	// up to two hours before HardTimeout finally catches it.
+	var consecutiveErrors int
 	// reportErr is the single place that turns an in-loop error into visible
 	// output — stderr always, the agent channel when the throttle allows it.
 	// Every keystroke-sending site below routes its error here instead of
@@ -321,7 +330,20 @@ func (d *SandboxDriver) loop(ctx context.Context, task A2ATask, inj Injector) {
 
 		processed, err := RunWorkerOnce(ctx, sandbox, inj, d.timeout)
 		if err != nil {
+			consecutiveErrors++
 			reportErr(err)
+			// 連續 3 次失敗就確認一次沙盒是否還在。不在就停止驅動，把判定交給
+			// sweep（它才是唯一該改任務狀態的地方）—— 沒有這條，一個 session
+			// 消失的沙盒會每秒失敗一次直到兩小時硬逾時。
+			if consecutiveErrors >= 3 {
+				if ok, aerr := d.alive(ctx, session); aerr == nil && !ok {
+					channel.SendLine(task.ContextID, "🔴 sandbox session 已不存在，停止驅動")
+					return
+				}
+				consecutiveErrors = 0
+			}
+		} else {
+			consecutiveErrors = 0
 		}
 		// Stream the sandbox's transcript activity (thinking/tool-use) to its
 		// agent channel — the "what is this sandbox actually doing" visibility

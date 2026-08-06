@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -869,6 +870,146 @@ func TestSandboxDriverSurfacesGateSendKeysFailure(t *testing.T) {
 		case <-deadline:
 			t.Fatal("send-keys failure on the managed-settings gate was never surfaced to the agent channel")
 		}
+	}
+}
+
+// alwaysFailingInjector satisfies Injector by failing every call with a fixed
+// error other than errSessionBusy — RunWorkerOnce (worker.go:165-178) then
+// requeues the job (up to maxJobAttempts) and returns that error to the
+// caller. A single staged job therefore produces exactly maxJobAttempts (3)
+// consecutive RunWorkerOnce errors before the job is moved to inbox/failed —
+// precisely enough to exercise loop's consecutiveErrors>=3 liveness check
+// without ever touching a real tmux session or claude process.
+type alwaysFailingInjector struct{ err error }
+
+func (a alwaysFailingInjector) Inject(context.Context, InputJob, string) error { return a.err }
+
+// task 8 (D7): a sandbox whose tmux session has actually vanished must not be
+// left failing silently every tick for up to two hours until HardTimeout —
+// after 3 consecutive RunWorkerOnce errors, the driver checks liveness and,
+// finding the session gone, stops driving it immediately (leaving the actual
+// task-state transition to sweep, per a2a_lifecycle.go's single teardown
+// path).
+func TestSandboxDriverStopsAfterConsecutiveFailuresWhenSessionDead(t *testing.T) {
+	var sent []string
+	stubTmuxPane(t, "", &sent) // no real tmux: capture-pane always returns empty
+	oldPoll := driverPollInterval
+	driverPollInterval = 10 * time.Millisecond
+	defer func() { driverPollInterval = oldPoll }()
+
+	root := t.TempDir()
+	agents := AgentStore{}
+	if err := agents.Add(Agent{Name: "pm", ChannelID: "chan-pm", Enabled: true}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if err := SaveAgents(root, agents); err != nil {
+		t.Fatalf("SaveAgents: %v", err)
+	}
+
+	task := A2ATask{ContextID: "c1", Agent: "pm", Session: SessionNameFor("pm", "c1"), State: TaskWorking}
+	sandbox := SandboxRoot(root, task.Session)
+	if err := Init(sandbox); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := IngestMessages(context.Background(), sandbox, []SourceMessage{{
+		Platform: "a2a", ChannelID: "c1", MessageID: "m1",
+		CreatedAt: time.Now().UTC().Format(time.RFC3339), Content: "do the thing",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	type sentLine struct{ channelID, text string }
+	got := make(chan sentLine, 32)
+	send := func(_ context.Context, channelID, text string) error {
+		got <- sentLine{channelID, text}
+		return nil
+	}
+	sinkCtx, sinkCancel := context.WithCancel(context.Background())
+	defer sinkCancel()
+	sink := newAgentOutputSink(sinkCtx, root, send)
+
+	d := NewSandboxDriver(root, time.Second)
+	d.SetOutputSink(sink)
+	// 覆寫 alive：session 已經不在了，測試不需要真的起 tmux。
+	d.alive = func(context.Context, string) (bool, error) { return false, nil }
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d.Ensure(ctx, task, alwaysFailingInjector{err: errors.New("boom: injector unreachable")})
+	defer d.StopAll()
+
+	deadline := time.After(3 * time.Second)
+	announced := false
+	for !announced {
+		select {
+		case msg := <-got:
+			if strings.Contains(msg.text, "已不存在") {
+				announced = true
+			}
+		case <-deadline:
+			t.Fatal("driver never announced stopping for a session whose liveness check reported dead")
+		}
+	}
+	// The driver loop must actually have exited, not merely emitted the line.
+	deadline2 := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline2) && len(d.Running()) != 0 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := d.Running(); len(got) != 0 {
+		t.Fatalf("Running() = %#v, want empty — driver must stop itself once liveness reports the session dead", got)
+	}
+}
+
+// task 8 (D7): the mirror case — a sandbox that is merely slow/busy (its
+// session is genuinely still alive) must NOT be torn down just because
+// RunWorkerOnce failed 3 times in a row. An earlier task in this remediation
+// cycle shipped exactly the bug of a liveness/health check firing on a
+// healthy-but-busy target; this pins that the alive=true branch resets the
+// counter and keeps driving instead of stopping.
+func TestSandboxDriverKeepsDrivingWhenAliveDespiteConsecutiveFailures(t *testing.T) {
+	var sent []string
+	stubTmuxPane(t, "", &sent)
+	oldPoll := driverPollInterval
+	driverPollInterval = 10 * time.Millisecond
+	defer func() { driverPollInterval = oldPoll }()
+
+	root := t.TempDir()
+	task := A2ATask{ContextID: "c1", Agent: "pm", Session: SessionNameFor("pm", "c1"), State: TaskWorking}
+	sandbox := SandboxRoot(root, task.Session)
+	if err := Init(sandbox); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := IngestMessages(context.Background(), sandbox, []SourceMessage{{
+		Platform: "a2a", ChannelID: "c1", MessageID: "m1",
+		CreatedAt: time.Now().UTC().Format(time.RFC3339), Content: "do the thing",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	var aliveCalls atomic.Int64
+	d := NewSandboxDriver(root, time.Second)
+	d.alive = func(context.Context, string) (bool, error) {
+		aliveCalls.Add(1)
+		return true, nil // session is genuinely still there — just busy/slow
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d.Ensure(ctx, task, alwaysFailingInjector{err: errors.New("boom: injector unreachable")})
+	defer d.StopAll()
+
+	// Give the loop plenty of ticks to hit the 3-consecutive-error threshold
+	// (one staged job exhausts maxJobAttempts=3 in 3 immediate iterations,
+	// with no poll sleep between error iterations) and beyond.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && aliveCalls.Load() == 0 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if aliveCalls.Load() == 0 {
+		t.Fatal("liveness check was never invoked after 3 consecutive failures")
+	}
+	// The driver must still be running — alive=true must never stop it.
+	time.Sleep(100 * time.Millisecond)
+	if got := d.Running(); len(got) != 1 {
+		t.Fatalf("Running() = %#v, want the driver still running — alive=true must not be treated as dead", got)
 	}
 }
 

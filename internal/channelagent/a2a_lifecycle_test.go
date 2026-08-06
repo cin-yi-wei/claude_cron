@@ -11,6 +11,32 @@ import (
 	"time"
 )
 
+// seedApprovedCallerAndEnabledAgent writes a minimal callers.json/agents.json
+// so DrainQueue's per-cycle revalidation (task 8, I1) doesn't reject a
+// capacity-mechanics test's queued rows for reasons unrelated to what that
+// test is actually exercising: these rows carry no Level, and grantRank("")
+// is 0 — never greater than any valid grant — so the caller's exact grant
+// level here is irrelevant, only that callerID/agent resolve and are
+// approved/enabled.
+func seedApprovedCallerAndEnabledAgent(t *testing.T, root, callerID, agentName string) {
+	t.Helper()
+	var callers CallerStore
+	if err := callers.Register(callerID, "s"); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	callers.Approve(callerID, []string{"read"})
+	if err := SaveCallers(root, callers); err != nil {
+		t.Fatalf("SaveCallers: %v", err)
+	}
+	var agents AgentStore
+	if err := agents.Add(Agent{Name: agentName, ProjectDir: "/p/" + agentName, Capabilities: []string{"read"}, Enabled: true}); err != nil {
+		t.Fatalf("Add agent: %v", err)
+	}
+	if err := SaveAgents(root, agents); err != nil {
+		t.Fatalf("SaveAgents: %v", err)
+	}
+}
+
 func TestHasCapacityRespectsCap(t *testing.T) {
 	var s TaskStore
 	for i := 0; i < MaxConcurrentSandboxes; i++ {
@@ -33,11 +59,12 @@ func TestMaxConcurrentSandboxesIsEight(t *testing.T) {
 
 func TestDrainQueueStartsSubmittedTasksUpToCap(t *testing.T) {
 	root := t.TempDir()
+	seedApprovedCallerAndEnabledAgent(t, root, "peer", "a")
 	var s TaskStore
 	// One already working, plus three queued.
 	s.Upsert(A2ATask{ContextID: "live", Agent: "a", State: TaskWorking})
 	for _, id := range []string{"q1", "q2", "q3"} {
-		s.Upsert(A2ATask{ContextID: id, Agent: "a", State: TaskSubmitted, Prompt: "work " + id})
+		s.Upsert(A2ATask{ContextID: id, Agent: "a", CallerID: "peer", State: TaskSubmitted, Prompt: "work " + id})
 	}
 	if err := SaveTasks(root, s); err != nil {
 		t.Fatalf("SaveTasks: %v", err)
@@ -68,10 +95,11 @@ func TestDrainQueueStartsSubmittedTasksUpToCap(t *testing.T) {
 // which a submitted task waiting for a slot doesn't count against itself.
 func TestDrainQueueRecoversWhenOnlyQueuedTasksExist(t *testing.T) {
 	root := t.TempDir()
+	seedApprovedCallerAndEnabledAgent(t, root, "peer", "a")
 	var s TaskStore
 	// More queued tasks than the cap, and nothing running at all.
 	for i := 0; i < MaxConcurrentSandboxes+2; i++ {
-		s.Upsert(A2ATask{ContextID: string(rune('a' + i)), Agent: "a", State: TaskSubmitted, Prompt: "work"})
+		s.Upsert(A2ATask{ContextID: string(rune('a' + i)), Agent: "a", CallerID: "peer", State: TaskSubmitted, Prompt: "work"})
 	}
 	if err := SaveTasks(root, s); err != nil {
 		t.Fatalf("SaveTasks: %v", err)
@@ -1183,3 +1211,106 @@ func TestFollowUpAfterSweepReclaimDoesNotResurrectSandboxDir(t *testing.T) {
 type recordingStopper struct{ stopped []string }
 
 func (r *recordingStopper) Stop(session string) { r.stopped = append(r.stopped, session) }
+
+// task 8 (D6)：呼叫方灌爆佇列後被 operator 撤銷，backlog 不可以繼續被排空成
+// 新沙盒 —— DrainQueue 必須在派送前重讀 callers.json，不是只在最初 dispatch
+// 那一次查過就算數。
+func TestDrainQueueFailsRowsWhoseCallerWasRevoked(t *testing.T) {
+	root := t.TempDir()
+	var callers CallerStore
+	_ = callers.Register("peer-a", "s")
+	callers.Approve("peer-a", []string{"read"})
+	callers.SetGrantLevel("peer-a", GrantDevelop)
+	callers.Revoke("peer-a")
+	_ = SaveCallers(root, callers)
+
+	var agents AgentStore
+	_ = agents.Add(Agent{Name: "a", ProjectDir: "/p/a", Capabilities: []string{"read"}, Enabled: true})
+	_ = SaveAgents(root, agents)
+
+	var s TaskStore
+	s.Upsert(A2ATask{
+		ContextID: "c1", Agent: "a", CallerID: "peer-a", Level: GrantDevelop,
+		Session: "aa-a-c1", State: TaskSubmitted, StartedAt: time.Now().UTC().Format(time.RFC3339),
+	})
+	_ = SaveTasks(root, s)
+
+	fake := &FakeSessionManager{}
+	if n, err := DrainQueue(context.Background(), root, NewSandboxExecutor(root, fake)); err != nil || n != 0 {
+		t.Fatalf("started = %d err = %v; a revoked caller's backlog must not drain", n, err)
+	}
+	if len(fake.Started) != 0 {
+		t.Fatalf("started %#v for a revoked caller", fake.Started)
+	}
+	got, _ := LoadTasks(root)
+	tk, _ := got.ByContext("c1")
+	if tk.State != TaskFailed || !strings.Contains(tk.Detail, "revoked") {
+		t.Fatalf("row = %q / %q, want failed with a revocation detail", tk.State, tk.Detail)
+	}
+	entries, _ := ReadAudit(root)
+	if len(entries) == 0 || entries[len(entries)-1].Outcome != "drain_rejected" {
+		t.Fatalf("a silent continue is exactly the defect; audit tail = %#v", entries)
+	}
+}
+
+// task 8 (D6)：disabling an agent must also stop its already-queued backlog
+// from draining into a new sandbox, not just future submissions.
+func TestDrainQueueFailsRowsForDisabledAgents(t *testing.T) {
+	root := t.TempDir()
+	var callers CallerStore
+	_ = callers.Register("peer-a", "s")
+	callers.Approve("peer-a", []string{"read"})
+	callers.SetGrantLevel("peer-a", GrantDevelop)
+	_ = SaveCallers(root, callers)
+
+	var agents AgentStore
+	_ = agents.Add(Agent{Name: "a", ProjectDir: "/p/a", Capabilities: []string{"read"}, Enabled: false})
+	_ = SaveAgents(root, agents)
+
+	var s TaskStore
+	s.Upsert(A2ATask{
+		ContextID: "c1", Agent: "a", CallerID: "peer-a", Level: GrantDevelop,
+		Session: "aa-a-c1", State: TaskSubmitted, StartedAt: time.Now().UTC().Format(time.RFC3339),
+	})
+	_ = SaveTasks(root, s)
+
+	fake := &FakeSessionManager{}
+	_, _ = DrainQueue(context.Background(), root, NewSandboxExecutor(root, fake))
+	if len(fake.Started) != 0 {
+		t.Fatalf("started %#v for a disabled agent", fake.Started)
+	}
+}
+
+// task 8 (I7)：session 不存在但任務未完成 → 標 failed（不是 canceled），worktree 保留。
+func TestSweepFailsTasksWhoseSessionVanished(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	var s TaskStore
+	s.Upsert(A2ATask{
+		ContextID: "c1", TaskID: "t1", Agent: "a", Session: "aa-a-c1", Worktree: "/p/aa-a-c1",
+		State: TaskWorking, StartedAt: now.Add(-LivenessGrace - time.Minute).Format(time.RFC3339),
+	})
+	s.Upsert(A2ATask{
+		ContextID: "c2", TaskID: "t2", Agent: "a", Session: "aa-a-c2", Worktree: "/p/aa-a-c2",
+		State: TaskWorking, StartedAt: now.Format(time.RFC3339), // 還在寬限期內
+	})
+	_ = SaveTasks(root, s)
+
+	fake := &FakeSessionManager{AliveSessions: map[string]bool{"aa-a-c1": false, "aa-a-c2": false}}
+	if _, _, err := SweepTimeouts(context.Background(), root, fake, now, nil); err != nil {
+		t.Fatalf("SweepTimeouts: %v", err)
+	}
+	got, _ := LoadTasks(root)
+	c1, _ := got.ByContext("c1")
+	if c1.State != TaskFailed || !strings.Contains(c1.Detail, "vanished") {
+		t.Fatalf("c1 = %q / %q, want failed", c1.State, c1.Detail)
+	}
+	// forensics：failed 的 worktree 保留。
+	if c1.Worktree == "" || len(fake.Removed) != 0 {
+		t.Fatalf("a vanished sandbox's worktree must be kept for forensics: worktree=%q removed=%#v", c1.Worktree, fake.Removed)
+	}
+	c2, _ := got.ByContext("c2")
+	if c2.State != TaskWorking {
+		t.Fatalf("c2 = %q; a task inside the liveness grace must be left alone", c2.State)
+	}
+}
