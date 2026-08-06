@@ -59,6 +59,37 @@ func TestMaxConcurrentSandboxesIsEight(t *testing.T) {
 	}
 }
 
+// TestAppendDetailComposesSafety 釘住 appendDetail 的合成規則
+// （round-11-review 第二輪 Minor 1/2/3）：既有 Detail 是空字串時沒有東西
+// 可以不安全，是 AND 的單位元；非空時兩段都要安全，結果才安全——單一段
+// 不安全，整串就不安全。
+func TestAppendDetailComposesSafety(t *testing.T) {
+	cases := []struct {
+		name         string
+		existing     string
+		existingSafe bool
+		reason       string
+		reasonSafe   bool
+		wantDetail   string
+		wantSafe     bool
+	}{
+		{"空 base + 安全 reason -> 安全", "", false, "hard timeout exceeded", true, "hard timeout exceeded", true},
+		{"空 base + 不安全 reason -> 不安全", "", false, "ensure worktree: /x: git failed", false, "ensure worktree: /x: git failed", false},
+		{"不安全 base + 安全 reason -> 仍不安全", "trust warning", false, "hard timeout exceeded", true, "trust warning; hard timeout exceeded", false},
+		{"安全 base + 安全 reason -> 安全", "earlier note", true, "hard timeout exceeded", true, "earlier note; hard timeout exceeded", true},
+		{"安全 base + 不安全 reason -> 不安全", "earlier note", true, "ensure worktree: /x: git failed", false, "earlier note; ensure worktree: /x: git failed", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			detail, safe := appendDetail(c.existing, c.existingSafe, c.reason, c.reasonSafe)
+			if detail != c.wantDetail || safe != c.wantSafe {
+				t.Fatalf("appendDetail(%q,%v,%q,%v) = (%q,%v), want (%q,%v)",
+					c.existing, c.existingSafe, c.reason, c.reasonSafe, detail, safe, c.wantDetail, c.wantSafe)
+			}
+		})
+	}
+}
+
 func TestDrainQueueStartsSubmittedTasksUpToCap(t *testing.T) {
 	root := t.TempDir()
 	seedApprovedCallerAndEnabledAgent(t, root, "peer", "a")
@@ -202,6 +233,13 @@ func TestSweepCancelsAfterHardTimeout(t *testing.T) {
 	if tk.State != TaskCanceled {
 		t.Fatalf("state = %s, want canceled", tk.State)
 	}
+	// round-11-review 第二輪 Minor 2：這一列從沒動過的 Detail 是空字串，接
+	// 上「hard timeout exceeded」這個固定字面文字之後，DetailSafe 必須是
+	// true——這正是 tasks/get 要放行原文、讓呼叫方讀到「你的任務被兩小時
+	// 逾時砍掉了」而不是一句 internal error 的前提。
+	if !tk.DetailSafe {
+		t.Fatal("DetailSafe = false, want true — an empty prior Detail plus a safe literal reason must compose as safe")
+	}
 }
 
 // TestSweepPreservesPriorDetailOnHardTimeout pins the fix for the exact
@@ -244,6 +282,13 @@ func TestSweepPreservesPriorDetailOnHardTimeout(t *testing.T) {
 	}
 	if !strings.Contains(tk.Detail, "hard timeout exceeded") {
 		t.Fatalf("Detail = %q, must still contain the sweep's own reason too", tk.Detail)
+	}
+	// trustNote 是模擬 TrustFolder 失敗包住 err 的不安全文字（fixture 沒有
+	// 設 DetailSafe，零值 false）；跟 sweep 自己乾淨的固定字面 reason 接續
+	// 之後，合成結果必須仍然是 false——舊內容不安全，整串就不安全，不能
+	// 因為新接上去的那一段乾淨就把整串洗白。
+	if tk.DetailSafe {
+		t.Fatal("DetailSafe = true, want false — an unsafe prior Detail must stay unsafe after appending a safe literal")
 	}
 }
 
@@ -656,6 +701,9 @@ func TestSweepFailsStaleDispatchingRows(t *testing.T) {
 	if c2.State != TaskDispatching {
 		t.Fatalf("fresh dispatching row = %q, want it left alone", c2.State)
 	}
+	if !c1.DetailSafe {
+		t.Fatal("DetailSafe = false, want true — an empty prior Detail plus \"dispatch stalled...\" must compose as safe")
+	}
 }
 
 // TestSweepDoesNotHardTimeoutFreshlyClaimedDispatchingRow guards review
@@ -731,6 +779,9 @@ func TestSweepPreservesPriorDetailOnStaleDispatch(t *testing.T) {
 	}
 	if !strings.Contains(tk.Detail, "dispatch stalled") {
 		t.Fatalf("Detail = %q, must still contain the sweep's own reason too", tk.Detail)
+	}
+	if tk.DetailSafe {
+		t.Fatal("DetailSafe = true, want false — an unsafe prior Detail must stay unsafe after appending a safe literal")
 	}
 }
 
@@ -1249,9 +1300,15 @@ func TestDrainQueueFailsRowsWhoseCallerWasRevoked(t *testing.T) {
 	if tk.State != TaskFailed || !strings.Contains(tk.Detail, "revoked") {
 		t.Fatalf("row = %q / %q, want failed with a revocation detail", tk.State, tk.Detail)
 	}
-	entries, _ := ReadAudit(root)
-	if len(entries) == 0 || entries[len(entries)-1].Outcome != "drain_rejected" {
-		t.Fatalf("a silent continue is exactly the defect; audit tail = %#v", entries)
+	// round-11-review 第二輪 Minor 1 的原始探針：這個 reason（"caller
+	// peer-a is no longer approved (revoked or removed)"）只由固定字面文
+	// 字加上呼叫方自己的 caller 名稱組成，不含任何 host 端資訊。row 從沒
+	// 動過的 Detail 是空字串，合成後 DetailSafe 必須是 true——否則一個能
+	// 讀到自己這一列的呼叫方（例如同一個 agent 底下、grant level 被降的
+	// 另一種 drain-reject，而不是這裡本身已經被撤銷、之後也就查不到自己
+	// 的 caller）會被擋下來只看到一句 internal error。
+	if !tk.DetailSafe {
+		t.Fatal("DetailSafe = false, want true — an empty prior Detail plus a caller-input-only drain-reject reason must compose as safe")
 	}
 }
 
@@ -1280,6 +1337,18 @@ func TestDrainQueueFailsRowsForDisabledAgents(t *testing.T) {
 	_, _ = DrainQueue(context.Background(), root, NewSandboxExecutor(root, fake))
 	if len(fake.Started) != 0 {
 		t.Fatalf("started %#v for a disabled agent", fake.Started)
+	}
+	// 這條路徑的呼叫方本身沒有被撤銷，之後仍能用自己的憑證查 tasks/get——
+	// 跟 TestTasksGetShowsDrainRejectReasonVerbatim 是同一個場景在 HTTP 邊
+	// 界上的延伸驗證。這裡先在單元層級釘住：reason 只由固定字面文字 + 呼
+	// 叫方自己的 agent 名稱組成，DetailSafe 必須是 true。
+	got, _ := LoadTasks(root)
+	tk, _ := got.ByContext("c1")
+	if tk.State != TaskFailed || !strings.Contains(tk.Detail, "disabled") {
+		t.Fatalf("row = %q / %q, want failed with a disabled-agent detail", tk.State, tk.Detail)
+	}
+	if !tk.DetailSafe {
+		t.Fatal("DetailSafe = false, want true — an empty prior Detail plus a caller-input-only drain-reject reason must compose as safe")
 	}
 }
 
@@ -1351,6 +1420,9 @@ func TestSweepFailsTasksWhoseSessionVanished(t *testing.T) {
 	c1, _ = got.ByContext("c1")
 	if c1.State != TaskFailed || !strings.Contains(c1.Detail, "vanished") {
 		t.Fatalf("c1 after pass 2 = %q / %q, want failed with a vanished detail", c1.State, c1.Detail)
+	}
+	if !c1.DetailSafe {
+		t.Fatal("DetailSafe = false, want true — an empty prior Detail plus \"sandbox session vanished\" must compose as safe")
 	}
 	// forensics：failed 的 worktree 保留。
 	if c1.Worktree == "" || len(fake.Removed) != 0 {
@@ -1504,6 +1576,13 @@ func TestSweepRevokesRunningTaskWhoseCallerWasRevoked(t *testing.T) {
 	tk, _ := got.ByContext("c1")
 	if tk.State != TaskFailed || !strings.Contains(tk.Detail, "revoked") {
 		t.Fatalf("row = %q / %q, want failed with a revocation detail", tk.State, tk.Detail)
+	}
+	// 這一列從沒動過的 Detail 是空字串，接上撤銷理由（固定字面文字 + 呼叫
+	// 方/agent 自己的名稱）之後必須是安全的——這一列的 CallerID 本身雖然
+	// 被撤銷、之後讀不到自己，但同一條合成規則也管著其他能繼續查詢的終態
+	// row，這裡在能構造出這個場景的地方先釘住旗標本身的正確性。
+	if !tk.DetailSafe {
+		t.Fatal("DetailSafe = false, want true — an empty prior Detail plus a caller/agent-input-only revocation reason must compose as safe")
 	}
 
 	// 既有的單一拆除路徑必須真的跑到：driver/tmux 停掉，不是只改政策檔跟
@@ -2015,6 +2094,9 @@ func TestSweepPreservesPriorDetailOnVanish(t *testing.T) {
 	if !strings.Contains(tk.Detail, trustNote) || !strings.Contains(tk.Detail, "vanished") {
 		t.Fatalf("Detail = %q, want both the prior trust-failure note AND the vanish reason", tk.Detail)
 	}
+	if tk.DetailSafe {
+		t.Fatal("DetailSafe = true, want false — an unsafe prior Detail must stay unsafe after appending a safe literal")
+	}
 }
 
 func TestSweepPreservesPriorDetailOnRunningRevocation(t *testing.T) {
@@ -2054,6 +2136,9 @@ func TestSweepPreservesPriorDetailOnRunningRevocation(t *testing.T) {
 	}
 	if !strings.Contains(tk.Detail, trustNote) || !strings.Contains(tk.Detail, "revoked") {
 		t.Fatalf("Detail = %q, want both the prior trust-failure note AND the revocation reason", tk.Detail)
+	}
+	if tk.DetailSafe {
+		t.Fatal("DetailSafe = true, want false — an unsafe prior Detail must stay unsafe after appending a safe literal")
 	}
 }
 

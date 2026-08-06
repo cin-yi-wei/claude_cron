@@ -1205,3 +1205,80 @@ func TestTasksGetRedactsUnsafeDetail(t *testing.T) {
 		t.Fatalf("detail = %q, want a generic message with no host path", detail)
 	}
 }
+
+// round-11-review 第二輪 Minor 1/2：這是這個功能真正要交付的東西——一個
+// 被硬逾時砍掉的任務，呼叫方必須讀到「hard timeout exceeded」，不是一句
+// 跟這件事完全無關的 internal error。走真正的 SweepTimeouts（不是手動組
+// A2ATask 塞 DetailSafe），端到端證明這條路徑真的會把 DetailSafe 正確標成
+// true。
+func TestTasksGetShowsHardTimeoutReasonVerbatim(t *testing.T) {
+	s, root := newTestA2AServer(t)
+	now := time.Now().UTC()
+	var tasks TaskStore
+	tasks.Upsert(A2ATask{
+		ContextID: "c1", TaskID: "t1", Agent: "codereview", CallerID: "peer-a",
+		Session: "aa-codereview-c1", State: TaskWorking,
+		StartedAt: now.Add(-3 * time.Hour).Format(time.RFC3339),
+	})
+	_ = SaveTasks(root, tasks)
+
+	if _, _, err := SweepTimeouts(context.Background(), root, &FakeSessionManager{}, now, nil); err != nil {
+		t.Fatalf("SweepTimeouts: %v", err)
+	}
+
+	rec := postRPC(t, s.Handler(), "secret-1", `{"jsonrpc":"2.0","id":1,"method":"tasks/get","params":{"contextId":"c1"}}`)
+	var resp RPCResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %#v", resp.Error)
+	}
+	res, _ := resp.Result.(map[string]any)
+	if res["state"] != "canceled" {
+		t.Fatalf("state = %#v, want canceled", res["state"])
+	}
+	detail, _ := res["detail"].(string)
+	if !strings.Contains(detail, "hard timeout exceeded") {
+		t.Fatalf("detail = %q, want the caller to read the hard-timeout reason verbatim, not a generic internal-error string", detail)
+	}
+}
+
+// 同一個場景的另一半：drainRejectReason 產生的理由（這裡用停用 agent 而不
+// 是撤銷 caller——撤銷 caller 之後那個 caller 自己也再認證不了，沒辦法真的
+// 用 HTTP 查回自己這一列，disabled-agent 這條路徑的呼叫方本身沒事，query
+// 得到）也是固定字面文字加上呼叫方自己已經知道的 agent 名稱，呼叫方必須
+// 讀到「agent "codereview" is disabled」，不是 internal error。走真正的
+// DrainQueue，端到端證明。
+func TestTasksGetShowsDrainRejectReasonVerbatim(t *testing.T) {
+	s, root := newTestA2AServer(t)
+	agents := AgentStore{}
+	_ = agents.Add(Agent{Name: "codereview", ProjectDir: "/p/x", Description: "d", Capabilities: []string{"read"}, Enabled: false})
+	if err := SaveAgents(root, agents); err != nil {
+		t.Fatalf("SaveAgents: %v", err)
+	}
+
+	var tasks TaskStore
+	tasks.Upsert(A2ATask{
+		ContextID: "c1", TaskID: "t1", Agent: "codereview", CallerID: "peer-a", Level: GrantReadOnly,
+		Session: "aa-codereview-c1", State: TaskSubmitted, StartedAt: time.Now().UTC().Format(time.RFC3339),
+	})
+	_ = SaveTasks(root, tasks)
+
+	if _, err := DrainQueue(context.Background(), root, &StubExecutor{}); err != nil {
+		t.Fatalf("DrainQueue: %v", err)
+	}
+
+	rec := postRPC(t, s.Handler(), "secret-1", `{"jsonrpc":"2.0","id":1,"method":"tasks/get","params":{"contextId":"c1"}}`)
+	var resp RPCResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %#v", resp.Error)
+	}
+	res, _ := resp.Result.(map[string]any)
+	if res["state"] != "failed" {
+		t.Fatalf("state = %#v, want failed", res["state"])
+	}
+	detail, _ := res["detail"].(string)
+	if !strings.Contains(detail, "disabled") {
+		t.Fatalf("detail = %q, want the caller to read the drain-reject reason verbatim, not a generic internal-error string", detail)
+	}
+}

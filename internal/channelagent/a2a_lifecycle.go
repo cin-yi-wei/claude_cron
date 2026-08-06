@@ -179,11 +179,9 @@ func revokeReasonForRunningTask(callers CallerStore, agents, rawAgents AgentStor
 	return reason
 }
 
-// safe 是 reason 本身(不含 cur.Detail 裡任何已經存在的舊內容)的安全性。合
-// 成後的旗標是兩者的 AND：舊內容不安全,結果就不安全,不管這次新接上去的
-// reason 多乾淨;新接上去的 reason 不安全,結果也不安全,不管舊內容原來多
-// 乾淨——appendDetail 是純粹的字串接續,沒有辦法事後把兩段的安全性分開,
-// 一旦合成就只能取更嚴格的那一邊。
+// safe 是 reason 本身(不含 cur.Detail 裡任何已經存在的舊內容)的安全性；
+// 合成規則見 appendDetail 的說明（既有內容是空字串時不參與 AND，避免把
+// 一段本來乾淨的固定字面 reason 錯殺成不安全）。
 func failDrainedTask(root string, t A2ATask, reason string, safe bool) {
 	_ = WithTasks(root, func(tasks *TaskStore) error {
 		cur, ok := tasks.ByContext(t.ContextID)
@@ -191,8 +189,7 @@ func failDrainedTask(root string, t A2ATask, reason string, safe bool) {
 			return errNothingToDrain
 		}
 		cur.State = TaskFailed
-		cur.Detail = appendDetail(cur.Detail, reason)
-		cur.DetailSafe = cur.DetailSafe && safe
+		cur.Detail, cur.DetailSafe = appendDetail(cur.Detail, cur.DetailSafe, reason, safe)
 		cur.CompletedAt = time.Now().UTC().Format(time.RFC3339)
 		tasks.Upsert(cur)
 		return nil
@@ -365,17 +362,33 @@ const LivenessGrace = 2 * time.Minute
 // 一個 A2ACycleInterval），調低則是放寬到單次取樣，兩者都要一起考慮。
 const VanishedConfirmStrikes = 2
 
-// appendDetail 把新的理由接在既有 Detail 後面（用「; 」分隔），不覆寫掉卡
-// 住之前就已經留在 Detail 裡的線索（常見的是 task 4 的 TrustFolder 失敗警
-// 告）。HardTimeout 取消與派送中崩潰兩條既有路徑都遵守這個慣例（見
+// appendDetail 把新的 reason 接在既有 Detail 後面（用「; 」分隔），不覆寫掉
+// 卡住之前就已經留在 Detail 裡的線索（常見的是 task 4 的 TrustFolder 失敗
+// 警告）。HardTimeout 取消與派送中崩潰兩條既有路徑都遵守這個慣例（見
 // TestSweepPreservesPriorDetailOnHardTimeout / …OnStaleDispatch，commit
 // b8c5ab0），存活偵測與撤銷偵測這兩條新路徑必須一致——否則卡住前的原因會
 // 在最後一步斷掉（round 9 review, Important）。
-func appendDetail(existing, reason string) string {
+//
+// existingSafe 是接續前既有 Detail 的安全旗標，reasonSafe 是這次要接上去
+// 的 reason 本身的安全性；回傳的 safe 是合成後的旗標，呼叫方必須把它寫回
+// DetailSafe。existing 是空字串時沒有任何「舊內容」可以不安全，是 AND 的
+// 單位元（vacuously safe）——只有 existing 真的非空時，existingSafe 才實
+// 際參與這次合成。少了這一條，第一次寫入的固定字面 reason 會被預設值
+// false 的 existingSafe 錯殺成不安全（round-11-review 第二輪 Minor 1/2：
+// 一列從沒動過的 Detail 是空字串，接上「hard timeout exceeded」這種完全
+// 乾淨的固定字面文字，結果卻被回應層擋下來，換成一句「internal error」，
+// 呼叫方連自己的任務是被兩小時逾時砍掉的都看不到）。
+//
+// reasonSafe 沒有預設值可省略，逼著每個呼叫點都要決定它接上去的到底是固
+// 定字面文字（true）還是包著 err.Error() 的字串（false）——不能讓「反正
+// 目前接的都是字面文字」這個事實只活在程式碼恰好沒人接過別的東西的巧合
+// 裡（round-11-review 第二輪 Minor 3）。
+func appendDetail(existing string, existingSafe bool, reason string, reasonSafe bool) (detail string, safe bool) {
+	safe = (existing == "" || existingSafe) && reasonSafe
 	if existing == "" {
-		return reason
+		return reason, safe
 	}
-	return existing + "; " + reason
+	return existing + "; " + reason, safe
 }
 
 func parseRFC3339(s string) (time.Time, bool) {
@@ -608,15 +621,15 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 					d, dok := parseRFC3339(t.DispatchedAt)
 					if !dok || now.Sub(d) >= DispatchStaleAfter {
 						t.State = TaskFailed
-						detail := "dispatch stalled (no sandbox came up)"
 						// 保留卡住前就已經留在 Detail 裡的線索,跟下面
 						// TaskCanceled 那條路一樣的理由(task 4):不能讓
 						// sweep 自己的 reason 蓋掉它(review round 2, minor
-						// 2)。
-						if t.Detail != "" {
-							detail = t.Detail + "; " + detail
-						}
-						t.Detail = detail
+						// 2)。"dispatch stalled..." 是固定字面文字
+						// (newSafe=true)；appendDetail 正確處理 t.Detail
+						// 目前是空字串的情況(round-11-review 第二輪 Minor
+						// 2：不會因為 t.DetailSafe 的預設值是 false 就把這
+						// 段本來乾淨的文字錯殺成不安全)。
+						t.Detail, t.DetailSafe = appendDetail(t.Detail, t.DetailSafe, "dispatch stalled (no sandbox came up)", true)
 						t.CompletedAt = now.UTC().Format(time.RFC3339)
 						tasks.Tasks[i] = t
 						changed = true
@@ -668,10 +681,12 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 				// 「信任失敗 → 沙盒卡在對話框 → 兩小時後被 sweep 收掉」這整條
 				// 因果就會在最後一步斷掉,使用者看到的只剩「hard timeout
 				// exceeded」,跟這個 task 原本要修的「什麼原因都看不到」一樣。
-				if t.Detail != "" {
-					reason = t.Detail + "; " + reason
-				}
-				t.Detail = reason
+				// reason（"hard timeout exceeded" 或「start time unreadable
+				// ...」）都是固定字面文字（newSafe=true）：呼叫方應該能讀到
+				// 自己的任務是被兩小時逾時砍掉的，不該被硬逾時本身的固定訊
+				// 息換成一句「internal error」（round-11-review 第二輪 Minor
+				// 2）。
+				t.Detail, t.DetailSafe = appendDetail(t.Detail, t.DetailSafe, reason, true)
 				t.CompletedAt = now.UTC().Format(time.RFC3339)
 				tasks.Tasks[i] = t
 				canceled++
@@ -837,7 +852,8 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 				cur.VanishedStrikes++
 				if cur.VanishedStrikes >= VanishedConfirmStrikes {
 					cur.State = TaskFailed
-					cur.Detail = appendDetail(cur.Detail, "sandbox session vanished")
+					// "sandbox session vanished" 是固定字面文字（newSafe=true）。
+					cur.Detail, cur.DetailSafe = appendDetail(cur.Detail, cur.DetailSafe, "sandbox session vanished", true)
 					cur.CompletedAt = now.UTC().Format(time.RFC3339)
 					cur.VanishedStrikes = 0 // row 已經是終態，不必再留計數
 					// round 10 review, Important：不在這裡直接塞進 stopOnly
@@ -945,7 +961,11 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 					return errNothingSwept
 				}
 				cur.State = TaskFailed
-				cur.Detail = appendDetail(cur.Detail, reason)
+				// reason 來自 revokeReasonForRunningTask，永遠以 nil,nil 呼叫
+				// drainRejectReason（見該函式），因此永遠落在固定字面文字 +
+				// 呼叫方自己的 caller/agent 名稱那幾個分支（newSafe=true）,
+				// 絕不會是包住 cerr/aerr 的那兩個不安全分支。
+				cur.Detail, cur.DetailSafe = appendDetail(cur.Detail, cur.DetailSafe, reason, true)
 				cur.CompletedAt = now.UTC().Format(time.RFC3339)
 				// round 10 review, Important：跟存活偵測同一個道理——鎖忙
 				// 的那一刻不代表之後不會再有機會，改成設耐久標記交給下面
