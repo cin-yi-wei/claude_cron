@@ -333,6 +333,48 @@ func TestMarkFailedRefusesRowsThatChangedIdentityOrAreTerminal(t *testing.T) {
 	}
 }
 
+// TestMarkFailedIdentityGuardCatchesRetriesWithSameOmittedTaskID pins round
+// 2026-08-06 final review, Minor 3: TestMarkFailedRefusesRowsThatChangedIdentityOrAreTerminal
+// above only proves the guard works when the two attempts happen to carry
+// different TaskIDs ("t1" vs "t2"). TaskID is the caller's OPTIONAL
+// params.taskId — never server-generated — and Session is a deterministic
+// function of the contextId, so with taskId omitted on BOTH attempts (the
+// common case), TaskID+Session alone cannot tell two different dispatch
+// attempts on the same contextId apart. A late markFailed for the FIRST
+// attempt must not flip the row belonging to a SECOND, live attempt just
+// because both happen to share the same (empty) TaskID and the same
+// (deterministic) Session.
+func TestMarkFailedIdentityGuardCatchesRetriesWithSameOmittedTaskID(t *testing.T) {
+	root := t.TempDir()
+	agents := AgentStore{}
+	_ = agents.Add(Agent{Name: "codereview", ProjectDir: "/p/x", Enabled: true})
+	_ = SaveAgents(root, agents)
+	session := SessionNameFor("codereview", "c1")
+	ex := NewSandboxExecutor(root, &FakeSessionManager{})
+
+	// attempt2 是磁碟上活著、真的在跑的那一次派送——taskId 兩次都沒填。
+	attempt2 := A2ATask{
+		ContextID: "c1", TaskID: "", Agent: "codereview", Session: session,
+		Worktree: SandboxWorktree("/p/x", session), Branch: BranchFor(session),
+		State: TaskWorking, DispatchAttempt: "attempt-2",
+	}
+	seedTask(t, root, attempt2)
+
+	// attempt1 的失敗遲到——TaskID（都是空字串）跟 Session 都跟磁碟上這一
+	// 列一樣，但這是不同一次派送嘗試（DispatchAttempt 不同）。
+	attempt1 := A2ATask{
+		ContextID: "c1", TaskID: "", Agent: "codereview", Session: session,
+		DispatchAttempt: "attempt-1",
+	}
+	ex.markFailed(attempt1, "late failure from attempt 1", false)
+
+	tasks, _ := LoadTasks(root)
+	got, _ := tasks.ByContext("c1")
+	if got.State != TaskWorking || got.DispatchAttempt != "attempt-2" {
+		t.Fatalf("a same-TaskID(empty)/same-Session, different-attempt row must not be clobbered by a late failure from a different attempt: got %#v", got)
+	}
+}
+
 // --- Important 5：dispatch 必須跑在有界的 context 上 ---
 
 // wedgedBuildSpy 模擬一個卡死的 git worktree add / tmux 就緒等待：除非

@@ -78,8 +78,11 @@ var errContextAgentSwitch = errors.New("a2a: contextId is bound to another agent
 
 // errDispatchFailAlreadyRecorded 從派送失敗那條路的 WithTasks callback 回
 // 傳，代表磁碟上那一列已經是終態（executor 的 markFailed 已經記下更完整的
-// 身分與理由）。回傳 error 讓 WithTasks 整個放棄寫入，而不是用 handler 手上
-// 那份呼叫前的過期快照覆蓋掉它。
+// 身分與理由），或者這一列已經不是這次失敗要負責的那次派送嘗試（同一個
+// contextId 在這個 handler 呼叫 Executor.Start 之後、fallback 真正落地之前
+// 被合法重送並認領出一個新的 dispatching/working row——round 2026-08-06
+// final review, Important 1）。兩種情況都回傳 error 讓 WithTasks 整個放棄
+// 寫入，而不是用 handler 手上那份呼叫前的過期快照覆蓋掉它。
 var errDispatchFailAlreadyRecorded = errors.New("a2a: dispatch failure already recorded on the row")
 
 // MessageSendParams is the params body of the message/send method.
@@ -482,6 +485,10 @@ func (s *A2AServer) handleMessageSend(w http.ResponseWriter, r *http.Request, re
 		if hasCapacity {
 			task.State = TaskDispatching
 			task.DispatchedAt = time.Now().UTC().Format(time.RFC3339)
+			// 這一刻起這一列就是「這次派送嘗試」——見 A2ATask.DispatchAttempt
+			// 的說明,派送失敗那條回呼路徑(下面)靠它分辨磁碟上這一列是不是
+			// 還是自己要負責的那一次嘗試。
+			task.DispatchAttempt = nextDispatchAttempt()
 		}
 		tasks.Upsert(task)
 		return nil
@@ -615,16 +622,28 @@ func (s *A2AServer) handleMessageSend(w http.ResponseWriter, r *http.Request, re
 		//   - 已經是終態：executor 的 markFailed（或 sweep/operator）早就記
 		//     下了這一列的下場，而且那份紀錄帶著完整、正確的身分。完全不
 		//     動它——覆寫只會用更差的資訊取代更好的。
-		//   - 還不是終態：只可能是 Start 在 markFailed 之外的路徑失敗（例如
-		//     load agents），這時才由這裡補一筆 failed，且是疊在磁碟上那一列
-		//     之上（保留它的 Worktree/Branch/Session），不是拿舊快照覆蓋。
+		//   - 身分已經換人：這裡的 task 是這個 handler 呼叫 Executor.Start
+		//     **之前**取得的快照。它回來、走到這裡之間沒有任何鎖保護——同一
+		//     個 contextId 可能已經合法重送並被認領成一個新的
+		//     dispatching/working row（markFailed 先幫上一次嘗試定案成終
+		//     態，呼叫方看到終態合法重送，新一輪認領又剛好搶在這個舊
+		//     handler 回來之前完成）。只比對 isTerminal 抓不到這個窗口：新
+		//     row 通常還不是終態。這裡改成跟 markFailed（a2a_executor.go）
+		//     與訊息追問失敗那條路（上面 :544）同樣的做法，比對
+		//     TaskID/DispatchAttempt——不吻合就代表這一列已經是別次派送嘗
+		//     試，不可以被這次遲到的失敗覆寫（round 2026-08-06 final review,
+		//     Important 1；探針證明過會誤殺一個活著的 t2-live row）。
+		//   - 還不是終態、身分也還是這次嘗試：只可能是 Start 在 markFailed
+		//     之外的路徑失敗（例如 load agents），這時才由這裡補一筆
+		//     failed，且是疊在磁碟上那一列之上（保留它的
+		//     Worktree/Branch/Session），不是拿舊快照覆蓋。
 		if serr := WithTasks(s.Root, func(tasks *TaskStore) error {
 			cur, ok := tasks.ByContext(task.ContextID)
 			if !ok {
 				// 這一列根本還沒落地（persist 之前就失敗）：沒有任何磁碟上的
 				// 東西需要保護，照這次請求自己的身分寫一筆失敗紀錄。
 				cur = task
-			} else if isTerminal(cur.State) {
+			} else if isTerminal(cur.State) || cur.TaskID != task.TaskID || cur.DispatchAttempt != task.DispatchAttempt {
 				return errDispatchFailAlreadyRecorded
 			}
 			cur.State = TaskFailed
@@ -634,6 +653,10 @@ func (s *A2AServer) handleMessageSend(w http.ResponseWriter, r *http.Request, re
 			// 之後可以被 tasks/get 查到（taskSnapshotPayload），這裡明確標成
 			// 不安全，讓那個查詢路徑用固定字串取代，不把它原文交給遠端呼叫方。
 			cur.DetailSafe = false
+			// CompletedAt 過去這裡從沒設過：PruneTasks 的保留期判斷靠
+			// !CompletedAt.IsZero()，沒有它這一列永遠排不進終止排名、永遠不
+			// 會因為年紀被修剪（round 2026-08-06 final review, Minor 2）。
+			cur.CompletedAt = time.Now().UTC().Format(time.RFC3339)
 			tasks.Upsert(cur)
 			return nil
 		}); serr != nil && !errors.Is(serr, errDispatchFailAlreadyRecorded) {

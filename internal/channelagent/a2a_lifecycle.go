@@ -16,6 +16,11 @@ import (
 // writing tasks.json when there was nothing to change.
 var errNothingSwept = errors.New("a2a: sweep found nothing to change")
 
+// sweepTestHookAfterPendingStopRetry is a test-only synchronization point;
+// see its call site inside SweepTimeouts for what it exists to make
+// deterministic. nil in production.
+var sweepTestHookAfterPendingStopRetry func()
+
 // MaxConcurrentSandboxes caps simultaneous aa-*-<ctx> instances. Industry
 // guidance for parallel agent worktrees is 8-10; 8 is the conservative end and
 // also bounds memory, which has run tight on this host.
@@ -71,6 +76,10 @@ func DrainQueue(ctx context.Context, root string, ex TaskExecutor) (int, error) 
 			}
 			t.State = TaskDispatching
 			t.DispatchedAt = now
+			// 這一刻起這一列是「這次派送嘗試」——見 A2ATask.DispatchAttempt
+			// 的說明，跟 handleMessageSend 認領 dispatching 的同一刻做的事
+			// 完全一樣。
+			t.DispatchAttempt = nextDispatchAttempt()
 			tasks.Tasks[i] = t
 			claimed = append(claimed, t)
 			free--
@@ -1048,6 +1057,18 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 		})
 	}
 
+	// sweepTestHookAfterPendingStopRetry, if set, fires exactly once here —
+	// between the durable session-stop retry loop above and step 2's
+	// teardown pass below. Production leaves it nil (zero cost); a test uses
+	// it to hold this exact window open deterministically with a real
+	// goroutine, reproducing the narrow race where the retry loop above
+	// loses tryLockSandboxSessionForTeardown on a session but step 2 below
+	// wins it moments later in this SAME pass (round 2026-08-06 final
+	// review, Minor 5).
+	if sweepTestHookAfterPendingStopRetry != nil {
+		sweepTestHookAfterPendingStopRetry()
+	}
+
 	// --- Step 2: 鎖外。每個 session 一把鎖，鎖內才准動手，動不了就放棄。 ---
 	//
 	// stopOnly 的 session（TaskFailed 殘留、只停不拆）先處理。刻意不追蹤
@@ -1142,6 +1163,21 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 					}
 					t.Worktree = ""
 					t.Session = ""
+					// round 2026-08-06 final review, Minor 5：這個 candidate
+					// 一路走到這裡代表 removeCandidate 剛剛成功——它的
+					// session 在上面第 2 步已經被無條件停過一次（stopper.Stop
+					// + sm.Stop），不論它是否也曾經是上面「可重試 session-
+					// stop」迴圈裡、鎖忙而沒能停成功的那一列。若不在這裡一
+					// 併清掉 SessionStopPending，一旦那個迴圈恰好在同一輪搶
+					// 輸了同一把鎖（這裡先贏、把 Session 清成空字串），這一
+					// 列就會卡在 SessionStopPending==true 且 Session=="" 的
+					// 組合：那個迴圈的候選條件要求 Session != ""（沒有
+					// session 名字，重試機制再也選不到它），PruneTasks 又把
+					// SessionStopPending 當成永久豁免——兩條規則疊起來就是
+					// 一個永遠回收不了、永遠修剪不掉的 row。清掉它不會漏掉
+					// 任何還沒做的事：Session 已經清空，代表磁碟上已經沒有
+					// 東西需要再停一次。
+					t.SessionStopPending = false
 					tasks.Tasks[i] = t
 					reclaimed++
 					changed = true

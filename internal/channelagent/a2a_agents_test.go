@@ -148,3 +148,45 @@ func TestLoadAgentsSkipsAgentsSharingABindingChannel(t *testing.T) {
 		t.Fatalf("agents = %#v; an agent sharing a binding channel must be dropped", got.Agents)
 	}
 }
+
+// TestWithAgentsPreservesValidationFailingEntries pins round 2026-08-06
+// final review, Minor 4: WithAgents loaded through the filtered LoadAgents,
+// so any admin mutation entirely unrelated to a validation-failing entry
+// (bad name, or a channel_id clashing with a binding) silently dropped that
+// entry from agents.json forever the moment it saved the filtered list back
+// — a single POST /api/a2a/agents to create an unrelated agent permanently
+// erased "Bad_Name". That also defeats LoadAgentsRaw's typo exemption in
+// revokeReasonForRunningTask, which exists precisely so a malformed entry is
+// not mistaken for a deliberate removal — an exemption with nothing left to
+// exempt once WithAgents has already deleted the entry from disk.
+func TestWithAgentsPreservesValidationFailingEntries(t *testing.T) {
+	root := t.TempDir()
+	if err := AtomicWriteJSON(AgentsPath(root), map[string]any{"agents": []map[string]any{
+		{"name": "Bad_Name", "project_dir": "/p/bad", "enabled": true},
+		{"name": "good", "project_dir": "/p/good", "enabled": true},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 一次跟 Bad_Name 完全無關的 admin 操作：新增另一個 agent。
+	if err := WithAgents(root, func(agents *AgentStore) error {
+		return agents.Add(Agent{Name: "new", ProjectDir: "/p/new", Enabled: true})
+	}); err != nil {
+		t.Fatalf("WithAgents: %v", err)
+	}
+
+	raw, err := LoadAgentsRaw(root)
+	if err != nil {
+		t.Fatalf("LoadAgentsRaw: %v", err)
+	}
+	names := map[string]bool{}
+	for _, a := range raw.Agents {
+		names[a.Name] = true
+	}
+	if !names["Bad_Name"] {
+		t.Fatalf("an unrelated admin mutation must not silently delete a validation-failing entry: got %#v", raw.Agents)
+	}
+	if !names["good"] || !names["new"] {
+		t.Fatalf("both the pre-existing valid entry and the newly added one must survive: got %#v", raw.Agents)
+	}
+}

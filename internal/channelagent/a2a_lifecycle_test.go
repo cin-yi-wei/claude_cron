@@ -2289,6 +2289,92 @@ func TestSweepRetriesPendingSessionStopOnALaterPass(t *testing.T) {
 	}
 }
 
+// TestSweepClearsSessionStopPendingWhenCandidateTeardownWinsTheLock pins
+// round 2026-08-06 final review, Minor 5: the durable session-stop retry
+// loop and step 2's reclaim-candidate teardown both try
+// tryLockSandboxSessionForTeardown on the SAME session, independently,
+// within the SAME sweep pass (a TaskCanceled row with a non-empty Session
+// and Worktree is selected by both). If the retry loop loses that TryLock
+// (session busy) but the candidate loop wins it a moment later in the very
+// same pass — a real, if narrow, window — the row ends up with
+// SessionStopPending still true (the retry loop never got to clear it) AND
+// Session == "" (the candidate loop's step 3 clears it, because a stop
+// really did happen, just via the OTHER loop, unconditionally, before the
+// removal). Nothing can then ever select this row into the retry loop again
+// (it requires Session != ""), and PruneTasks refuses it forever
+// (SessionStopPending is true) — an unbounded row per occurrence.
+//
+// A background goroutine holds the session's real shared lock
+// deterministically through the retry loop's TryLock attempt (which must
+// therefore fail), then releases it — synchronized via
+// sweepTestHookAfterPendingStopRetry, which fires exactly once between the
+// retry loop and step 2 — before the candidate loop's TryLock attempt
+// (which must therefore succeed). Both attempts contend on the exact same
+// *sync.RWMutex used in production; -race covers the real concurrent
+// Lock/RLock/TryLock traffic.
+func TestSweepClearsSessionStopPendingWhenCandidateTeardownWinsTheLock(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	const session = "aa-a-c1"
+	var s TaskStore
+	s.Upsert(A2ATask{
+		ContextID: "c1", TaskID: "t1", Agent: "a", Session: session,
+		Worktree: "/p/aa-a-c1", State: TaskCanceled, SessionStopPending: true,
+		CompletedAt: now.Add(-TaskRetention - time.Hour).Format(time.RFC3339),
+	})
+	if err := SaveTasks(root, s); err != nil {
+		t.Fatalf("SaveTasks: %v", err)
+	}
+	if err := Init(SandboxRoot(root, session)); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	released := make(chan struct{})
+	go func() {
+		unlock := lockSandboxSession(session)
+		close(entered)
+		<-release
+		unlock()
+		close(released)
+	}()
+	<-entered // 鎖已經握住：retry 迴圈這一輪的 TryLock 一定失敗。
+
+	sweepTestHookAfterPendingStopRetry = func() {
+		close(release)
+		<-released // 保證鎖真的放開了，才讓 candidates 迴圈開始嘗試。
+	}
+	defer func() { sweepTestHookAfterPendingStopRetry = nil }()
+
+	fake := &FakeSessionManager{}
+	_, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now, nil)
+	if err != nil {
+		t.Fatalf("SweepTimeouts: %v", err)
+	}
+	if reclaimed != 1 {
+		t.Fatalf("reclaimed = %d, want 1", reclaimed)
+	}
+
+	got, _ := LoadTasks(root)
+	tk, _ := got.ByContext("c1")
+	if tk.SessionStopPending {
+		t.Fatal("SessionStopPending must be cleared once step 2's teardown actually stopped this exact session, even though the durable retry loop lost the lock this pass")
+	}
+	if tk.Session != "" || tk.Worktree != "" {
+		t.Fatalf("worktree/session must be cleared after a successful reclaim: got %#v", tk)
+	}
+
+	// 直接證明「永遠修剪不掉」的後果本身消失了。
+	dropped, err := PruneTasks(root, now)
+	if err != nil {
+		t.Fatalf("PruneTasks: %v", err)
+	}
+	if dropped != 1 {
+		t.Fatalf("dropped = %d, want 1 — this row must now be prunable", dropped)
+	}
+}
+
 func TestPruneTasksKeepsNewestTerminalRowsAndAllLiveOnes(t *testing.T) {
 	root := t.TempDir()
 	now := time.Now().UTC()

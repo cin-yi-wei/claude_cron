@@ -668,3 +668,77 @@ func TestSandboxExecutorContinuesWhenTrustFails(t *testing.T) {
 		t.Fatalf("session not started: %#v", fake.Started)
 	}
 }
+
+// TestBuildLockWaitFailsFastOnAnAlreadyBoundedContext pins round 2026-08-06
+// final review, Minor 6: a2a_server.go/a2a_lifecycle.go create the dispatch
+// ctx's deadline the moment a row is claimed into TaskDispatching — BEFORE
+// Start ever attempts the session's build lock (lockSandboxSessionForBuild,
+// round 14 review Important 3's fix for the terminal-then-resubmit double-
+// build race). That build lock used to be a plain, unbounded
+// sync.Mutex.Lock() that never looked at ctx at all: a dispatch queued
+// behind another build on the SAME session could burn its whole budget just
+// waiting for the lock, only discovering the ctx had already expired once
+// some LATER ctx-aware call (EnsureWorkspace) finally ran — after
+// wastefully doing LoadAgents/grant-level checks/persist under the lock
+// first. This proves the wait itself now respects ctx: a build queued
+// behind a lock that is never released within the ctx's own window must
+// fail promptly, at the wait itself, without ever calling EnsureWorkspace.
+func TestBuildLockWaitFailsFastOnAnAlreadyBoundedContext(t *testing.T) {
+	root, fake, ex := newExecutorFixture(t)
+	session := SessionNameFor("codereview", "c1")
+
+	// 模擬「同一個 session 名已經有另一個建置在跑」——round 14 review,
+	// Important 3 的 build 鎖存在的理由本身（terminal-then-resubmit）。用一
+	// 個真正的 goroutine 握住它，只在測試自己的保險絲或成功偵測到之後才放
+	// 開，絕不提前放開。
+	held := make(chan struct{})
+	release := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		unlock, lockErr := lockSandboxSessionForBuild(context.Background(), session)
+		if lockErr != nil {
+			close(held) // 不該發生；讓主測試自己的斷言去抓。
+			return
+		}
+		close(held)
+		<-release
+		unlock()
+	}()
+	<-held
+
+	task := A2ATask{
+		ContextID: "c1", Agent: "codereview", Session: session,
+		State: TaskDispatching, Level: GrantReadOnly, DispatchAttempt: "attempt-2",
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- ex.Start(ctx, task, "go") }()
+
+	select {
+	case err := <-done:
+		close(release)
+		wg.Wait()
+		if err == nil {
+			t.Fatal("expected Start to fail once its ctx expired while still waiting for the build lock")
+		}
+	case <-time.After(3 * time.Second):
+		close(release)
+		wg.Wait()
+		<-done
+		t.Fatal("測試保險絲：Start 在等 build 鎖的時候完全沒有尊重 ctx 的逾時，一直等到鎖被手動放開為止")
+	}
+
+	if len(fake.Workspaces) != 0 {
+		t.Fatalf("Start must fail during the lock wait itself, before ever calling EnsureWorkspace: %#v", fake.Workspaces)
+	}
+
+	tasks, _ := LoadTasks(root)
+	got, ok := tasks.ByContext("c1")
+	if !ok || got.State != TaskFailed {
+		t.Fatalf("a build that failed while waiting for the session lock must still leave a terminal, sweep-visible row: got %#v", got)
+	}
+}

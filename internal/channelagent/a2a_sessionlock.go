@@ -1,6 +1,10 @@
 package channelagent
 
-import "sync"
+import (
+	"context"
+	"sync"
+	"time"
+)
 
 // sandboxSessionLocks 讓「使用某個 session 名的沙盒」（建立、追問投遞）與
 // 「拆除同一個 session 名的沙盒」不可能同時進行。
@@ -108,14 +112,41 @@ func lockSandboxSession(session string) func() {
 // 秒）跑完才送得出去，既有的
 // TestFollowUpDuringInFlightDrainQueueDispatchDoesNotDoubleDispatch 會死鎖
 // ——那個「追問不等派送做完」的行為必須維持（見上面 RWMutex 的說明）。
-func lockSandboxSessionForBuild(session string) func() {
+//
+// ctx 讓「等 build 鎖」這一段本身也尊重 dispatch 的逾時預算（round
+// 2026-08-06 final review, Minor 6）：這個預算（a2aDispatchTimeout）是呼叫
+// 方在這一列取得派送權的同一刻建立的，過去卻只傳給鎖「之後」的每一個
+// ctx-aware 呼叫（EnsureWorkspace、Sessions.Start、Inject……）——底下搶
+// build 鎖本身是無界的 sync.Mutex.Lock()，完全看不到 ctx。排在同一個
+// session 名另一個建置後面的派送因此可能把整個預算燒在「等鎖」上，直到鎖
+// 真的到手、第一個 ctx-aware 呼叫才發現預算早就見底——徒然多繞一圈才失
+// 敗，還在鎖真正到手之後那一小段時間裡做了一些完全用不到的工作
+// （LoadAgents、等級檢查、persist）。改成 TryLock 輪詢 + 對 ctx.Done() 的
+// select：等待本身在 ctx 過期的那一刻就直接放棄，不多等，也不曾經真正握
+// 住鎖。這不會拉長、也不會重設這個 session 的鎖可能被佔用的總時間上限
+// ——上限仍然只受同一個、從 claim 那一刻起算的 ctx 界定，跟過去完全一
+// 樣，sweep 的 DispatchStaleAfter 假設（見 a2aDispatchTimeout 的說明）不受
+// 影響。
+func lockSandboxSessionForBuild(ctx context.Context, session string) (unlock func(), err error) {
 	l := acquireSessionLock(session)
-	l.build.Lock()
-	l.mu.RLock()
-	return func() {
-		l.mu.RUnlock()
-		l.build.Unlock()
-		releaseSessionLock(session, l)
+	const pollInterval = 5 * time.Millisecond
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+	for {
+		if l.build.TryLock() {
+			l.mu.RLock()
+			return func() {
+				l.mu.RUnlock()
+				l.build.Unlock()
+				releaseSessionLock(session, l)
+			}, nil
+		}
+		select {
+		case <-ctx.Done():
+			releaseSessionLock(session, l)
+			return nil, ctx.Err()
+		case <-ticker.C:
+		}
 	}
 }
 

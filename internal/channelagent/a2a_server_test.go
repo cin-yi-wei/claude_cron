@@ -1342,3 +1342,94 @@ func TestTasksGetShowsDrainRejectReasonVerbatim(t *testing.T) {
 		t.Fatalf("detail = %q, want the caller to read the drain-reject reason verbatim, not a generic internal-error string", detail)
 	}
 }
+
+// fallbackRaceExecutor 模擬「dispatch 失敗那條回呼路徑跑到之前，同一個
+// contextId 已經被合法重送並成功派送出另一次全新嘗試」——不需要真正的併發
+// goroutine：Start 本身就在 handleMessageSend 呼叫 Executor.Start 的那一
+// 刻，同步地把磁碟上的 row 換成一個活著、不同身分的新嘗試，再回傳錯誤，精
+// 確重現「這次失敗回呼看到的已經是別人的活 row」這個窗口——跟
+// FakeSessionManager.OnRemove 在既有 sweep 測試裡模擬拆除窗口內的重新提交
+// 是同一種手法。
+type fallbackRaceExecutor struct{ root string }
+
+func (e fallbackRaceExecutor) Start(_ context.Context, task A2ATask, _ string) error {
+	_ = WithTasks(e.root, func(tasks *TaskStore) error {
+		tasks.Upsert(A2ATask{
+			ContextID: task.ContextID, TaskID: "t2-live", Agent: task.Agent,
+			CallerID: task.CallerID, Session: task.Session,
+			Worktree: "/p/x/" + task.Session, Branch: BranchFor(task.Session),
+			State: TaskWorking, Level: task.Level, StartedAt: task.StartedAt,
+		})
+		return nil
+	})
+	return errors.New("fake dispatch failure from the first attempt")
+}
+
+// TestDispatchFailureFallbackDoesNotClobberADifferentLiveAttempt pins round
+// 2026-08-06 final review, Important 1: the dispatch-failure fallback
+// guarded only on isTerminal(cur.State), unlike the neighbouring follow-up
+// path (a2a_server.go:544) and markFailed, which both compare TaskID.
+// Reproduces the reviewer's own probe: a dispatch fails, and by the time
+// this handler's own failure fallback runs, the contextId has already been
+// legitimately reclaimed by a different, live attempt (task "t2-live",
+// State working) — the fallback must leave that row alone, not flip it to
+// failed carrying the first attempt's stale error.
+func TestDispatchFailureFallbackDoesNotClobberADifferentLiveAttempt(t *testing.T) {
+	s, root := newTestA2AServer(t)
+	s.Executor = fallbackRaceExecutor{root: root}
+
+	rec := postRPC(t, s.Handler(), "secret-1",
+		`{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"agent":"codereview","contextId":"c1","text":"go"}}`)
+	var resp RPCResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	if resp.Error == nil {
+		t.Fatalf("expected this dispatch to report failure, got %s", rec.Body.String())
+	}
+
+	tasks, _ := LoadTasks(root)
+	got, ok := tasks.ByContext("c1")
+	if !ok {
+		t.Fatal("row missing after the fallback ran")
+	}
+	if got.TaskID != "t2-live" || got.State != TaskWorking {
+		t.Fatalf("the dispatch-failure fallback clobbered a different, live attempt: got %#v", got)
+	}
+}
+
+// alwaysFailExecutor fails every dispatch without ever touching tasks.json
+// itself (unlike SandboxExecutor, whose failure paths all route through
+// markFailed) — the one shape of Start failure the fallback in
+// a2a_server.go is actually meant to handle: the row is still exactly the
+// one this same request claimed moments earlier (same TaskID, same
+// DispatchAttempt), just never transitioned past TaskDispatching.
+type alwaysFailExecutor struct{}
+
+func (alwaysFailExecutor) Start(context.Context, A2ATask, string) error {
+	return errors.New("boom")
+}
+
+// TestDispatchFailureFallbackRecordsCompletedAt pins round 2026-08-06 final
+// review, Minor 2: the same fallback block never set CompletedAt, so
+// PruneTasks' retention arm (!r.done.IsZero()) could never fire for these
+// rows — they piled up in tasks.json forever regardless of age.
+func TestDispatchFailureFallbackRecordsCompletedAt(t *testing.T) {
+	s, root := newTestA2AServer(t)
+	s.Executor = alwaysFailExecutor{}
+
+	rec := postRPC(t, s.Handler(), "secret-1",
+		`{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"agent":"codereview","contextId":"c1","text":"go"}}`)
+	var resp RPCResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	if resp.Error == nil {
+		t.Fatalf("expected dispatch failure, got %s", rec.Body.String())
+	}
+
+	tasks, _ := LoadTasks(root)
+	got, ok := tasks.ByContext("c1")
+	if !ok || got.State != TaskFailed {
+		t.Fatalf("row after dispatch failure = %#v", got)
+	}
+	if got.CompletedAt == "" {
+		t.Fatal("the dispatch-failure fallback must set CompletedAt so PruneTasks' retention arm can ever consider this row")
+	}
+}

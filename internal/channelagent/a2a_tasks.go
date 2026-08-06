@@ -2,8 +2,11 @@ package channelagent
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync/atomic"
+	"time"
 )
 
 type TaskState string
@@ -94,6 +97,27 @@ type A2ATask struct {
 	// CallbackState 追蹤完成回呼，與任務狀態機完全解耦：""（未處理）→
 	// pending → sent / failed / dropped。任務狀態永遠不看這個欄位。
 	CallbackState string `json:"callback_state,omitempty"`
+	// DispatchAttempt 是 server 端在這一列「取得派送權」（submitted →
+	// dispatching）那一刻產生、不受呼叫方控制的唯一權杖（handleMessageSend
+	// 與 DrainQueue 認領的同一刻都會蓋掉它）。存在的理由是 TaskID 與 Session
+	// 都不足以分辨「同一個 contextId 的兩次不同派送嘗試」：TaskID 是呼叫方
+	// 選填的 params.taskId,兩次都可以是空字串;Session 是 contextId 的確定
+	// 性函式,兩次派送必然相同。markFailed 與派送失敗回呼這兩條「遲到的失
+	// 敗」路徑都拿它跟自己手上的快照比對,不吻合就代表磁碟上這一列已經是
+	// 另一次派送（合法重送）出的新嘗試,不可以被覆寫（round 2026-08-06
+	// final review, Minor 3 / Important 1）。
+	DispatchAttempt string `json:"dispatch_attempt,omitempty"`
+}
+
+// dispatchAttemptSeq 是產生 DispatchAttempt 的唯一計數器，行程內單調遞增。
+var dispatchAttemptSeq uint64
+
+// nextDispatchAttempt 生成一個新的派送嘗試權杖：時間戳讓它在 tasks.json 裡
+// 讀起來有序、方便除錯，原子計數器才是真正保證唯一性的部分（不受時鐘解析
+// 度或 goroutine 交錯影響），跟 nextInjectedMessageID 的理由完全相同。
+func nextDispatchAttempt() string {
+	seq := atomic.AddUint64(&dispatchAttemptSeq, 1)
+	return fmt.Sprintf("%d-%d", time.Now().UnixNano(), seq)
 }
 
 type TaskStore struct {

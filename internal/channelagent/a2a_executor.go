@@ -138,13 +138,24 @@ func (e *SandboxExecutor) persist(task A2ATask) error {
 // 兩種情況都直接放棄寫入（回 error 讓 WithTasks 不存檔）。刻意不比對
 // State：Start 的參數是認領當下的快照，它的 State 跟磁碟上那一列本來就可能
 // 不同（submitted vs dispatching），比對它只會把正常路徑擋掉。
+//
+// 身分比對還加了 DispatchAttempt（round 2026-08-06 final review, Minor 3）：
+// 光比 TaskID + Session 看似夠了,其實不然——TaskID 是呼叫方選填的
+// params.taskId,兩次派送可以都不填、都是空字串;Session 是 contextId 的確
+// 定性函式,兩次派送必然相同。單靠這兩者,同一個 contextId 先後兩次都沒填
+// taskId 的派送嘗試會被誤判成同一個身分,一次遲到的 markFailed 就能把第二
+// 次、貨真價實還在 working 的嘗試翻成 failed。DispatchAttempt 是 server 端
+// 在每次認領 dispatching 那一刻產生、呼叫方完全碰不到的權杖,才是真正能分
+// 辨「兩次不同派送嘗試」的欄位。今天這個洞打不進來,純粹是因為
+// lockSandboxSessionForBuild 的 build 互斥鎖把同一個 session 的兩個 Start
+// 序列化了——但那是實作細節,不是型別層的保證，守衛本身必須獨立成立。
 func (e *SandboxExecutor) markFailed(task A2ATask, detail string, safe bool) {
 	_ = WithTasks(e.Root, func(tasks *TaskStore) error {
 		worktree, branch, session := task.Worktree, task.Branch, task.Session
 		t := task
 		if cur, ok := tasks.ByContext(t.ContextID); ok {
-			if cur.TaskID != task.TaskID || cur.Session != task.Session {
-				log.Printf("a2a: context %s 的 row 身分已變（現在是 task %s / session %s），不把它標成 failed", task.ContextID, cur.TaskID, cur.Session)
+			if cur.TaskID != task.TaskID || cur.Session != task.Session || cur.DispatchAttempt != task.DispatchAttempt {
+				log.Printf("a2a: context %s 的 row 身分已變（現在是 task %s / session %s / attempt %s），不把它標成 failed", task.ContextID, cur.TaskID, cur.Session, cur.DispatchAttempt)
 				return errMarkFailedTargetChanged
 			}
 			if !CanTransition(cur.State, TaskFailed) {
@@ -181,7 +192,14 @@ func (e *SandboxExecutor) Start(ctx context.Context, task A2ATask, prompt string
 	// 可以同時落在同一個 session 名上（terminal-then-resubmit 就會製造出這個
 	// 情況），兩份建置疊在一起，第二份的 WriteSandboxPolicy 還能把一個活著的
 	// readonly 沙盒改寫成 level=full。
-	unlock := lockSandboxSessionForBuild(task.Session)
+	unlock, err := lockSandboxSessionForBuild(ctx, task.Session)
+	if err != nil {
+		// ctx 在等 build 鎖的時候就已經過期：這一列從沒真正握到鎖、什麼都
+		// 沒建立過（round 2026-08-06 final review, Minor 6），跟其他早期
+		// 失敗分支一樣直接 markFailed，把槽釋放出來。
+		e.markFailed(task, "waiting for session build lock: "+err.Error(), false)
+		return err
+	}
 	defer unlock()
 
 	agents, err := LoadAgents(e.Root)

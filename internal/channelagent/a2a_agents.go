@@ -110,11 +110,26 @@ var agentsMu sync.Mutex
 
 // WithAgents 在鎖內載入 agents.json、交給 fn 修改、再存檔。fn 回傳 error 時
 // 完全不寫檔。fn 內絕不可以再呼叫 WithAgents。
+//
+// 讀的是 LoadAgentsRaw，不是 LoadAgents（round 2026-08-06 final review,
+// Minor 4）：後者會濾掉名字不合法、或 channel_id 撞到某個 binding 的 agent
+// （見 LoadAgents 的說明），但這裡是「整檔讀 → 改 → 整檔寫」的循環——用過
+// 濾後的清單當底稿，等於把過濾結果直接存檔覆蓋掉原檔,任何一次跟這些壞
+// entry 完全無關的 admin 操作（例如新增另一個 agent）都會把它們從
+// agents.json 裡永久抹掉，操作者從沒要求刪除它們。這同時也讓
+// LoadAgentsRaw 特地留給 revokeReasonForRunningTask 用的「typo 豁免」形同
+// 虛設——那個豁免的前提正是「壞掉的 entry 還留在檔案裡」，如果它已經被這
+// 裡的讀-改-寫循環悄悄刪掉，豁免就沒有東西可以豁免。fn 看到的是完整、未
+// 過濾的清單，跟過去用 LoadAgents 相比，唯一差別是壞 entry 現在也在 fn 可
+// 以 Get/Add/Remove 的範圍內——這正是讓 operator 有辦法用 API 修好或刪掉
+// 它們，而不是被過濾規則永久攔在外面、只能手改 agents.json。一般的新派
+// 送路徑（Start、DrainQueue）完全不受影響：它們繼續呼叫 LoadAgents，過濾
+// 規則對「要不要接受新派送」的效力不變。
 func WithAgents(root string, fn func(*AgentStore) error) error {
 	agentsMu.Lock()
 	defer agentsMu.Unlock()
 
-	s, err := LoadAgents(root)
+	s, err := LoadAgentsRaw(root)
 	if err != nil {
 		return err
 	}
