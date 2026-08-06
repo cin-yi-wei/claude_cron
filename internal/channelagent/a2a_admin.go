@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -68,6 +69,11 @@ type adminA2ATaskDTO struct {
 	CompletedAt   string `json:"completed_at,omitempty"`
 	CallbackState string `json:"callback_state,omitempty"`
 }
+
+// errA2AStoreUnchanged 從 WithCallers / WithAgents 的 callback 回傳，代表
+// 「什麼都沒改，不要寫檔」（最常見的是找不到那個 id）。呼叫端用自己的
+// missing 旗標分辨它與真正的存檔失敗，回對應的 HTTP 狀態。
+var errA2AStoreUnchanged = errors.New("a2a: store left unchanged")
 
 // serveA2A 處理 /api/a2a/*。rest 是 "/api/a2a/" 之後的部分。
 // cfg.A2A.Enabled == false 時一律 404：關掉 kill switch 就等於這些路由不存在。
@@ -168,19 +174,21 @@ func (h AdminHandler) createA2AAgent(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	agents, err := LoadAgents(h.Root)
-	if err != nil {
-		http.Error(w, "agent store unavailable", http.StatusInternalServerError)
-		return
-	}
-	if err := agents.Add(Agent{
-		Name: in.Name, ProjectDir: in.ProjectDir, Description: in.Description,
-		Capabilities: in.Capabilities, ChannelID: in.ChannelID, Enabled: in.Enabled,
+	// 讀 → 改 → 寫全部包在 WithAgents 的鎖內：兩個併發建立請求各自讀到同一
+	// 份快照、各自 append、後寫的整檔覆蓋前寫的，回了 201 的 agent 就這樣消
+	// 失（round 14 review, Critical 2）。
+	var addErr error
+	if err := WithAgents(h.Root, func(agents *AgentStore) error {
+		addErr = agents.Add(Agent{
+			Name: in.Name, ProjectDir: in.ProjectDir, Description: in.Description,
+			Capabilities: in.Capabilities, ChannelID: in.ChannelID, Enabled: in.Enabled,
+		})
+		return addErr
 	}); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	if err := SaveAgents(h.Root, agents); err != nil {
+		if addErr != nil {
+			http.Error(w, addErr.Error(), http.StatusBadRequest)
+			return
+		}
 		http.Error(w, "cannot save agents", http.StatusInternalServerError)
 		return
 	}
@@ -207,20 +215,21 @@ func (h AdminHandler) a2aAgentAction(w http.ResponseWriter, r *http.Request, res
 			methodNotAllowed(w)
 			return
 		}
-		agents, err := LoadAgents(h.Root)
-		if err != nil {
-			http.Error(w, "agent store unavailable", http.StatusInternalServerError)
-			return
-		}
-		a, ok2 := agents.Get(name)
-		if !ok2 {
-			http.Error(w, "unknown agent", http.StatusNotFound)
-			return
-		}
-		a.Enabled = true
-		agents.Remove(name)
-		_ = agents.Add(a)
-		if err := SaveAgents(h.Root, agents); err != nil {
+		missing := false
+		if err := WithAgents(h.Root, func(agents *AgentStore) error {
+			a, ok2 := agents.Get(name)
+			if !ok2 {
+				missing = true
+				return errA2AStoreUnchanged
+			}
+			a.Enabled = true
+			agents.Remove(name)
+			return agents.Add(a)
+		}); err != nil {
+			if missing {
+				http.Error(w, "unknown agent", http.StatusNotFound)
+				return
+			}
 			http.Error(w, "cannot save agents", http.StatusInternalServerError)
 			return
 		}
@@ -237,12 +246,18 @@ func (h AdminHandler) a2aAgentAction(w http.ResponseWriter, r *http.Request, res
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	agents, _ := LoadAgents(h.Root)
-	if !agents.Remove(rest) {
-		http.Error(w, "unknown agent", http.StatusNotFound)
-		return
-	}
-	if err := SaveAgents(h.Root, agents); err != nil {
+	missing := false
+	if err := WithAgents(h.Root, func(agents *AgentStore) error {
+		if !agents.Remove(rest) {
+			missing = true
+			return errA2AStoreUnchanged
+		}
+		return nil
+	}); err != nil {
+		if missing {
+			http.Error(w, "unknown agent", http.StatusNotFound)
+			return
+		}
 		http.Error(w, "cannot save agents", http.StatusInternalServerError)
 		return
 	}
@@ -287,16 +302,17 @@ func (h AdminHandler) registerA2ACaller(w http.ResponseWriter, r *http.Request) 
 		}
 		in.Credential = base64.RawURLEncoding.EncodeToString(buf)
 	}
-	callers, err := LoadCallers(h.Root)
-	if err != nil {
-		http.Error(w, "caller store unavailable", http.StatusInternalServerError)
-		return
-	}
-	if err := callers.Register(in.CallerID, in.Credential); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	if err := SaveCallers(h.Root, callers); err != nil {
+	// 同上：整段 read-modify-write 在 WithCallers 的鎖內完成，否則併發註冊會
+	// 互相覆寫（round 14 review, Critical 2）。
+	var regErr error
+	if err := WithCallers(h.Root, func(callers *CallerStore) error {
+		regErr = callers.Register(in.CallerID, in.Credential)
+		return regErr
+	}); err != nil {
+		if regErr != nil {
+			http.Error(w, regErr.Error(), http.StatusBadRequest)
+			return
+		}
 		http.Error(w, "cannot save callers", http.StatusInternalServerError)
 		return
 	}
@@ -329,37 +345,21 @@ func (h AdminHandler) a2aCallerAction(w http.ResponseWriter, r *http.Request, re
 	}
 	_ = json.NewDecoder(r.Body).Decode(&in)
 
-	callers, err := LoadCallers(h.Root)
-	if err != nil {
-		http.Error(w, "caller store unavailable", http.StatusInternalServerError)
-		return
-	}
+	// 參數驗證（包含 ValidateCallbackURL 的 DNS 解析——絕不可以在
+	// callersMu 之內做的慢動作）全部排在進鎖之前，鎖內只剩純記憶體的
+	// read-modify-write。
 	switch {
 	case strings.HasSuffix(rest, "/approve"):
-		id := strings.TrimSuffix(rest, "/approve")
 		if in.Level != "" && !ValidGrantLevel(GrantLevel(in.Level)) {
 			http.Error(w, "level must be readonly, develop or full", http.StatusBadRequest)
 			return
 		}
-		if !callers.Approve(id, in.Capabilities) {
-			http.Error(w, "unknown caller", http.StatusNotFound)
-			return
-		}
-		if in.Level != "" {
-			callers.SetGrantLevel(id, GrantLevel(in.Level))
-		}
 	case strings.HasSuffix(rest, "/level"):
-		id := strings.TrimSuffix(rest, "/level")
 		if !ValidGrantLevel(GrantLevel(in.Level)) {
 			http.Error(w, "level must be readonly, develop or full", http.StatusBadRequest)
 			return
 		}
-		if !callers.SetGrantLevel(id, GrantLevel(in.Level)) {
-			http.Error(w, "unknown caller", http.StatusNotFound)
-			return
-		}
 	case strings.HasSuffix(rest, "/callback"):
-		id := strings.TrimSuffix(rest, "/callback")
 		// 目的地在設定當下與觸發當下各驗一次。
 		if in.URL != "" {
 			if _, verr := ValidateCallbackURL(in.URL, defaultCallbackResolver); verr != nil {
@@ -367,15 +367,42 @@ func (h AdminHandler) a2aCallerAction(w http.ResponseWriter, r *http.Request, re
 				return
 			}
 		}
-		if !callers.SetCallback(id, in.URL, in.Token) {
-			http.Error(w, "unknown caller", http.StatusNotFound)
-			return
-		}
 	default:
 		http.NotFound(w, r)
 		return
 	}
-	if err := SaveCallers(h.Root, callers); err != nil {
+
+	missing := false
+	if err := WithCallers(h.Root, func(callers *CallerStore) error {
+		switch {
+		case strings.HasSuffix(rest, "/approve"):
+			id := strings.TrimSuffix(rest, "/approve")
+			if !callers.Approve(id, in.Capabilities) {
+				missing = true
+				return errA2AStoreUnchanged
+			}
+			if in.Level != "" {
+				callers.SetGrantLevel(id, GrantLevel(in.Level))
+			}
+		case strings.HasSuffix(rest, "/level"):
+			id := strings.TrimSuffix(rest, "/level")
+			if !callers.SetGrantLevel(id, GrantLevel(in.Level)) {
+				missing = true
+				return errA2AStoreUnchanged
+			}
+		case strings.HasSuffix(rest, "/callback"):
+			id := strings.TrimSuffix(rest, "/callback")
+			if !callers.SetCallback(id, in.URL, in.Token) {
+				missing = true
+				return errA2AStoreUnchanged
+			}
+		}
+		return nil
+	}); err != nil {
+		if missing {
+			http.Error(w, "unknown caller", http.StatusNotFound)
+			return
+		}
 		http.Error(w, "cannot save callers", http.StatusInternalServerError)
 		return
 	}

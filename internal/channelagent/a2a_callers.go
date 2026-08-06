@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 )
 
 type CallerStatus string
@@ -57,6 +58,36 @@ func LoadCallers(root string) (CallerStore, error) {
 // 0644 被 bindings.json 等共用，不能改，所以走 AtomicWriteJSONMode。
 func SaveCallers(root string, s CallerStore) error {
 	return AtomicWriteJSONMode(CallersPath(root), s, 0o600)
+}
+
+// callersMu 序列化 callers.json 的 read-modify-write，理由與 tasksMu 對
+// tasks.json 完全相同（a2a_store.go）：AtomicWriteJSONMode 擋得住寫壞的檔
+// 案，擋不住遺失更新——admin API 的核准/撤銷/改等級/設回呼各自「整檔讀 →
+// 改一個欄位 → 整檔寫」，兩個併發請求交錯時後寫的那份會把前一份整個蓋掉。
+// 最嚴重的形態是撤銷：HTTP 回 200 OK，callers.json 裡那個 caller 卻還是
+// approved，還能繼續認證（round 14 review, Critical 2）。CLI 走 admin API、
+// 不直接寫檔（cmd/claude-cron/a2a_cmd.go 的說明），所以行程內互斥就足夠。
+//
+// 鎖序與既有的兩把鎖完全不交會：這把鎖內只做 callers.json 的讀寫，絕不取
+// session 鎖、絕不巢狀呼叫 WithTasks（RevokeCaller 因此把 terminateTasks 留
+// 在 WithCallers 之外）。也不得在鎖內做慢動作（HTTP、DNS 解析、tmux、git）
+// ——ValidateCallbackURL 會解析 DNS，呼叫端必須在進鎖之前先驗完。
+var callersMu sync.Mutex
+
+// WithCallers 在鎖內載入 callers.json、交給 fn 修改、再存檔。fn 回傳 error
+// 時完全不寫檔。這把鎖不可重入：fn 內絕不可以再呼叫 WithCallers。
+func WithCallers(root string, fn func(*CallerStore) error) error {
+	callersMu.Lock()
+	defer callersMu.Unlock()
+
+	s, err := LoadCallers(root)
+	if err != nil {
+		return err
+	}
+	if err := fn(&s); err != nil {
+		return err
+	}
+	return SaveCallers(root, s)
 }
 
 func (s *CallerStore) Register(id, credential string) error {

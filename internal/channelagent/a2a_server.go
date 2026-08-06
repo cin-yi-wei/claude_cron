@@ -76,6 +76,12 @@ var errContextHijack = errors.New("a2a: contextId is owned by another caller")
 // sandboxes/，RunningCount 也數不到它，8 併發上限對它完全無效。
 var errContextAgentSwitch = errors.New("a2a: contextId is bound to another agent")
 
+// errDispatchFailAlreadyRecorded 從派送失敗那條路的 WithTasks callback 回
+// 傳，代表磁碟上那一列已經是終態（executor 的 markFailed 已經記下更完整的
+// 身分與理由）。回傳 error 讓 WithTasks 整個放棄寫入，而不是用 handler 手上
+// 那份呼叫前的過期快照覆蓋掉它。
+var errDispatchFailAlreadyRecorded = errors.New("a2a: dispatch failure already recorded on the row")
+
 // MessageSendParams is the params body of the message/send method.
 type MessageSendParams struct {
 	Agent     string `json:"agent"`
@@ -99,15 +105,39 @@ type A2AServer struct {
 	DispatchContext context.Context
 }
 
+// a2aDispatchTimeout 是單一次沙盒派送（EnsureWorkspace + Sessions.Start +
+// Inject）的上限。變數而不是常數，只為了讓測試能把窗口縮到毫秒級（比照
+// adapters.go 的 injectSubmitDelay），production 不得改寫它。
+//
+// 取值的兩個邊界：下限要蓋得住文件記載的開機時間 —— tmux 開機在
+// worktree.go 有 sessionBootDelay = 90 秒的上限，再加上一次冷的
+// `git worktree add`；上限必須小於 DispatchStaleAfter（5 分鐘），這樣一個真
+// 的卡死的建置會先被自己的 deadline 解開、由 markFailed 留下明確理由，而不
+// 是拖到 sweep 的「派送中崩潰」猜測路徑才被處理。
+//
+// 為什麼非有界不可：dispatch 過去跑在 context.Background() 上，
+// `git worktree add` 與 tmux 就緒等待因此完全沒有上限（兩者都經
+// adapters.go 的 runExternalCommand → exec.CommandContext，逾時與否完全取決
+// 於傳進來的 ctx）。SandboxExecutor.Start 整段建置持有該 session 的共享鎖，
+// 於是一個卡死的建置會永遠握著它，sweep 第 2 步的 TryLock 永遠拿不到 ——
+// 那個沙盒的 worktree / sandbox root 就永遠回收不了。
+var a2aDispatchTimeout = 4 * time.Minute
+
 // dispatchCtx returns the context used for the (slow, detached) sandbox
 // dispatch, as opposed to r.Context(), which the rest of handleRPC keeps
 // using since parsing/auth/store access genuinely should abort if the
-// caller goes away.
-func (s *A2AServer) dispatchCtx() context.Context {
-	if s.DispatchContext != nil {
-		return s.DispatchContext
+// caller goes away. 回傳的 cancel 必須在派送結束後呼叫（釋放 timer）。
+//
+// 逾時觸發時，卡在 exec 裡的 git/tmux 呼叫會拿到 ctx.Err()，Start 一路把它
+// 當成一般的派送失敗處理：markFailed 寫下理由與完整身分、Start 回傳 error、
+// defer 的 unlock 放開這個 session 的 build/共享鎖。於是那一列變成一個
+// sweep 之後處理得了的終態 row，而不是一個永遠握著鎖、永遠回收不了的沙盒。
+func (s *A2AServer) dispatchCtx() (context.Context, context.CancelFunc) {
+	parent := s.DispatchContext
+	if parent == nil {
+		parent = context.Background()
 	}
-	return context.Background()
+	return context.WithTimeout(parent, a2aDispatchTimeout)
 }
 
 func (s *A2AServer) Handler() http.Handler {
@@ -495,7 +525,10 @@ func (s *A2AServer) handleMessageSend(w http.ResponseWriter, r *http.Request, re
 		// task.State — that lifecycle belongs entirely to whichever call is
 		// actually running this row's dispatch.
 		if fd, ok := s.Executor.(FollowUpDeliverer); ok {
-			if derr := fd.DeliverFollowUp(s.dispatchCtx(), followUpTask, p.Text); derr != nil {
+			dctx, cancel := s.dispatchCtx()
+			derr := fd.DeliverFollowUp(dctx, followUpTask, p.Text)
+			cancel()
+			if derr != nil {
 				// 交付失敗不能讓任務狀態退回、也不能觸發重新派送 —— 沙盒本身
 				// 還活著,只是這一句沒送到,跟「派送失敗」是完全不同性質的
 				// 錯誤(那套邏輯的前提是沙盒根本沒起來)。只記 log,讓呼叫方
@@ -541,24 +574,52 @@ func (s *A2AServer) handleMessageSend(w http.ResponseWriter, r *http.Request, re
 		return
 	}
 
-	if err := s.Executor.Start(s.dispatchCtx(), task, p.Text); err != nil {
+	dctx, cancelDispatch := s.dispatchCtx()
+	err = s.Executor.Start(dctx, task, p.Text)
+	cancelDispatch()
+	if err != nil {
 		// Never echo the underlying error to an internet-facing caller: once
 		// the real executor lands, this detail will carry worktree paths, git
 		// output and tmux state — exactly the private project information
 		// this design exists to keep off the wire. Log it server-side instead,
 		// and mark the task failed so it stops occupying capacity forever.
 		log.Printf("a2a: dispatch failed for task %s (agent=%s contextId=%s): %v", task.TaskID, task.Agent, task.ContextID, err)
-		task.State = TaskFailed
-		task.Detail = err.Error()
-		// DetailSafe=false：err 是 Executor.Start 的回傳值，跟上面註解說的
-		// 一樣可能夾帶 worktree 路徑、git 輸出、tmux 狀態。這一列的 Detail
-		// 之後可以被 tasks/get 查到（taskSnapshotPayload），這裡明確標成
-		// 不安全，讓那個查詢路徑用固定字串取代，不把它原文交給遠端呼叫方。
-		task.DetailSafe = false
+		// task 是這個 handler 在呼叫 Executor.Start **之前**取得的快照：
+		// Worktree/Branch 都還是空的（handleRPC 只填得出 Session，它是
+		// contextId 的確定性函式）。executor 在建立過程中已經把真正落到磁碟
+		// 上的 Worktree/Branch persist 進這一列了，失敗時 markFailed 也把它
+		// 們保住。把這份過期快照整列 Upsert 回去，等於用空字串蓋掉那些欄位
+		// ——一個活著的 tmux session、它的 worktree、sandbox root 與政策檔就
+		// 再也沒有任何 row 指向它們：SweepTimeouts 的候選清單完全靠掃
+		// tasks.Tasks 的 Worktree/Session 產生，回收不了、也不計入併發上限
+		// （round 14 review, Critical 1）。
+		//
+		// 所以這裡在鎖內重讀那一列再決定：
+		//   - 已經是終態：executor 的 markFailed（或 sweep/operator）早就記
+		//     下了這一列的下場，而且那份紀錄帶著完整、正確的身分。完全不
+		//     動它——覆寫只會用更差的資訊取代更好的。
+		//   - 還不是終態：只可能是 Start 在 markFailed 之外的路徑失敗（例如
+		//     load agents），這時才由這裡補一筆 failed，且是疊在磁碟上那一列
+		//     之上（保留它的 Worktree/Branch/Session），不是拿舊快照覆蓋。
 		if serr := WithTasks(s.Root, func(tasks *TaskStore) error {
-			tasks.Upsert(task)
+			cur, ok := tasks.ByContext(task.ContextID)
+			if !ok {
+				// 這一列根本還沒落地（persist 之前就失敗）：沒有任何磁碟上的
+				// 東西需要保護，照這次請求自己的身分寫一筆失敗紀錄。
+				cur = task
+			} else if isTerminal(cur.State) {
+				return errDispatchFailAlreadyRecorded
+			}
+			cur.State = TaskFailed
+			cur.Detail = err.Error()
+			// DetailSafe=false：err 是 Executor.Start 的回傳值，跟上面註解說的
+			// 一樣可能夾帶 worktree 路徑、git 輸出、tmux 狀態。這一列的 Detail
+			// 之後可以被 tasks/get 查到（taskSnapshotPayload），這裡明確標成
+			// 不安全，讓那個查詢路徑用固定字串取代，不把它原文交給遠端呼叫方。
+			cur.DetailSafe = false
+			tasks.Upsert(cur)
 			return nil
-		}); serr != nil {
+		}); serr != nil && !errors.Is(serr, errDispatchFailAlreadyRecorded) {
 			log.Printf("a2a: failed to persist failed task state for %s/%s: %v", task.Agent, task.ContextID, serr)
 		}
 		// This branch mutates task state (TaskFailed) and must not do so without

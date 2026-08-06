@@ -34,9 +34,22 @@ import "sync"
 // 鎖序（違反即死鎖）：lockSandboxSession 系列 → tasksMu。
 // SandboxExecutor.Start、SandboxExecutor.DeliverFollowUp 與 sweep 第 2 步都
 // 照這個順序；WithTasks 的 callback 內永遠不得取得 session 鎖。
+//
+// build 是第三個角色（round 14 review, Important 3）：共享鎖擋得住「使用 vs
+// 拆除」，卻擋不住「兩個建置同時落在同一個 session 名上」——兩個 Start 都拿
+// 得到 RLock，於是兩份 EnsureWorkspace、兩次 WriteSandboxPolicy（第二次能把
+// 一個活著的 readonly 沙盒的政策檔改寫成 level=full）、兩次 Inject 全部疊在
+// 一起。build 這把互斥鎖只有 Start 會拿，所以 DeliverFollowUp 仍然可以在一
+// 個還在建置中的 session 上投遞追問（既有的
+// TestFollowUpDuringInFlightDrainQueueDispatchDoesNotDoubleDispatch 釘住的
+// 行為不變）。
+//
+// 鎖序（違反即死鎖）：build → 共享/互斥的 mu → tasksMu。拆除路徑只碰 mu，
+// 不碰 build，所以不存在互相等待的環。
 type sessionLock struct {
-	mu   sync.RWMutex
-	refs int
+	mu    sync.RWMutex
+	build sync.Mutex
+	refs  int
 }
 
 var sandboxSessionLocks = struct {
@@ -81,6 +94,27 @@ func lockSandboxSession(session string) func() {
 	l.mu.RLock()
 	return func() {
 		l.mu.RUnlock()
+		releaseSessionLock(session, l)
+	}
+}
+
+// lockSandboxSessionForBuild 是 SandboxExecutor.Start 專用的取鎖方式：先取
+// 這個 session 名的 build 互斥鎖（同一時間只准一個建置），再取共享鎖（讓拆
+// 除路徑照舊被擋住、讓 DeliverFollowUp 照舊可以並存）。順序固定 build → mu，
+// 全程不得反向；拆除路徑只用 TryLock 取 mu、從不碰 build，所以兩者之間沒有
+// 互相等待的環。
+//
+// 為什麼不是把 Start 改成拿互斥的 mu：那會讓追問被迫等整個建置（最長 90
+// 秒）跑完才送得出去，既有的
+// TestFollowUpDuringInFlightDrainQueueDispatchDoesNotDoubleDispatch 會死鎖
+// ——那個「追問不等派送做完」的行為必須維持（見上面 RWMutex 的說明）。
+func lockSandboxSessionForBuild(session string) func() {
+	l := acquireSessionLock(session)
+	l.build.Lock()
+	l.mu.RLock()
+	return func() {
+		l.mu.RUnlock()
+		l.build.Unlock()
 		releaseSessionLock(session, l)
 	}
 }

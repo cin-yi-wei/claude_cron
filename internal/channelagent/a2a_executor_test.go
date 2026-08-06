@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func newExecutorFixture(t *testing.T) (string, *FakeSessionManager, *SandboxExecutor) {
@@ -353,12 +354,16 @@ func (c *cancelDuringInject) Inject(ctx context.Context, root string, msg Source
 	return nil
 }
 
-// TestSandboxExecutorTearsDownSessionWhenTaskCanceledDuringStart pins the
-// chosen resolution for round-2 finding 2: when the row is found terminal
-// after the session is already up, Start must stop that session (no
-// orphan) and report success (never an error a2a_server.go would clobber
-// the terminal row with), leaving the canceled row exactly as it was.
-func TestSandboxExecutorTearsDownSessionWhenTaskCanceledDuringStart(t *testing.T) {
+// TestSandboxExecutorDefersOrphanSessionStopToTheGuardedSweepPath 釘住
+// round-2 finding 2 的最終解法（round 14, Important 4 修正）：session 已經起
+// 來之後才發現 row 是終態時，Start 仍然要回報成功（絕不能回一個
+// a2a_server.go 會拿來覆寫終態 row 的 error），但**不可以自己去停那個
+// session** —— 共享鎖底下、沒有身分重新核對的 Sessions.Stop 是第二條破壞性
+// 路徑：同一個 contextId 的合法重送會在這個窗口內用同一個確定性名字重建
+// session，這裡的 Stop 就會把剛建好的那個殺掉。改成打上 SessionStopPending
+// 耐久標記，交給 sweep 那條唯一的、有 TryLock + 身分重確認的拆除路徑處理
+// （跟 terminateTasks 之前被改成的做法一致）。
+func TestSandboxExecutorDefersOrphanSessionStopToTheGuardedSweepPath(t *testing.T) {
 	root := t.TempDir()
 	agents := AgentStore{}
 	_ = agents.Add(Agent{Name: "codereview", ProjectDir: "/p/x", Enabled: true})
@@ -375,8 +380,8 @@ func TestSandboxExecutorTearsDownSessionWhenTaskCanceledDuringStart(t *testing.T
 		t.Fatalf("Start should report success (row already terminal) rather than an error a2a_server.go would clobber, got: %v", err)
 	}
 
-	if len(spy.Stopped) != 1 || spy.Stopped[0] != session {
-		t.Fatalf("orphaned session must be stopped, got Stopped=%#v", spy.Stopped)
+	if len(spy.Stopped) != 0 {
+		t.Fatalf("Start 不可以自己停 session（第二條破壞性路徑），got Stopped=%#v", spy.Stopped)
 	}
 
 	tasks, _ := LoadTasks(root)
@@ -386,6 +391,23 @@ func TestSandboxExecutorTearsDownSessionWhenTaskCanceledDuringStart(t *testing.T
 	}
 	if got.State != TaskCanceled || got.Detail != "canceled mid-start" {
 		t.Fatalf("canceled row must be left exactly as it was, got %#v", got)
+	}
+	if !got.SessionStopPending {
+		t.Fatalf("孤兒 session 必須標成 SessionStopPending 交給 sweep 停，got %#v", got)
+	}
+
+	// 唯一那條有守衛的拆除路徑接手：這一輪 sweep 就會真的停掉它。
+	if _, _, err := SweepTimeouts(context.Background(), root, spy, time.Now(), nil); err != nil {
+		t.Fatalf("SweepTimeouts: %v", err)
+	}
+	found := false
+	for _, s := range spy.Stopped {
+		if s == session {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("sweep 必須停掉這個孤兒 session，Stopped=%#v", spy.Stopped)
 	}
 }
 

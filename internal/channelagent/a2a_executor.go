@@ -76,6 +76,11 @@ func isTerminal(s TaskState) bool {
 // would clobber the true terminal state this guard exists to protect.
 var errTaskAlreadyTerminal = errors.New("task already reached a terminal state")
 
+// errMarkFailedTargetChanged 從 markFailed 的 WithTasks callback 回傳，代表
+// 磁碟上那一列已經不是這次失敗該負責的那一列（身分被重送換掉，或已經有別
+// 的路徑定案了終態）。回傳 error 讓 WithTasks 整個放棄寫入。
+var errMarkFailedTargetChanged = errors.New("a2a: markFailed target changed identity or is already terminal")
+
 // persist writes task into the store, preserving whatever other tasks are
 // already there. It refuses to overwrite an already-terminal row: without
 // this guard, a call racing behind an external cancel/complete/fail would
@@ -120,11 +125,32 @@ func (e *SandboxExecutor) persist(task A2ATask) error {
 // safe 標記 detail 是否可以原文回給 tasks/get 的遠端呼叫方——見
 // A2ATask.DetailSafe 的說明。呼叫方必須在每個呼叫點明確決定，不給預設值，
 // 逼著新增的失敗分支也要做這個判斷，而不是靜默繼承上一個呼叫點的答案。
+//
+// 身分與終態守衛（round 14 review, Important 3）：這個函式過去對磁碟上那一
+// 列什麼都不查就整列翻成 failed。兩種情況因此會壞事——
+//   - 身分已經換人：同一個 contextId 被合法重送（Upsert 以 contextId 為
+//     key，新的 TaskID 就地覆寫舊列），一次遲到的失敗會把那個活著的新任務
+//     標成 failed，而它的沙盒還在跑。
+//   - 已經是終態：operator 取消、sweep 判定、或 CollectResults 收下的完成，
+//     都是別人已經定案的下場，不可以被回頭覆寫（persist 早就有這條規則，
+//     markFailed 卻沒有）。
+//
+// 兩種情況都直接放棄寫入（回 error 讓 WithTasks 不存檔）。刻意不比對
+// State：Start 的參數是認領當下的快照，它的 State 跟磁碟上那一列本來就可能
+// 不同（submitted vs dispatching），比對它只會把正常路徑擋掉。
 func (e *SandboxExecutor) markFailed(task A2ATask, detail string, safe bool) {
 	_ = WithTasks(e.Root, func(tasks *TaskStore) error {
 		worktree, branch, session := task.Worktree, task.Branch, task.Session
 		t := task
 		if cur, ok := tasks.ByContext(t.ContextID); ok {
+			if cur.TaskID != task.TaskID || cur.Session != task.Session {
+				log.Printf("a2a: context %s 的 row 身分已變（現在是 task %s / session %s），不把它標成 failed", task.ContextID, cur.TaskID, cur.Session)
+				return errMarkFailedTargetChanged
+			}
+			if !CanTransition(cur.State, TaskFailed) {
+				log.Printf("a2a: context %s 已經是終態 %s，不覆寫它的下場", task.ContextID, cur.State)
+				return errMarkFailedTargetChanged
+			}
 			t = cur
 		}
 		if worktree != "" {
@@ -147,10 +173,15 @@ func (e *SandboxExecutor) markFailed(task A2ATask, detail string, safe bool) {
 
 func (e *SandboxExecutor) Start(ctx context.Context, task A2ATask, prompt string) error {
 	// 整段建立過程持有 session 鎖，於是 sweep 不可能在中途把同名 session 的
-	// worktree / sandbox root 拆掉（task 7, D3）。鎖序：session 鎖 →
+	// worktree / sandbox root 拆掉（task 7, D3）。鎖序：build → session 鎖 →
 	// tasksMu（下面的 persist / WithTasks），全程不得反向 —— WithTasks 的
 	// callback 內永遠不得取得 session 鎖。
-	unlock := lockSandboxSession(task.Session)
+	//
+	// build 這一層是 round 14 review 的 Important 3：光靠共享鎖，兩個 Start
+	// 可以同時落在同一個 session 名上（terminal-then-resubmit 就會製造出這個
+	// 情況），兩份建置疊在一起，第二份的 WriteSandboxPolicy 還能把一個活著的
+	// readonly 沙盒改寫成 level=full。
+	unlock := lockSandboxSessionForBuild(task.Session)
 	defer unlock()
 
 	agents, err := LoadAgents(e.Root)
@@ -279,24 +310,32 @@ func (e *SandboxExecutor) Start(ctx context.Context, task A2ATask, prompt string
 	// distinctly (task-8 review round 2, finding 2).
 	// The store load, terminal/transition checks and the TaskWorking upsert
 	// all happen inside one WithTasks call so a concurrent cancel/complete
-	// can never land between the check and the write. Sessions.Stop is kept
-	// OUTSIDE the callback: it shells out to tmux, and nothing that touches a
-	// session or process may run while tasksMu is held.
-	var (
-		stopOrphan  bool
-		orphanState TaskState
-	)
+	// can never land between the check and the write. 這裡不呼叫任何會碰到
+	// session 或行程的東西：tasksMu 持有期間絕不 shell out。
 	err = WithTasks(e.Root, func(tasks *TaskStore) error {
 		cur, ok := tasks.ByContext(task.ContextID)
 		if ok && isTerminal(cur.State) {
 			// The task reached a terminal state (most likely canceled) while
 			// its session was starting: EnsureWorkspace/Start/Inject already
 			// succeeded, so a real tmux session is now running that this
-			// terminal row does not reference. Leave the terminal row exactly
-			// as it is; the actual teardown happens after this call returns.
-			stopOrphan = true
-			orphanState = cur.State
-			return nil
+			// terminal row does not reference.
+			//
+			// round 14 review, Important 4：這裡過去直接呼叫 Sessions.Stop
+			// ——共享鎖底下、沒有身分重新核對的第二條破壞性路徑。同一個
+			// contextId 的合法重送會在這個窗口內用同一個確定性名字重建
+			// session，那個 Stop 就會把剛建好的活 session 殺掉，留下一列還在
+			// working、session 卻已死的紀錄，卡到 2 小時硬逾時。改成只打上
+			// SessionStopPending 耐久標記（跟存活/撤銷偵測、terminateTasks
+			// 完全同一套做法），真正的停止交給 sweep 那條唯一的、有 TryLock
+			// + 身分重確認的拆除路徑；只要標記還在，每一輪 sweep 都會重試。
+			// 除了這個標記之外，終態那一列的任何欄位都不動。
+			log.Printf("a2a: task %s 在建置途中變成終態 %s；把它的孤兒 session %s 交給 sweep 停止", task.ContextID, cur.State, task.Session)
+			if cur.Session != "" && !cur.SessionStopPending {
+				cur.SessionStopPending = true
+				tasks.Upsert(cur)
+				return nil
+			}
+			return errNothingSwept // 沒有東西要改，不必寫檔
 		}
 		if ok && !CanTransition(cur.State, TaskWorking) {
 			log.Printf("a2a: session %s is running but task %s is in state %s (not submitted); leaving its state alone", task.Session, task.ContextID, cur.State)
@@ -327,20 +366,14 @@ func (e *SandboxExecutor) Start(ctx context.Context, task A2ATask, prompt string
 		tasks.Upsert(task)
 		return nil
 	})
-	if err != nil {
+	// errNothingSwept 是「這一列不需要任何寫入」的內部訊號（終態且標記已經
+	// 在了），不是失敗，不該印成記錄狀態失敗。
+	if err != nil && !errors.Is(err, errNothingSwept) {
 		// Transient I/O error (on load or on save): the session really is
 		// running and we simply couldn't persist TaskWorking. Log and leave
 		// the row for the normal lifecycle to reconcile rather than
 		// fabricate a failure that contradicts the sandbox's actual state.
 		log.Printf("a2a: session %s is running but recording its state failed: %v", task.Session, err)
-		return nil
-	}
-	if stopOrphan {
-		// The work in flight is correctly discarded, since the task was
-		// already decided elsewhere.
-		if serr := e.Sessions.Stop(ctx, task.Session); serr != nil {
-			log.Printf("a2a: task %s reached terminal state %s during start; stopping its orphaned session %s failed: %v", task.ContextID, orphanState, task.Session, serr)
-		}
 	}
 	return nil
 }

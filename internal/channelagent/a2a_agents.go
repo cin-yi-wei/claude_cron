@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sync"
 )
 
 // Agent is an A2A-exposed identity: aa-<Name>. Unlike a Binding it has no
@@ -94,6 +95,33 @@ func LoadAgentsRaw(root string) (AgentStore, error) {
 
 func SaveAgents(root string, s AgentStore) error {
 	return AtomicWriteJSON(AgentsPath(root), s)
+}
+
+// agentsMu 是 agents.json 的對稱防護，理由與 callersMu / tasksMu 相同：
+// admin API 的建立/停用/啟用/刪除都是「整檔讀 → 改 → 整檔寫」，沒有序列化
+// 時併發請求會互相覆寫，30 個回了 201 的 agent 只剩下幾個真的留在檔案裡
+// （round 14 review, Critical 2）。
+//
+// 同樣不可重入、鎖內不得有慢動作，也絕不與 session 鎖或 tasksMu 巢狀
+// （DisableAgent 因此把 terminateTasks 留在 WithAgents 之外）。載入刻意沿用
+// LoadAgents（含既有的名稱／channel_id 驗證過濾），維持 admin 路徑原本的
+// 行為不變。
+var agentsMu sync.Mutex
+
+// WithAgents 在鎖內載入 agents.json、交給 fn 修改、再存檔。fn 回傳 error 時
+// 完全不寫檔。fn 內絕不可以再呼叫 WithAgents。
+func WithAgents(root string, fn func(*AgentStore) error) error {
+	agentsMu.Lock()
+	defer agentsMu.Unlock()
+
+	s, err := LoadAgents(root)
+	if err != nil {
+		return err
+	}
+	if err := fn(&s); err != nil {
+		return err
+	}
+	return SaveAgents(root, s)
 }
 
 func (s *AgentStore) Get(name string) (Agent, bool) {

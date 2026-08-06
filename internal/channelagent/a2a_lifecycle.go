@@ -103,7 +103,15 @@ func DrainQueue(ctx context.Context, root string, ex TaskExecutor) (int, error) 
 			failDrainedTask(root, t, reason, reasonSafe)
 			continue
 		}
-		if err := ex.Start(ctx, t, t.Prompt); err != nil {
+		// 與 handleRPC 的派送同一個理由（round 14 review, Important 5）：
+		// 建置必須跑在有界的 context 上。DrainQueue 拿到的是整個 cycle 的
+		// ctx，只有 serve 關機時才會取消——一個卡死的 git worktree add 或
+		// tmux 就緒等待會永遠握著那個 session 的鎖，sweep 的 TryLock 永遠拿
+		// 不到，那個沙盒就永遠回收不了。
+		dctx, cancel := context.WithTimeout(ctx, a2aDispatchTimeout)
+		err := ex.Start(dctx, t, t.Prompt)
+		cancel()
+		if err != nil {
 			continue // executor 已經把失敗記在 row 上了
 		}
 		started++
@@ -1316,14 +1324,21 @@ func terminateTasks(ctx context.Context, root string, match func(A2ATask) bool, 
 
 // RevokeCaller 撤銷一個呼叫方，並讓撤銷對已排隊與執行中的工作生效。
 func RevokeCaller(ctx context.Context, root, id string, sm SessionManager, stopper SandboxStopper) (int, error) {
-	callers, err := LoadCallers(root)
-	if err != nil {
-		return 0, err
-	}
-	if !callers.Revoke(id) {
-		return 0, fmt.Errorf("unknown caller %q", id)
-	}
-	if err := SaveCallers(root, callers); err != nil {
+	// 撤銷這個狀態轉換必須在 callersMu 之內完成，否則一個併發的
+	// approve/level/callback 請求會用它自己的舊快照整檔覆寫回去——撤銷回
+	// 200 OK，caller 卻還是 approved（round 14 review, Critical 2）。
+	// terminateTasks 刻意留在鎖外：它會取 tasksMu，兩把鎖絕不巢狀。
+	unknown := false
+	if err := WithCallers(root, func(callers *CallerStore) error {
+		if !callers.Revoke(id) {
+			unknown = true
+			return errA2AStoreUnchanged
+		}
+		return nil
+	}); err != nil {
+		if unknown {
+			return 0, fmt.Errorf("unknown caller %q", id)
+		}
 		return 0, err
 	}
 	n, err := terminateTasks(ctx, root, func(t A2ATask) bool { return t.CallerID == id }, "caller revoked", sm, stopper)
@@ -1338,20 +1353,22 @@ func RevokeCaller(ctx context.Context, root, id string, sm SessionManager, stopp
 
 // DisableAgent 停用一個 agent，語意與 RevokeCaller 相同。
 func DisableAgent(ctx context.Context, root, name string, sm SessionManager, stopper SandboxStopper) (int, error) {
-	agents, err := LoadAgents(root)
-	if err != nil {
-		return 0, err
-	}
-	a, ok := agents.Get(name)
-	if !ok {
-		return 0, fmt.Errorf("unknown agent %q", name)
-	}
-	a.Enabled = false
-	agents.Remove(name)
-	if err := agents.Add(a); err != nil {
-		return 0, err
-	}
-	if err := SaveAgents(root, agents); err != nil {
+	// 與 RevokeCaller 同一個道理：停用這個狀態轉換在 agentsMu 之內完成，
+	// terminateTasks（會取 tasksMu）留在鎖外。
+	unknown := false
+	if err := WithAgents(root, func(agents *AgentStore) error {
+		a, ok := agents.Get(name)
+		if !ok {
+			unknown = true
+			return errA2AStoreUnchanged
+		}
+		a.Enabled = false
+		agents.Remove(name)
+		return agents.Add(a)
+	}); err != nil {
+		if unknown {
+			return 0, fmt.Errorf("unknown agent %q", name)
+		}
 		return 0, err
 	}
 	n, err := terminateTasks(ctx, root, func(t A2ATask) bool { return t.Agent == name }, "agent disabled", sm, stopper)
