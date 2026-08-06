@@ -97,7 +97,18 @@ func SaveTasks(root string, s TaskStore) error {
 	return AtomicWriteJSON(TasksPath(root), s)
 }
 
+const (
+	// maxPromptBytes / maxDetailBytes 在寫入時截斷。Prompt 是呼叫方原文，
+	// Detail 是沙盒自撰文字 —— 兩者都不受任何上限約束，而每次 WithTasks 是
+	// 整檔讀+整檔寫，cycle 每 10 秒至少碰一次。
+	maxPromptBytes = 8 << 10
+	maxDetailBytes = 64 << 10
+)
+
+// Upsert 是所有寫入的單一咽喉，截斷放在這裡就不會有漏網的路徑。
 func (s *TaskStore) Upsert(t A2ATask) {
+	t.Prompt = truncateBytes(t.Prompt, maxPromptBytes)
+	t.Detail = truncateBytes(t.Detail, maxDetailBytes)
 	for i := range s.Tasks {
 		if s.Tasks[i].ContextID == t.ContextID {
 			s.Tasks[i] = t

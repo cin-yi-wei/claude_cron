@@ -602,18 +602,10 @@ func GateLogPath(root string) string { return filepath.Join(root, "a2a-gate.json
 // 的獨立行程，沒有共用鎖可用；Linux 上 < 4KB 的 append 是原子的，所以多個並發
 // gate 行程不會互相截斷。0600：這份 log 含 caller id 與指令內容。
 func AppendGateLog(root string, e GateLogEntry) error {
-	if err := os.MkdirAll(root, 0o755); err != nil {
-		return err
-	}
-	f, err := os.OpenFile(GateLogPath(root), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
 	blob, err := json.Marshal(e)
 	if err != nil {
 		return err
 	}
-	_, err = f.Write(append(blob, '\n'))
-	return err
+	// 與 a2a-audit.jsonl 共用同一套 rotation 規則。
+	return appendRotatingLine(GateLogPath(root), append(blob, '\n'), 0o600)
 }

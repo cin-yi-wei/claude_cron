@@ -332,6 +332,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 						fmt.Fprintf(stdout, "a2a drain: %v\n", err)
 					}
 					agent.EnsureSandboxDrivers(supCtx, *root, driver)
+					if _, err := agent.PruneTasks(*root, time.Now()); err != nil {
+						fmt.Fprintf(stdout, "a2a prune: %v\n", err)
+					}
 				}
 			}()
 		}

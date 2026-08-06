@@ -2169,3 +2169,108 @@ func TestSweepRetriesPendingSessionStopOnALaterPass(t *testing.T) {
 		t.Fatal("SessionStopPending must be cleared once the stop actually succeeds")
 	}
 }
+
+func TestPruneTasksKeepsNewestTerminalRowsAndAllLiveOnes(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	var s TaskStore
+	for i := 0; i < MaxTaskRows+50; i++ {
+		s.Upsert(A2ATask{
+			ContextID:   fmt.Sprintf("done%03d", i),
+			State:       TaskCompleted,
+			CompletedAt: now.Add(-time.Duration(i) * time.Minute).Format(time.RFC3339),
+		})
+	}
+	// 超過保留期的一列，即使在前 500 名內也要丟。
+	s.Upsert(A2ATask{
+		ContextID: "ancient", State: TaskCompleted,
+		CompletedAt: now.Add(-TaskRetention - time.Hour).Format(time.RFC3339),
+	})
+	// 非終止的 row 永不丟棄。
+	s.Upsert(A2ATask{ContextID: "live", State: TaskWorking, StartedAt: now.Format(time.RFC3339)})
+	_ = SaveTasks(root, s)
+
+	if _, err := PruneTasks(root, now); err != nil {
+		t.Fatalf("PruneTasks: %v", err)
+	}
+	got, _ := LoadTasks(root)
+	terminal := 0
+	for _, t2 := range got.Tasks {
+		if t2.State == TaskCompleted {
+			terminal++
+		}
+	}
+	if terminal > MaxTaskRows {
+		t.Fatalf("kept %d terminal rows, cap is %d", terminal, MaxTaskRows)
+	}
+	if _, ok := got.ByContext("ancient"); ok {
+		t.Fatal("a row past TaskRetention must be dropped")
+	}
+	if _, ok := got.ByContext("live"); !ok {
+		t.Fatal("a non-terminal row must never be dropped")
+	}
+	if _, ok := got.ByContext("done000"); !ok {
+		t.Fatal("the newest terminal row must be kept")
+	}
+}
+
+func TestUpsertTruncatesPromptAndDetail(t *testing.T) {
+	var s TaskStore
+	s.Upsert(A2ATask{
+		ContextID: "c1",
+		Prompt:    strings.Repeat("p", 3*maxPromptBytes),
+		Detail:    strings.Repeat("d", 3*maxDetailBytes),
+	})
+	got := s.Tasks[0]
+	if len(got.Prompt) > maxPromptBytes+16 {
+		t.Fatalf("prompt kept %d bytes", len(got.Prompt))
+	}
+	if len(got.Detail) > maxDetailBytes+16 {
+		t.Fatalf("detail kept %d bytes", len(got.Detail))
+	}
+}
+
+// PruneTasks 的刪除資格：終止狀態、且 Worktree/Session 都已被 SweepTimeouts
+// 回收乾淨、且 SessionStopPending 不再是 true。任何一項不成立都代表磁碟或
+// tmux 上還有東西只能靠這一列的存在才找得到 —— 刪掉它就是製造一個永遠找不
+// 到主人的孤兒 worktree/session。這裡直接證明：一列即使排名遠遠超過
+// MaxTaskRows、且早就過了 TaskRetention，只要它的 Worktree/Session 還沒被
+// 回收，PruneTasks 也絕不刪它。
+func TestPruneTasksNeverDropsARowWithAnUnreclaimedSandbox(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	var s TaskStore
+	for i := 0; i < MaxTaskRows+50; i++ {
+		s.Upsert(A2ATask{
+			ContextID:   fmt.Sprintf("done%03d", i),
+			State:       TaskCompleted,
+			CompletedAt: now.Add(-time.Duration(i+1) * time.Minute).Format(time.RFC3339),
+		})
+	}
+	s.Upsert(A2ATask{
+		ContextID:   "unreclaimed",
+		State:       TaskCompleted,
+		CompletedAt: now.Add(-TaskRetention - time.Hour).Format(time.RFC3339),
+		Worktree:    "/some/worktree/aa-codereview-unreclaimed",
+		Session:     "aa-codereview-unreclaimed",
+	})
+	s.Upsert(A2ATask{
+		ContextID:          "stoppending",
+		State:              TaskFailed,
+		CompletedAt:        now.Add(-TaskRetention - time.Hour).Format(time.RFC3339),
+		Session:            "aa-codereview-stoppending",
+		SessionStopPending: true,
+	})
+	_ = SaveTasks(root, s)
+
+	if _, err := PruneTasks(root, now); err != nil {
+		t.Fatalf("PruneTasks: %v", err)
+	}
+	got, _ := LoadTasks(root)
+	if _, ok := got.ByContext("unreclaimed"); !ok {
+		t.Fatal("a row with an unreclaimed worktree/session must never be dropped")
+	}
+	if _, ok := got.ByContext("stoppending"); !ok {
+		t.Fatal("a row with SessionStopPending must never be dropped")
+	}
+}

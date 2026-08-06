@@ -6,9 +6,11 @@ import (
 	"errors"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -138,6 +140,52 @@ func bearer(r *http.Request) string {
 	return ""
 }
 
+// unauthorizedAuditThrottle 讓對憑證的暴力嘗試不會把 a2a-audit.jsonl 灌爆：
+// 以來源 IP 為 key，每秒最多一筆。上限 1024 個 key，滿了就整批清空 —— 一個
+// 攻擊者可以用偽造來源撐爆 map，整批清空比 LRU 簡單且效果相同（限流的目的
+// 是護住 log，不是精確計量）。
+type unauthorizedAuditThrottle struct {
+	mu   sync.Mutex
+	seen map[string]time.Time
+}
+
+var unauthorizedAudits = &unauthorizedAuditThrottle{seen: map[string]time.Time{}}
+
+func (t *unauthorizedAuditThrottle) allow(key string, now time.Time) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if len(t.seen) > 1024 {
+		t.seen = map[string]time.Time{}
+	}
+	if last, ok := t.seen[key]; ok && now.Sub(last) < time.Second {
+		return false
+	}
+	t.seen[key] = now
+	return true
+}
+
+// sourceHost 取請求的來源 host（去掉 port）。
+func sourceHost(r *http.Request) string {
+	if h, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return h
+	}
+	return r.RemoteAddr
+}
+
+// auditBadRequest 記錄一個已認證但格式／目標有問題的請求。與 unauthorized 分
+// 開：呼叫方是誰已經知道了，這是「他們送了什麼壞東西」。
+func (s *A2AServer) auditBadRequest(r *http.Request, callerID, agent, contextID, reason string) {
+	_ = AppendAudit(s.Root, AuditEntry{
+		At:         time.Now().UTC().Format(time.RFC3339),
+		CallerID:   callerID,
+		Agent:      agent,
+		ContextID:  contextID,
+		Summary:    reason,
+		Outcome:    "bad_request",
+		RemoteAddr: sourceHost(r),
+	})
+}
+
 func (s *A2AServer) handleRPC(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
@@ -157,17 +205,31 @@ func (s *A2AServer) handleRPC(w http.ResponseWriter, r *http.Request) {
 	}
 	caller, ok := callers.Authenticate(bearer(r))
 	if !ok {
+		// 認證失敗完全不留稽核，等於一個以「需要誰要求了什麼的持久紀錄」為
+		// 存在理由的對外監聽器，卻對暴力嘗試視而不見（I8）。以來源 IP 限流，
+		// 記憑證指紋（SHA-256 前 8 hex）而非憑證本身——絕不記憑證。
+		host := sourceHost(r)
+		if unauthorizedAudits.allow(host, time.Now()) {
+			_ = AppendAudit(s.Root, AuditEntry{
+				At:           time.Now().UTC().Format(time.RFC3339),
+				Outcome:      "unauthorized",
+				CredentialFP: credentialFingerprint(bearer(r)),
+				RemoteAddr:   host,
+			})
+		}
 		writeRPC(w, RPCFail(req.ID, RPCUnauthorized, "unknown or unapproved caller"))
 		return
 	}
 
 	if req.Method != "message/send" {
+		s.auditBadRequest(r, caller.CallerID, "", "", "unsupported method "+req.Method)
 		writeRPC(w, RPCFail(req.ID, RPCMethodNotFound, "unsupported method "+req.Method))
 		return
 	}
 
 	var p MessageSendParams
 	if err := json.Unmarshal(req.Params, &p); err != nil {
+		s.auditBadRequest(r, caller.CallerID, "", "", "malformed params")
 		writeRPC(w, RPCFail(req.ID, RPCInvalidParams, "malformed params"))
 		return
 	}
@@ -176,7 +238,15 @@ func (s *A2AServer) handleRPC(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !a2aContextIDRe.MatchString(p.ContextID) {
+		s.auditBadRequest(r, caller.CallerID, p.Agent, p.ContextID, "contextId must be 1-128 alphanumeric characters")
 		writeRPC(w, RPCFail(req.ID, RPCInvalidParams, "contextId must be 1-128 alphanumeric characters"))
+		return
+	}
+	// p.TaskID 未驗證、未設長度上限：不可達路徑或 session 名，但可讓呼叫方在
+	// task store 裡塞 ~1 MiB blob，而 task store 是每 10 秒整檔讀寫一次的。
+	if len(p.TaskID) > 128 {
+		s.auditBadRequest(r, caller.CallerID, p.Agent, p.ContextID, "taskId exceeds 128 characters")
+		writeRPC(w, RPCFail(req.ID, RPCInvalidParams, "taskId must be at most 128 characters"))
 		return
 	}
 
@@ -187,6 +257,7 @@ func (s *A2AServer) handleRPC(w http.ResponseWriter, r *http.Request) {
 	}
 	agent, ok := agents.Get(p.Agent)
 	if !ok || !agent.Enabled {
+		s.auditBadRequest(r, caller.CallerID, p.Agent, p.ContextID, "unknown agent "+p.Agent)
 		writeRPC(w, RPCFail(req.ID, RPCInvalidParams, "unknown agent "+p.Agent))
 		return
 	}

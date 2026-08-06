@@ -212,6 +212,92 @@ const (
 // ones worth inspecting.
 const MaxRetainedFailedSandboxes = 20
 
+const (
+	// MaxTaskRows 是終止狀態 row 的保留上限（依 CompletedAt 由新到舊）。
+	MaxTaskRows = 500
+	// TaskRetention 是終止狀態 row 的保留期。
+	TaskRetention = 14 * 24 * time.Hour
+)
+
+// PruneTasks 修剪 tasks.json：終止狀態的 row 依 CompletedAt 由新到舊保留前
+// MaxTaskRows 筆，且丟棄超過 TaskRetention 者。非終止的 row 永不丟棄 ——
+// 它們還在跑，丟掉就等於製造孤兒沙盒。
+//
+// 終止不代表可以丟。一列即使終止，只要還有東西靠它才能被找到，就不符合刪除
+// 資格 —— 具體是下面任何一項為真：
+//   - Worktree != ""：worktree 還沒被 SweepTimeouts 回收（forensics 保留、
+//     RetainAfterComplete 的優惠期、或單純還沒輪到），SweepTimeouts 的候選
+//     清單完全靠掃 tasks.Tasks 產生，這一列從檔案裡消失，worktree 就永遠
+//     不會再被任何機制看見，變成沒有主人的孤兒。
+//   - Session != ""：同一個道理套用在 tmux session 上。
+//   - SessionStopPending：session 是否真的停過還沒被確認，下一輪 sweep 需要
+//     靠這一列重新嘗試（見 A2ATask.SessionStopPending 的說明）。
+//
+// 只有這三項都不成立 —— 也就是 SweepTimeouts 已經把這一列的磁碟/session
+// 回收乾淨 —— 才會真的進入排名/保留期判斷。這樣的 row 因此只跳過這一輪，不
+// 是永遠豁免：等它被 sweep 收乾淨之後，之後某一次 PruneTasks 呼叫會再看到
+// 它並判定資格。
+//
+// TaskWorking/TaskDispatching（非終止）的 row 完全不進終止排名，所以「結果
+// 還沒被 CollectResults 收下」不需要另外檢查：CollectResults 把 row 轉終
+// 態、寫入 Detail 是同一次鎖內動作（a2a_result.go），在那之前 row 根本不是
+// 終止狀態，PruneTasks 看不到它。
+//
+// contextId 由呼叫方指定、1-128 字元，所以沒有上限時 row 數完全由對方決定，
+// 而每個 handler 的擁有權檢查都排在一次單調成長的 O(N) 整檔讀寫後面。
+// 每個 A2A cycle 結束時呼叫一次。回傳丟棄的筆數。
+func PruneTasks(root string, now time.Time) (int, error) {
+	dropped := 0
+	err := WithTasks(root, func(tasks *TaskStore) error {
+		type row struct {
+			idx  int
+			done time.Time // 零值（缺漏／無法解析）排在最舊
+		}
+		var terminal []row
+		for i, t := range tasks.Tasks {
+			if !isTerminal(t.State) {
+				continue
+			}
+			d, _ := parseRFC3339(t.CompletedAt)
+			terminal = append(terminal, row{i, d})
+		}
+		sort.Slice(terminal, func(a, b int) bool { return terminal[a].done.After(terminal[b].done) })
+
+		drop := map[int]bool{}
+		for rank, r := range terminal {
+			t := tasks.Tasks[r.idx]
+			// 還沒被 sweep 回收乾淨：不管排名或保留期，一律留著，交給下一次。
+			if t.Worktree != "" || t.Session != "" || t.SessionStopPending {
+				continue
+			}
+			if rank >= MaxTaskRows {
+				drop[r.idx] = true
+				continue
+			}
+			if !r.done.IsZero() && now.Sub(r.done) > TaskRetention {
+				drop[r.idx] = true
+			}
+		}
+		if len(drop) == 0 {
+			return errNothingSwept
+		}
+		kept := tasks.Tasks[:0]
+		for i, t := range tasks.Tasks {
+			if drop[i] {
+				dropped++
+				continue
+			}
+			kept = append(kept, t)
+		}
+		tasks.Tasks = kept
+		return nil
+	})
+	if err != nil && !errors.Is(err, errNothingSwept) {
+		return 0, err
+	}
+	return dropped, nil
+}
+
 // LivenessGrace 是一列進入 dispatching 之後，多久才開始檢查它的 tmux
 // session 還在不在。DispatchedAt 起算——剛起來的 session 有 tmux server 尚
 // 未就緒的窗口（EnsureWorkspace + Sessions.Start 最長 90 秒），沒有寬限期

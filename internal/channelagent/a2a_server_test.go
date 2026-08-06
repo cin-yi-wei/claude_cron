@@ -15,6 +15,17 @@ import (
 
 func newTestA2AServer(t *testing.T) (*A2AServer, string) {
 	t.Helper()
+	// unauthorizedAudits is package-level (shared across every request this
+	// process ever serves, in test or in prod) so the per-source 1/second
+	// throttle survives process restarts and works across every A2AServer
+	// instance. In tests that means every case in this file shares the same
+	// map — and httptest.NewRequest always stamps the same default
+	// RemoteAddr, so without a reset here the very first unauthorized
+	// request in ANY earlier test would still be "seen" a moment later and
+	// silently suppress the first entry a later test expects to land.
+	unauthorizedAudits.mu.Lock()
+	unauthorizedAudits.seen = map[string]time.Time{}
+	unauthorizedAudits.mu.Unlock()
 	root := t.TempDir()
 	agents := AgentStore{}
 	_ = agents.Add(Agent{Name: "codereview", ProjectDir: "/p/x", Description: "d", Capabilities: []string{"read"}, Enabled: true})
@@ -926,5 +937,68 @@ func TestFollowUpOnWorkingRowNeverRegressesCapacityEvenWhenFull(t *testing.T) {
 	nw, ok := tasks.ByContext("brandnew")
 	if !ok || nw.State != TaskSubmitted {
 		t.Fatalf("new context state = %#v, want queued (submitted) since the cap is still genuinely full", nw)
+	}
+}
+
+// 對憑證做暴力嘗試會在 a2a-audit.jsonl 產生零行 —— 對一個以「誰要求了什麼的
+// 持久紀錄」為存在理由的對外監聽器，這是最該有的一筆。
+func TestUnauthorizedRequestIsAudited(t *testing.T) {
+	s, root := newTestA2AServer(t)
+	postRPC(t, s.Handler(), "totally-wrong",
+		`{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"agent":"codereview","contextId":"c1","text":"hi"}}`)
+
+	got, err := ReadAudit(root)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("audit = %#v, %v; want exactly one unauthorized entry", got, err)
+	}
+	e := got[0]
+	if e.Outcome != "unauthorized" || e.CallerID != "" {
+		t.Fatalf("entry = %#v", e)
+	}
+	if e.CredentialFP == "" || len(e.CredentialFP) != 8 {
+		t.Fatalf("credential fingerprint = %q, want 8 hex chars", e.CredentialFP)
+	}
+	if strings.Contains(e.CredentialFP, "totally-wrong") {
+		t.Fatal("the credential itself must never be recorded")
+	}
+	if e.RemoteAddr == "" {
+		t.Fatal("the source address must be recorded")
+	}
+}
+
+// 灌爆保護：同一來源 IP 每秒最多一筆 unauthorized。
+func TestUnauthorizedAuditIsRateLimitedPerSource(t *testing.T) {
+	s, root := newTestA2AServer(t)
+	for i := 0; i < 20; i++ {
+		postRPC(t, s.Handler(), fmt.Sprintf("wrong-%d", i),
+			`{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"agent":"codereview","contextId":"c1","text":"hi"}}`)
+	}
+	got, _ := ReadAudit(root)
+	if len(got) > 3 {
+		t.Fatalf("wrote %d unauthorized entries for one source in one second; the log would be flooded", len(got))
+	}
+	if len(got) == 0 {
+		t.Fatal("rate limiting must not suppress the first entry")
+	}
+}
+
+func TestBadRequestsAreAudited(t *testing.T) {
+	s, root := newTestA2AServer(t)
+	postRPC(t, s.Handler(), "secret-1", `{"jsonrpc":"2.0","id":1,"method":"tasks/bogus","params":{}}`)
+	got, _ := ReadAudit(root)
+	if len(got) != 1 || got[0].Outcome != "bad_request" || got[0].CallerID != "peer-a" {
+		t.Fatalf("audit = %#v", got)
+	}
+}
+
+func TestOverlongTaskIDIsRejected(t *testing.T) {
+	s, _ := newTestA2AServer(t)
+	body := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"agent":"codereview","contextId":"c1","taskId":%q,"text":"hi"}}`,
+		strings.Repeat("t", 200))
+	rec := postRPC(t, s.Handler(), "secret-1", body)
+	var resp RPCResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	if resp.Error == nil || resp.Error.Code != RPCInvalidParams {
+		t.Fatalf("an unbounded taskId lets a caller stash a ~1 MiB blob in the task store; got %#v", resp.Error)
 	}
 }
