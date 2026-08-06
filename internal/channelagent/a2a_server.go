@@ -65,6 +65,22 @@ type A2AServer struct {
 	Root     string
 	BaseURL  string
 	Executor TaskExecutor
+	// DispatchContext scopes sandbox creation. It must NOT be the request's
+	// context: a client disconnect would cancel git worktree add or the tmux
+	// start midway, leaving a half-built sandbox that the forensics rule then
+	// keeps forever. Nil means context.Background().
+	DispatchContext context.Context
+}
+
+// dispatchCtx returns the context used for the (slow, detached) sandbox
+// dispatch, as opposed to r.Context(), which the rest of handleRPC keeps
+// using since parsing/auth/store access genuinely should abort if the
+// caller goes away.
+func (s *A2AServer) dispatchCtx() context.Context {
+	if s.DispatchContext != nil {
+		return s.DispatchContext
+	}
+	return context.Background()
 }
 
 func (s *A2AServer) Handler() http.Handler {
@@ -258,7 +274,7 @@ func (s *A2AServer) handleRPC(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.Executor.Start(r.Context(), task, p.Text); err != nil {
+	if err := s.Executor.Start(s.dispatchCtx(), task, p.Text); err != nil {
 		// Never echo the underlying error to an internet-facing caller: once
 		// the real executor lands, this detail will carry worktree paths, git
 		// output and tmux state — exactly the private project information

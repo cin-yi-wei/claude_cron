@@ -221,7 +221,23 @@ func run(args []string, stdout, stderr io.Writer) int {
 				BaseURL:  cfg.A2A.BaseURL,
 				Executor: agent.NewSandboxExecutor(*root, agent.TmuxSessionManager{}),
 			}
-			a2aSrv := &http.Server{Addr: cfg.A2AListen(), Handler: a2a.Handler()}
+			a2aSrv := &http.Server{
+				Addr:    cfg.A2AListen(),
+				Handler: a2a.Handler(),
+				// This listener is internet-facing (separate port from the
+				// admin API), so it must not let a slow or idle client hold a
+				// connection open indefinitely. The handler itself is fast —
+				// dispatch is now detached from the request (see
+				// A2AServer.DispatchContext) and runs to completion in the
+				// background regardless of these timeouts — so headers/body/
+				// response all fit comfortably inside a few seconds; these
+				// values just bound how long a misbehaving connection can be
+				// held before being cut loose.
+				ReadHeaderTimeout: 10 * time.Second,
+				ReadTimeout:       30 * time.Second,
+				WriteTimeout:      30 * time.Second,
+				IdleTimeout:       120 * time.Second,
+			}
 			go func() {
 				fmt.Fprintf(stdout, "a2a server listening on %s\n", cfg.A2AListen())
 				if err := a2aSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {

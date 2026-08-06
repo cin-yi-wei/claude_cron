@@ -543,6 +543,51 @@ func TestSameCallerMayReuseItsOwnTerminalContextID(t *testing.T) {
 	}
 }
 
+// ctxRecordingExecutor records whether the context handed to Start was
+// already cancelled when dispatch began, so the test below can prove
+// dispatch does NOT inherit the request's context.
+type ctxRecordingExecutor struct {
+	StubExecutor
+	sawDone bool
+}
+
+func (c *ctxRecordingExecutor) Start(ctx context.Context, task A2ATask, prompt string) error {
+	select {
+	case <-ctx.Done():
+		c.sawDone = true
+	default:
+	}
+	return c.StubExecutor.Start(ctx, task, prompt)
+}
+
+// Task 7: a client that disconnects mid-request must not cancel dispatch —
+// otherwise a half-built sandbox (git worktree add or tmux start interrupted
+// partway) is left behind for the forensics retention rule to preserve
+// forever. This test uses an ALREADY-CANCELLED request context, so if
+// dispatch used r.Context() directly, ctx.Done() would already be closed by
+// the time Start observes it.
+func TestDispatchSurvivesClientDisconnect(t *testing.T) {
+	s, _ := newTestA2AServer(t)
+	ex := &ctxRecordingExecutor{}
+	s.Executor = ex
+
+	req := httptest.NewRequest(http.MethodPost, "/a2a", strings.NewReader(
+		`{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"agent":"codereview","contextId":"c1","text":"hi"}}`))
+	req.Header.Set("Authorization", "Bearer secret-1")
+	cancelled, cancel := context.WithCancel(req.Context())
+	cancel() // client has already gone away
+	req = req.WithContext(cancelled)
+
+	s.Handler().ServeHTTP(httptest.NewRecorder(), req)
+
+	if ex.Calls != 1 {
+		t.Fatalf("executor calls = %d, want 1", ex.Calls)
+	}
+	if ex.sawDone {
+		t.Fatal("dispatch inherited the cancelled request context")
+	}
+}
+
 func TestMalformedAuthorizationHeaderRejected(t *testing.T) {
 	s, _ := newTestA2AServer(t)
 	cases := []struct {
