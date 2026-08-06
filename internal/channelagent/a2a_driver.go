@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -53,6 +54,16 @@ func (d *SandboxDriver) Ensure(ctx context.Context, task A2ATask, inj Injector) 
 	if task.Session == "" {
 		return
 	}
+	// Only aa- sandboxes are driven (and auto-answer confirm dialogs) this way.
+	// A cc- (or any other) session name here means a corrupted task row or a
+	// caller miswiring — refuse LOUDLY rather than silently no-oping, so the
+	// mistake shows up in logs instead of just looking like a session that
+	// never got picked up. cc- bindings must keep going through supervisor.go's
+	// confirm watchdog, which still asks the human.
+	if !strings.HasPrefix(task.Session, "aa-") {
+		fmt.Fprintf(os.Stderr, "a2a driver: refusing to drive session %q — not an aa- sandbox\n", task.Session)
+		return
+	}
 	d.mu.Lock()
 	if _, live := d.running[task.Session]; live {
 		d.mu.Unlock()
@@ -77,6 +88,12 @@ func (d *SandboxDriver) loop(ctx context.Context, session string, inj Injector) 
 	}()
 
 	sandbox := SandboxRoot(d.root, session)
+	// lastConfirmHash debounces the auto-answer: it's the hash of the last
+	// dialog this loop actually answered, so a dialog that hasn't dismissed
+	// yet by the next capture (pane not redrawn) is not re-typed into — a
+	// second "1"+Enter landing after the real dismissal would submit as a
+	// stray prompt to a live sandbox. See autoAnswerSandboxConfirm.
+	var lastConfirmHash string
 	for {
 		select {
 		case <-ctx.Done():
@@ -96,9 +113,10 @@ func (d *SandboxDriver) loop(ctx context.Context, session string, inj Injector) 
 		// sendConfirmChoice) the cc- confirm watchdog uses in supervisor.go —
 		// verified they carry no Binding/registry coupling, so they parse a
 		// sandbox pane identically to a binding pane. cc- behaviour (which still
-		// asks the human) is untouched: this call only ever runs from the
-		// sandbox driver loop, never from supervisor.go.
-		autoAnswerSandboxConfirm(ctx, session)
+		// asks the human) is untouched: autoAnswerSandboxConfirm refuses any
+		// non-aa- session, and this call only ever runs from the sandbox driver
+		// loop, never from supervisor.go.
+		lastConfirmHash = autoAnswerSandboxConfirm(ctx, session, lastConfirmHash)
 
 		processed, err := RunWorkerOnce(ctx, sandbox, inj, d.timeout)
 		if err != nil {
@@ -121,15 +139,38 @@ func (d *SandboxDriver) loop(ctx context.Context, session string, inj Injector) 
 // (no such tmux session, tmux unavailable) resolve to ScreenUnknown/empty pane
 // and are silently ignored — the next RunWorkerOnce attempt will simply defer
 // again via errSessionBusy if the session truly isn't ready yet.
-func autoAnswerSandboxConfirm(ctx context.Context, session string) {
+//
+// ONLY aa- sandboxes are ever auto-answered — checked here too (not just in
+// Ensure) as defense in depth, since this is the function that actually types
+// the keystroke. A cc- binding must keep asking the human via supervisor.go's
+// confirm watchdog.
+//
+// lastHash is the hash (confirmDialog.hash()) of the dialog this function
+// last answered for this session, or "" if none. It is returned updated:
+// unchanged (echoed back) when the SAME dialog is still on screen — this is
+// the debounce that stops a second "1"+Enter from being sent before the pane
+// has redrawn past the first one, which would otherwise land as a stray "1"
+// submitted as a prompt once the dialog actually dismisses. Reset to "" the
+// moment the pane stops showing a confirm dialog at all, so a genuinely new
+// dialog (even one with identical text) is still answered.
+func autoAnswerSandboxConfirm(ctx context.Context, session, lastHash string) string {
+	if !strings.HasPrefix(session, "aa-") {
+		return ""
+	}
 	pane := capturePane(ctx, session)
 	if pane == "" || classifyScreen(pane) != ScreenConfirm {
-		return
+		return ""
 	}
-	if _, ok := parseConfirmDialog(pane); !ok {
-		return
+	dlg, ok := parseConfirmDialog(pane)
+	if !ok {
+		return ""
+	}
+	h := dlg.hash()
+	if h == lastHash {
+		return lastHash // already answered this exact dialog; pane likely hasn't redrawn yet
 	}
 	_ = sendConfirmChoice(ctx, session, 1)
+	return h
 }
 
 // Stop ends the driver for one sandbox and BLOCKS until its goroutine has
