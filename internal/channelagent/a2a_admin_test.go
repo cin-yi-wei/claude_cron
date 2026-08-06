@@ -1,6 +1,7 @@
 package channelagent
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -139,12 +140,39 @@ func TestAdminA2ARevokeTerminatesInFlightWork(t *testing.T) {
 	if err != nil || pol.Level != GrantRevoked {
 		t.Fatalf("policy = %#v err = %v", pol, err)
 	}
-	if len(stopper.stopped) != 1 || stopper.stopped[0] != session {
-		t.Fatalf("driver stops = %#v", stopper.stopped)
+	// 撤銷本身不停 session：破壞性動作只能走 sweep 那條唯一有 TryLock + 身分
+	// 重新確認的路徑（round-13-review Critical）。這裡只該留下「還沒停」的意
+	// 圖，而且 HTTP 請求因此有界——SandboxDriver.Stop 會等當前那一輪
+	// RunWorkerOnce 跑完，卡住的 turn 可以是二十分鐘。
+	if len(stopper.stopped) != 0 || len(fake.Stopped) != 0 {
+		t.Fatalf("revoke stopped things itself: driver=%#v tmux=%#v", stopper.stopped, fake.Stopped)
 	}
-	if len(fake.Stopped) != 1 || fake.Stopped[0] != session {
-		t.Fatalf("tmux stops = %#v", fake.Stopped)
+	for _, id := range []string{"c1", "c2"} {
+		tk, _ := got.ByContext(id)
+		if tk.Session != "" && !tk.SessionStopPending {
+			t.Fatalf("%s: SessionStopPending = false, want true so a later sweep stops it", id)
+		}
 	}
+	// 下一輪 sweep 才真的停，而且是走那條有守衛的路徑。
+	if _, _, err := SweepTimeouts(context.Background(), root, fake, time.Now(), stopper); err != nil {
+		t.Fatalf("SweepTimeouts: %v", err)
+	}
+	// 同一列同時是 pendingStop 也是回收候選時會被停兩次；停止本身冪等，這是
+	// Task 7 review 記過的已知無害重複，所以這裡只驗「有停到，而且停的都是這
+	// 個 session」，不驗次數。
+	assertStoppedOnly := func(what string, got []string) {
+		t.Helper()
+		if len(got) == 0 {
+			t.Fatalf("after sweep, %s stops = %#v, want at least one", what, got)
+		}
+		for _, s := range got {
+			if s != session {
+				t.Fatalf("after sweep, %s stopped %q, want only %q", what, s, session)
+			}
+		}
+	}
+	assertStoppedOnly("driver", stopper.stopped)
+	assertStoppedOnly("tmux", fake.Stopped)
 	entries, _ := ReadAudit(root)
 	if len(entries) == 0 || entries[len(entries)-1].Outcome != "revoked" {
 		t.Fatalf("audit tail = %#v", entries)

@@ -997,7 +997,9 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 	var pendingStop []A2ATask
 	_ = WithTasks(root, func(tasks *TaskStore) error {
 		for _, t := range tasks.Tasks {
-			if t.State == TaskFailed && t.SessionStopPending && t.Session != "" {
+			// 任何終止狀態都算：撤銷/取消走的是 TaskCanceled，vanished 走的是
+			// TaskFailed，兩者都只留下「這一列現在的樣子」給下一輪重建。
+			if isTerminal(t.State) && t.SessionStopPending && t.Session != "" {
 				pendingStop = append(pendingStop, t)
 			}
 		}
@@ -1005,6 +1007,13 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 	})
 	var stopped []A2ATask
 	for _, t := range pendingStop {
+		// 重新撤銷一次政策檔再停。撤銷當下若有一個 Start 正持著共享鎖，它的
+		// WriteSandboxPolicy 可能落在 RevokeSandboxPolicy 之後，把已撤銷的政策
+		// 覆寫回可用（round-13-review 的第二個變形）。這裡是在 Start 放開鎖之
+		// 後才跑，所以補這一次就把那個窗口關掉；操作本身冪等。
+		if rerr := RevokeSandboxPolicy(root, t.Session); rerr != nil {
+			log.Printf("a2a: 重新撤銷 %s 的政策檔失敗: %v", t.Session, rerr)
+		}
 		st := stopTarget{taskID: t.TaskID, contextID: t.ContextID, session: t.Session, state: t.State}
 		if stopSessionGuarded(ctx, root, sm, stopper, st) {
 			stopped = append(stopped, t)
@@ -1270,10 +1279,18 @@ func terminateTasks(ctx context.Context, root string, match func(A2ATask) bool, 
 			t.State = TaskCanceled
 			t.Detail = detail
 			t.CompletedAt = now
-			tasks.Tasks[i] = t
 			if t.Session != "" {
+				// 只記下「這個 session 還沒停」，實際的停止交給 sweep 那條
+				// 唯一的、有 TryLock + 身分重新確認的拆除路徑。這裡自己動手
+				// 停會變成第二條破壞性路徑：round-13-review 的探針顯示，同一
+				// 個 session 的鎖被持有時正規路徑會正確跳過，而這裡照樣把它
+				// 砍掉——操作者取消 c1、呼叫方合法重送 c1、系統重建同名
+				// session，然後這裡把剛建好的那個殺掉，留下一列還在 working
+				// 但 session 已死的紀錄，卡到 2 小時硬逾時。
+				t.SessionStopPending = true
 				sessions = append(sessions, t.Session)
 			}
+			tasks.Tasks[i] = t
 			n++
 		}
 		if n == 0 {
@@ -1289,14 +1306,11 @@ func terminateTasks(ctx context.Context, root string, match func(A2ATask) bool, 
 			log.Printf("a2a: 撤銷 %s 的政策檔失敗（session 仍會被停掉）: %v", s, rerr)
 		}
 	}
-	for _, s := range sessions {
-		if stopper != nil {
-			stopper.Stop(s)
-		}
-		if sm != nil {
-			_ = sm.Stop(ctx, s)
-		}
-	}
+	// 這裡刻意不停 session。能力已經在上面被拿掉（政策檔改成 revoked，gate
+	// 每次工具呼叫都重讀、預設拒絕），所以沙盒下一個動作就被擋住；剩下的
+	// 停止與回收由下一輪 sweep 走那條唯一的拆除路徑完成。這同時也讓 HTTP
+	// 請求有界——SandboxDriver.Stop 會等當前那一輪 RunWorkerOnce 跑完，遇到
+	// 卡住的 turn 可以是二十分鐘，不該掛在操作者的請求上。
 	return n, nil
 }
 
