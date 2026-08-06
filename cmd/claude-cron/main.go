@@ -446,6 +446,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runTriggerCommand(args[1:], stdout, stderr)
 	case "busy":
 		return runBusyCommand(args[1:], stdout, stderr)
+	case "a2a":
+		return runA2ACommand(args[1:], stdout, stderr)
 	case "bind", "unbind", "pause", "resume", "list", "set-default":
 		return runManageCommand(args[0], args[1:], stdout, stderr)
 	default:
