@@ -1056,3 +1056,82 @@ func TestBadRequestAuditBoundsCallerControlledAgent(t *testing.T) {
 		t.Fatalf("stored Agent kept %d runes", n)
 	}
 }
+
+func TestTasksGetReturnsTheCallersOwnTask(t *testing.T) {
+	s, root := newTestA2AServer(t)
+	var tasks TaskStore
+	tasks.Upsert(A2ATask{
+		ContextID: "c1", TaskID: "t1", Agent: "codereview", CallerID: "peer-a",
+		Session: "aa-codereview-c1", Branch: "aa/aa-codereview-c1", State: TaskCompleted,
+		StartedAt: "2026-08-06T00:00:00Z", CompletedAt: "2026-08-06T00:10:00Z",
+		Detail: "all good",
+	})
+	_ = SaveTasks(root, tasks)
+
+	rec := postRPC(t, s.Handler(), "secret-1",
+		`{"jsonrpc":"2.0","id":1,"method":"tasks/get","params":{"contextId":"c1"}}`)
+	var resp RPCResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %#v", resp.Error)
+	}
+	res, _ := resp.Result.(map[string]any)
+	if res["state"] != "completed" || res["detail"] != "all good" ||
+		res["branch"] != "aa/aa-codereview-c1" || res["taskId"] != "t1" {
+		t.Fatalf("result = %#v", res)
+	}
+	// session / worktree 路徑是私有專案資訊，不得出現在回應裡。
+	if _, leaked := res["session"]; leaked {
+		t.Fatal("tasks/get must not expose the sandbox session name")
+	}
+	if _, leaked := res["worktree"]; leaked {
+		t.Fatal("tasks/get must not expose the worktree path")
+	}
+}
+
+// 不洩漏存在性：別人的 contextId 與不存在的 contextId 回完全相同的錯誤。
+func TestTasksGetHidesOtherCallersTasks(t *testing.T) {
+	s, root := newTestA2AServer(t)
+	var tasks TaskStore
+	tasks.Upsert(A2ATask{ContextID: "c1", TaskID: "t1", Agent: "codereview", CallerID: "someone-else", State: TaskWorking})
+	_ = SaveTasks(root, tasks)
+
+	callers, _ := LoadCallers(root)
+	_ = callers.Register("peer-b", "secret-2")
+	callers.Approve("peer-b", []string{"read"})
+	callers.SetGrantLevel("peer-b", GrantReadOnly)
+	_ = SaveCallers(root, callers)
+
+	mine := postRPC(t, s.Handler(), "secret-2", `{"jsonrpc":"2.0","id":1,"method":"tasks/get","params":{"contextId":"c1"}}`)
+	ghost := postRPC(t, s.Handler(), "secret-2", `{"jsonrpc":"2.0","id":1,"method":"tasks/get","params":{"contextId":"nosuch"}}`)
+
+	var a, b RPCResponse
+	_ = json.Unmarshal(mine.Body.Bytes(), &a)
+	_ = json.Unmarshal(ghost.Body.Bytes(), &b)
+	if a.Error == nil || b.Error == nil {
+		t.Fatalf("both must error: %#v / %#v", a.Error, b.Error)
+	}
+	if a.Error.Code != b.Error.Code || a.Error.Message != b.Error.Message {
+		t.Fatalf("existence leaked: %#v vs %#v", a.Error, b.Error)
+	}
+}
+
+// detail 是沙盒自撰文字，回應中截斷至 64 KiB。這是對「沙盒文字不流出 HTTP」
+// 的刻意放寬 —— 沒有它就沒有交付（規格第六節開放問題 8）。
+func TestTasksGetTruncatesDetail(t *testing.T) {
+	s, root := newTestA2AServer(t)
+	var tasks TaskStore
+	tasks.Upsert(A2ATask{
+		ContextID: "c1", TaskID: "t1", Agent: "codereview", CallerID: "peer-a",
+		State: TaskCompleted, Detail: strings.Repeat("x", 3*maxDetailBytes),
+	})
+	_ = SaveTasks(root, tasks)
+
+	rec := postRPC(t, s.Handler(), "secret-1", `{"jsonrpc":"2.0","id":1,"method":"tasks/get","params":{"contextId":"c1"}}`)
+	var resp RPCResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	res, _ := resp.Result.(map[string]any)
+	if got := len(res["detail"].(string)); got > maxDetailBytes+32 {
+		t.Fatalf("detail = %d bytes, want at most %d", got, maxDetailBytes)
+	}
+}

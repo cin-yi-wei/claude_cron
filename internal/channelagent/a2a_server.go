@@ -222,12 +222,21 @@ func (s *A2AServer) handleRPC(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Method != "message/send" {
+	switch req.Method {
+	case "message/send":
+		s.handleMessageSend(w, r, req, caller)
+	case "tasks/get":
+		s.handleTasksGet(w, r, req, caller)
+	default:
 		s.auditBadRequest(r, caller.CallerID, "", "", "unsupported method "+req.Method)
 		writeRPC(w, RPCFail(req.ID, RPCMethodNotFound, "unsupported method "+req.Method))
-		return
 	}
+}
 
+// handleMessageSend 是 message/send 的完整處理：驗證 params、找 agent、算有效
+// 授權等級、以 WithTasks 原子性地判斷「新派送 / 排隊 / 對已存在的 dispatch
+// 送 follow-up」、再實際呼叫 Executor。
+func (s *A2AServer) handleMessageSend(w http.ResponseWriter, r *http.Request, req RPCRequest, caller Caller) {
 	var p MessageSendParams
 	if err := json.Unmarshal(req.Params, &p); err != nil {
 		s.auditBadRequest(r, caller.CallerID, "", "", "malformed params")
@@ -554,4 +563,70 @@ func (s *A2AServer) handleRPC(w http.ResponseWriter, r *http.Request) {
 		"taskId":    task.TaskID,
 		"state":     string(task.State),
 	}))
+}
+
+// TaskGetParams 是 tasks/get 的 params。contextId 必填。
+type TaskGetParams struct {
+	ContextID string `json:"contextId"`
+	TaskID    string `json:"taskId"`
+}
+
+// errTaskNotVisible 是「查無此 row」與「這一列屬於別人」共用的訊息。兩者必須
+// 完全一致，否則呼叫方可以用錯誤訊息的差異列舉別人的 contextId。
+const errTaskNotVisible = "no task for that contextId"
+
+// taskSnapshotPayload 是 tasks/get 的回應形狀，也是完成回呼的 body 基底
+// （Task 12 在它之上加一個 "event" 欄位）。刻意不含 session / worktree ——
+// 那是私有專案資訊，host 路徑與內部簿記沒有理由跨過 HTTP 邊界；state / detail
+// 才是這個功能存在的理由。
+//
+// detail 是沙盒自撰文字，截斷至 maxDetailBytes。把它交出去是對「沙盒文字不
+// 流出 HTTP」的刻意放寬，因為沒有它就沒有交付（規格第六節開放問題 8）。
+// Upsert 已經在寫入時把 Detail 截到 maxDetailBytes，這裡再截一次是防禦性的
+// ——就算未來某條路徑繞過 Upsert 直接改了 Detail，回應仍然有界。
+func taskSnapshotPayload(t A2ATask) map[string]any {
+	return map[string]any{
+		"contextId":   t.ContextID,
+		"taskId":      t.TaskID,
+		"state":       string(t.State),
+		"level":       string(t.Level),
+		"branch":      t.Branch,
+		"startedAt":   t.StartedAt,
+		"completedAt": t.CompletedAt,
+		"detail":      truncateBytes(t.Detail, maxDetailBytes),
+	}
+}
+
+// handleTasksGet 是 tasks/get 的完整處理：只讀，不經過 WithTasks（不做任何
+// 變更，LoadTasks 就夠了），只讓呼叫方看到自己（CallerID 相符）的 row，且
+// 「查無此列」與「這列是別人的」回完全相同的錯誤，不讓呼叫方靠錯誤訊息的
+// 差異列舉別人的 contextId。
+func (s *A2AServer) handleTasksGet(w http.ResponseWriter, r *http.Request, req RPCRequest, caller Caller) {
+	var p TaskGetParams
+	if err := json.Unmarshal(req.Params, &p); err != nil {
+		s.auditBadRequest(r, caller.CallerID, "", "", "malformed tasks/get params")
+		writeRPC(w, RPCFail(req.ID, RPCInvalidParams, "malformed params"))
+		return
+	}
+	if !a2aContextIDRe.MatchString(p.ContextID) {
+		s.auditBadRequest(r, caller.CallerID, "", p.ContextID, "invalid contextId on tasks/get")
+		writeRPC(w, RPCFail(req.ID, RPCInvalidParams, "contextId must be 1-128 alphanumeric characters"))
+		return
+	}
+	tasks, err := LoadTasks(s.Root)
+	if err != nil {
+		writeRPC(w, RPCFail(req.ID, RPCInternalError, "task store unavailable"))
+		return
+	}
+	t, ok := tasks.ByContext(p.ContextID)
+	// 擁有權不符與查無此 row 回完全相同的錯誤（不洩漏存在性）。
+	if !ok || t.CallerID != caller.CallerID {
+		writeRPC(w, RPCFail(req.ID, RPCInvalidParams, errTaskNotVisible))
+		return
+	}
+	if p.TaskID != "" && p.TaskID != t.TaskID {
+		writeRPC(w, RPCFail(req.ID, RPCInvalidParams, errTaskNotVisible))
+		return
+	}
+	writeRPC(w, RPCOK(req.ID, taskSnapshotPayload(t)))
 }
