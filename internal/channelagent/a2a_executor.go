@@ -440,7 +440,31 @@ func (e *SandboxExecutor) DeliverFollowUp(ctx context.Context, task A2ATask, pro
 	live := false
 	_ = WithTasks(e.Root, func(tasks *TaskStore) error {
 		if cur, ok := tasks.ByContext(task.ContextID); ok {
+			// cur.Worktree != "" 是「這一列已經durable 地指得到一個沙盒」的判
+			// 準（2026-08-06 minor triage, Fix 5）。少了它，一列還在
+			// TaskDispatching、但 Start 尚未跑到 persist（a2a_executor.go 的
+			// task.Worktree 賦值 + e.persist，早於 Init/EnsureWorkspace/tmux
+			// 任何真正的 side effect）的 row 也會被判成可投遞，於是下面的
+			// Inject → IngestMessages → Init(sandboxRoot) 就地建出
+			// sandboxes/<session>/。這個窗口內 Start 仍可能早期失敗（等 build
+			// 鎖等到 ctx 過期、unknown/disabled agent、grant level 不合法），
+			// markFailed 留下的是一列 Worktree == "" 的 TaskFailed：
+			// SweepTimeouts 的 failed candidate 條件要求 Worktree != ""，所以
+			// 那個目錄永遠不會被回收；PruneTasks 又因為 Worktree == "" 且
+			// 沒有 SessionStopPending 而有資格把整列丟掉——目錄留在磁碟上，
+			// registry 裡再也沒有任何東西指得到它。
+			//
+			// 反過來，只要 Worktree 已經寫進 row，這個沙盒的目錄樹就一直有主
+			// ：sweep 的 removeCandidate 會連同 SandboxRoot(root, session) 一
+			// 起刪，PruneTasks 也不會在那之前把列丟掉。所以「先有 Worktree，
+			// 才准建目錄」把孤兒從結構上排除，而且完全不新增任何拆除路徑。
+			//
+			// 代價是這個極窄窗口內的追問會被丟掉——跟這個函式既有的
+			// !live 分支一樣的處理，呼叫端（a2a_server.go 的 isFollowUp 分支）
+			// 已經會把「這則追問可能沒被看到」寫進 row 的 Detail，呼叫方查
+			// tasks/get 就看得到，可以自己重送。
 			live = cur.TaskID == task.TaskID && cur.Session == task.Session &&
+				cur.Worktree != "" &&
 				(cur.State == TaskDispatching || cur.State == TaskWorking)
 		}
 		return errNothingSwept // 只讀不寫，讓 WithTasks 跳過存檔

@@ -3,8 +3,10 @@ package channelagent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -520,7 +522,33 @@ func StartControlSession(ctx context.Context, session, cwd, registryRoot, tokenE
 }
 
 // StopTmuxSession kills a tmux session. A missing session is not an error.
+//
+// 「tmux 真的跑起來、用離開碼回報了結果」一律視為成功：不論是砍掉了、還是根
+// 本沒有這個 session（也包含 tmux server 沒起來），對呼叫方的結論相同——那個
+// session 現在不在跑了。
+//
+// 但「我們根本沒問到答案」不可以再被吞成 nil（2026-08-06 minor triage，
+// Fix 1b）。舊版本無條件 return nil，於是 fork EAGAIN（這台機器有 OOM 史）、
+// tmux 執行檔暫時找不到、ctx 被取消這三種情況，全部長得跟「已經停掉了」一模
+// 一樣；A2A 的回收路徑因此會在 session 其實還活著的時候刪掉它的 worktree 與
+// sandbox root，留下一個 cwd 已被刪除、沒有任何 row 指得到的 claude 行程。
+// 判定方式與 TmuxSessionAlive 完全一致（同樣的三分法），理由也一樣。
+//
+// cc- 的四個呼叫點（supervisor.go 三處、control.go 經 ControlDeps.StopSession、
+// admin.go）今天全部寫成 `_ = StopTmuxSession(...)`，一律忽略回傳值，所以這個
+// 修正對 cc- 沒有任何可觀察到的行為改變；只有 A2A 的拆除路徑會去看它。
 func StopTmuxSession(ctx context.Context, session string) error {
-	_ = runExternalCommand(ctx, "tmux", "kill-session", "-t", session)
-	return nil
+	err := runExternalCommand(ctx, "tmux", "kill-session", "-t", session)
+	if err == nil {
+		return nil
+	}
+	// ctx 取消/逾時優先判斷：這時 cmd.Run() 回的錯誤型別不保證是 *exec.ExitError。
+	if ctx.Err() != nil {
+		return fmt.Errorf("stop tmux session %s: %w", session, ctx.Err())
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return nil // tmux 回答了：沒有這個 session（或沒有 server）
+	}
+	return fmt.Errorf("stop tmux session %s: %w", session, err)
 }

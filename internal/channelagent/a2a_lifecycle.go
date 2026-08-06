@@ -566,7 +566,13 @@ type SandboxStopper interface {
 //     it right before acting (task 7 review round 3, important finding);
 //     it is logged and left for manual inspection rather than risked. A
 //     removal failure is logged and left for a later sweep to retry — the
-//     candidate stays out of the "succeeded" list below.
+//     candidate stays out of the "succeeded" list below. A FAILED STOP is
+//     treated the same way as a busy teardown lock: removal does not run at
+//     all that pass (2026-08-06 minor triage, Fix 1). Deleting a worktree
+//     and sandbox root whose tmux session could not actually be stopped
+//     leaves a live claude process with a deleted cwd that no row references
+//     and no later sweep can find — the exact orphan class this whole
+//     lock-then-verify design exists to prevent.
 //  3. Take the lock again and, for each succeeded candidate, clear
 //     Worktree/Session ONLY if the row at that contextId still has the
 //     exact same TaskID, State, Worktree and Session recorded in step 1. A
@@ -1122,7 +1128,20 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 		if stopper != nil {
 			stopper.Stop(c.session)
 		}
-		_ = sm.Stop(ctx, c.session)
+		// 停不掉就不准拆（2026-08-06 minor triage, Fix 1）。這裡原本是
+		// `_ = sm.Stop(...)`，把錯誤丟掉直接往下刪：一個 sm.Stop 真的失敗
+		// （tmux fork EAGAIN、執行檔找不到、ctx 被取消——StopTmuxSession 現在
+		// 會誠實回報這幾種情況）的 candidate，worktree 與 sandbox root 照樣被
+		// 刪光，留下一個還活著、cwd 已經不存在、沒有任何 row 指得到、之後也
+		// 沒有任何 sweep 找得到的 claude 行程。處理方式跟拿不到拆除鎖完全一
+		// 樣（上面那個既有分支）：這一輪什麼都不動，row 保留 Worktree/Session
+		// 留給下一次 sweep 重試——那正是整個「先刪磁碟、成功了才清欄位」設計
+		// 的重試前提。
+		if err := sm.Stop(ctx, c.session); err != nil {
+			log.Printf("a2a: sweep: context %s 的 session %s 停不掉，本輪不拆它的 worktree/sandbox root（留給下一次 sweep 重試）: %v", c.contextID, c.session, err)
+			unlock()
+			continue
+		}
 		ok2 := removeCandidate(ctx, root, sm, c)
 		unlock()
 		if ok2 {

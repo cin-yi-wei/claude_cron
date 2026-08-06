@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -96,6 +97,18 @@ func truncateBytes(s string, limit int) string {
 	return cut + "…（截斷）"
 }
 
+// rotationLockPath 是某一份 rotating log 的輪替鎖路徑。用檔案鎖（跟
+// registry.lock 同一套 AcquireLock）而不是 process 內的 mutex，是因為
+// a2a-gate.jsonl 的寫入者是 PreToolUse hook —— 每一次工具呼叫都是一個獨立的
+// OS 行程，process 內的鎖對它們完全無效。
+func rotationLockPath(path string) string { return path + ".rotate.lock" }
+
+// rotateTestHookBeforeRotate 只給測試用（production 為 nil，零成本）：在
+// 「已經決定要輪替」與「真的取鎖 + 改名」之間開一個確定性的窗口，讓測試可以
+// 在那一刻扮演另一個 hook 行程完成一次完整的輪替，重現跨行程的
+// stat-then-rename 競態。
+var rotateTestHookBeforeRotate func(path string)
+
 // appendRotatingLine 以單次 O_APPEND write 追加一行，並在檔案超過 AuditMaxBytes
 // 時先 rename 成 <path>.1（只留一代）再 append。a2a-audit.jsonl 與
 // a2a-gate.jsonl 共用這個機制。
@@ -104,10 +117,10 @@ func appendRotatingLine(path string, line []byte, mode os.FileMode) error {
 		return err
 	}
 	if info, err := os.Stat(path); err == nil && info.Size() >= AuditMaxBytes {
-		// rename 失敗不阻止寫入：留一份過大的 log 遠比丟掉這一筆紀錄好。
-		if rErr := os.Rename(path, path+".1"); rErr != nil {
-			fmt.Fprintf(os.Stderr, "a2a: rotate %s 失敗（繼續追加）: %v\n", path, rErr)
+		if rotateTestHookBeforeRotate != nil {
+			rotateTestHookBeforeRotate(path)
 		}
+		rotateOversizedLog(path)
 	}
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, mode)
 	if err != nil {
@@ -116,6 +129,49 @@ func appendRotatingLine(path string, line []byte, mode os.FileMode) error {
 	defer f.Close()
 	_, err = f.Write(line)
 	return err
+}
+
+// rotateOversizedLog 把一份已經超過上限的 log rename 成 <path>.1，並且是整個
+// 檔案系統上唯一一個此刻能這麼做的人。
+//
+// 為什麼非得跨行程互斥不可（2026-08-06 minor triage, Fix 2）：a2a-gate.jsonl
+// 的寫入者是 PreToolUse hook，**每一次工具呼叫都是一個新的 OS 行程**（見
+// AppendGateLog 的說明與 cmd/claude-cron/main.go 的 hook 分支），不是同一個
+// serve 行程裡的多條 goroutine。原本的「stat 看到超過上限 → rename」中間沒有
+// 任何互斥：兩個 hook 行程可以同時 stat 到同一份 32 MiB 的檔、接著都 rename，
+// 第二個 rename 直接蓋掉第一個剛建立的 .1 —— 整整一代（上限 32 MiB）的 gate
+// 稽核歷史就這樣無聲消失。本輪先前把稽核 log 的同類問題判為「單一寫入者，
+// 不成立」，那個理由是針對 a2a-audit.jsonl 講的，套不到 gate log 身上。
+//
+// 用 lock.go 既有的 AcquireLock（O_EXCL + pid + 陳舊竊取），跟 registry.lock
+// 同一套機制：它落在檔案系統上，因此對獨立行程一樣有效，process 內的
+// sync.Mutex 則完全解決不了這個競態。
+//
+//   - 取不到鎖 = 另一個行程正在輪替：這一趟就不輪替，直接把這行 append 上去。
+//     絕不等待——gate 跑在每一次工具呼叫的關鍵路徑上，寧可讓檔案暫時多長一
+//     點，也不能讓沙盒的工具呼叫卡在一把鎖上。而且沒有任何資料會因此遺失：
+//     這行不是落在贏家即將 rename 成 .1 的舊檔（內容原封不動保留在 .1），
+//     就是落在贏家剛開好的新檔。
+//   - 拿到鎖之後**重新 stat 一次**：這是真正修掉競態的那一步。呼叫端看到的
+//     大小是取鎖之前量的，取鎖成功不代表那份檔案還是同一份——另一個行程可能
+//     已經在這中間完整輪替過一輪了。大小已經降下來就代表別人做完了，這裡不
+//     可以再 rename 一次（那正是會蓋掉 .1 的動作）。
+//
+// rename 失敗不阻止寫入：留一份過大的 log 遠比丟掉這一筆紀錄好（既有取捨）。
+func rotateOversizedLog(path string) {
+	lock, err := AcquireLock(rotationLockPath(path))
+	if err != nil {
+		return // 另一個行程正在輪替；這一趟直接 append，不重複 rename
+	}
+	defer func() { _ = lock.Release() }()
+
+	info, sErr := os.Stat(path)
+	if sErr != nil || info.Size() < AuditMaxBytes {
+		return // 在我們取到鎖之前，別人已經輪替完了
+	}
+	if rErr := os.Rename(path, path+".1"); rErr != nil {
+		fmt.Fprintf(os.Stderr, "a2a: rotate %s 失敗（繼續追加）: %v\n", path, rErr)
+	}
 }
 
 func AppendAudit(root string, e AuditEntry) error {
@@ -128,6 +184,22 @@ func AppendAudit(root string, e AuditEntry) error {
 	e.Agent = truncateRunes(e.Agent, maxAuditFieldRunes)
 	e.ContextID = truncateRunes(e.ContextID, maxAuditFieldRunes)
 	e.TaskID = truncateRunes(e.TaskID, maxAuditFieldRunes)
+	// 2026-08-06 minor triage, Fix 4：剩下四個欄位一起收進同一道界限。今天
+	// 沒有任何呼叫端能把呼叫方控制的資料塞進它們（At 是 time.Now 格式化、
+	// Outcome 是程式碼裡的字面常數、RemoteAddr 取自 net.SplitHostPort、
+	// CredentialFP 是 8 個 hex 字元），所以這純粹是縱深防禦，不是修一個活著
+	// 的漏洞。但這正是 round 11 補 CallerID/Agent/ContextID/TaskID 時學到的
+	// 那件事：把界限放在 AppendAudit 這一個地方，未來任何新的呼叫端都自動受
+	// 保護，不必逐一記得截斷；留一個沒有上限的欄位在寫入路徑上，就是留一個
+	// 「下一個呼叫端把不受控輸入接上去就能把 32 MiB 稽核歷史 rotate 掉」的
+	// 缺口。四個欄位共用同一個上限、同一個 truncateRunes 標記，跟上面四個完
+	// 全一致——At 也不例外：一個超過 200 字元的時間戳本來就不是時間戳，截斷
+	// 它不會讓任何可解析的值變得不可解析，而不截斷它會讓整行超過
+	// maxAuditLineBytes、被 ReadAudit 整筆跳過（等於這筆稽核直接消失）。
+	e.At = truncateRunes(e.At, maxAuditFieldRunes)
+	e.Outcome = truncateRunes(e.Outcome, maxAuditFieldRunes)
+	e.RemoteAddr = truncateRunes(e.RemoteAddr, maxAuditFieldRunes)
+	e.CredentialFP = truncateRunes(e.CredentialFP, maxAuditFieldRunes)
 	blob, err := json.Marshal(e)
 	if err != nil {
 		return err
@@ -206,6 +278,15 @@ func loadOrCreateAuditKey(root string) []byte {
 		return k
 	}
 
+	// 到這裡代表磁碟上「沒有一把可用的金鑰」。分辨兩種完全不同的原因
+	// （2026-08-06 minor triage, Fix 3）：檔案根本不存在（正常的第一次啟動，
+	// 下面用 O_EXCL 建立），或者檔案存在但內容解不開（半截 hex、被截斷、
+	// 被別的東西覆寫）。後者是舊實作的無聲死路：O_EXCL 永遠回 ErrExist、接
+	// 著的重讀永遠還是解不開，於是每一次行程啟動都退回一把只活在記憶體裡的
+	// 金鑰——跨重啟關聯憑證指紋這件事就此永久失效，而且沒有任何地方留下訊
+	// 號。
+	corrupt := auditKeyFileIsCorrupt(path)
+
 	buf := make([]byte, 32)
 	if _, err := rand.Read(buf); err != nil {
 		// crypto/rand 讀不到隨機源是機器層級的嚴重異常。退化成一把只在這
@@ -217,10 +298,29 @@ func loadOrCreateAuditKey(root string) []byte {
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err == nil {
 		f, cErr := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-		if cErr == nil {
-			_, _ = f.WriteString(hex.EncodeToString(buf))
-			_ = f.Close()
-		} else if errors.Is(cErr, os.ErrExist) {
+		switch {
+		case cErr == nil:
+			_, wErr := f.WriteString(hex.EncodeToString(buf))
+			cErr = f.Close()
+			if wErr == nil && cErr == nil {
+				auditKeyCache[root] = buf
+				return buf
+			}
+			log.Printf("a2a: 寫入稽核金鑰 %s 失敗，這個行程改用一把不落地的金鑰——重啟之後憑證指紋將無法跨行程關聯: write=%v close=%v", path, wErr, cErr)
+			auditKeyCache[root] = buf
+			return buf
+		case errors.Is(cErr, os.ErrExist) && corrupt:
+			// 檔案存在但內容壞掉：原地換成一把新的、有效的金鑰。用「同目錄
+			// 暫存檔 + rename」讓替換是原子的，任何併發的讀取者不是看到舊
+			// 的壞內容就是看到新的完整內容，不會讀到寫到一半。
+			if rErr := replaceAuditKeyFile(path, buf); rErr != nil {
+				log.Printf("a2a: 稽核金鑰檔 %s 內容毀損且無法修復，這個行程改用一把不落地的金鑰——重啟之後憑證指紋將無法跨行程關聯: %v", path, rErr)
+			} else {
+				log.Printf("a2a: 稽核金鑰檔 %s 內容毀損（不是有效的 hex），已重新產生一把——在此之前寫下的憑證指紋無法再與新的指紋關聯", path)
+			}
+			auditKeyCache[root] = buf
+			return buf
+		case errors.Is(cErr, os.ErrExist):
 			// 輸掉建立競賽:改讀贏家剛寫好的檔案，不要用自己剛產生的這把
 			// ——否則兩個行程會各自快取不同的金鑰。
 			if k := readAuditKeyFile(path); k != nil {
@@ -229,10 +329,50 @@ func loadOrCreateAuditKey(root string) []byte {
 			}
 			// 贏家還沒寫完（極窄的競賽視窗），讀不到：退而求其次先用自己
 			// 這把，下一次呼叫會重新嘗試讀檔案。
+			log.Printf("a2a: 稽核金鑰 %s 已被另一個行程建立但還讀不到，這個行程暫時使用一把不落地的金鑰（下次呼叫會重試）", path)
+		default:
+			log.Printf("a2a: 無法建立稽核金鑰 %s（目錄不可寫？），這個行程改用一把不落地的金鑰——重啟之後憑證指紋將無法跨行程關聯: %v", path, cErr)
 		}
+	} else {
+		log.Printf("a2a: 無法建立稽核金鑰目錄 %s，這個行程改用一把不落地的金鑰——重啟之後憑證指紋將無法跨行程關聯: %v", filepath.Dir(path), err)
 	}
 	auditKeyCache[root] = buf
 	return buf
+}
+
+// auditKeyFileIsCorrupt 只在「檔案確實讀得到，但內容不是一把可用的金鑰」時
+// 回 true。這條界線是刻意畫得很保守的：任何讀取層面的失敗（暫時的 EACCES、
+// EIO、檔案不存在）都回 false，因為那些情況根本無法證明內容壞掉，貿然覆寫
+// 等於親手銷毀一把完全正常的金鑰。「可用」的定義完全沿用 readAuditKeyFile
+// （trim 後是合法 hex 且非空），所以今天讀得起來的每一個檔案，明天也一樣讀
+// 得起來、不會被判定成毀損——這個修復路徑在結構上不可能有偽陽性。
+func auditKeyFileIsCorrupt(path string) bool {
+	if _, err := os.ReadFile(path); err != nil {
+		return false
+	}
+	return readAuditKeyFile(path) == nil
+}
+
+// replaceAuditKeyFile 用同目錄暫存檔 + rename 原子地換掉金鑰檔內容。
+func replaceAuditKeyFile(path string, key []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".a2a-audit-key-*")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	defer os.Remove(name) // rename 成功之後這行是 no-op
+	if _, err := tmp.WriteString(hex.EncodeToString(key)); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(name, path)
 }
 
 // readAuditKeyFile 讀取並解碼既有的金鑰檔，格式不對或讀不到都回 nil（不是
