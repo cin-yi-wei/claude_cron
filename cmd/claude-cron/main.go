@@ -308,9 +308,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 			sink := agent.NewAgentOutputSink(supCtx, *root, cfg)
 			driver.SetOutputSink(sink)
 			ex := agent.NewSandboxExecutor(*root, agent.TmuxSessionManager{})
+			cb := agent.NewCallbackDispatcher(supCtx, *root)
 			go func() {
 				defer sink.Wait()
 				defer driver.StopAll()
+				defer cb.Wait()
 				t := time.NewTicker(cfg.A2ACycleInterval())
 				defer t.Stop()
 				for {
@@ -332,6 +334,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 						fmt.Fprintf(stdout, "a2a drain: %v\n", err)
 					}
 					agent.EnsureSandboxDrivers(supCtx, *root, driver)
+					// callback 的唯一觸發點。collect / sweep 之後才掃，於是這一
+					// 輪剛進入終止狀態的 row 也會被撿到。
+					agent.EnqueueTerminalCallbacks(*root, cb)
 					if _, err := agent.PruneTasks(*root, time.Now()); err != nil {
 						fmt.Fprintf(stdout, "a2a prune: %v\n", err)
 					}

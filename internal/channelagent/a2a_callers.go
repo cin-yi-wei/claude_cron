@@ -30,6 +30,10 @@ type Caller struct {
 	// GrantLevel 是這個呼叫方的授權上限。有效等級 = min(請求的 level,
 	// GrantLevel)。空值解讀為 readonly(見 EffectiveGrantLevel)。
 	GrantLevel GrantLevel `json:"grant_level,omitempty"`
+	// CallbackURL / CallbackToken 只能由 operator 經 CLI / admin API 設定，
+	// 永遠不接受請求提供 —— 否則這台主機就成了 SSRF 跳板。
+	CallbackURL   string `json:"callback_url,omitempty"`
+	CallbackToken string `json:"callback_token,omitempty"`
 }
 
 type CallerStore struct {
@@ -132,6 +136,19 @@ func (s *CallerStore) SetGrantLevel(id string, l GrantLevel) bool {
 	for i := range s.Callers {
 		if s.Callers[i].CallerID == id {
 			s.Callers[i].GrantLevel = l
+			return true
+		}
+	}
+	return false
+}
+
+// SetCallback 設定這個呼叫方的完成回呼目的地。呼叫端（admin API / CLI）必須
+// 先跑過 ValidateCallbackURL —— 目的地在「設定當下與觸發當下」各驗一次。
+func (s *CallerStore) SetCallback(id, url, token string) bool {
+	for i := range s.Callers {
+		if s.Callers[i].CallerID == id {
+			s.Callers[i].CallbackURL = url
+			s.Callers[i].CallbackToken = token
 			return true
 		}
 	}

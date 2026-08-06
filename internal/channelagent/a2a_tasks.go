@@ -91,6 +91,9 @@ type A2ATask struct {
 	// 確定性函式，failed 沙盒又依 forensics 規則保留，沒有這個比對，殘留在
 	// outbox/pending 的舊結果檔會把重用同一 contextId 的新任務立刻判為完成。
 	LastMessageID string `json:"last_message_id,omitempty"`
+	// CallbackState 追蹤完成回呼，與任務狀態機完全解耦：""（未處理）→
+	// pending → sent / failed / dropped。任務狀態永遠不看這個欄位。
+	CallbackState string `json:"callback_state,omitempty"`
 }
 
 type TaskStore struct {

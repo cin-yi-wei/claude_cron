@@ -243,6 +243,17 @@ func (s *A2AServer) handleMessageSend(w http.ResponseWriter, r *http.Request, re
 		writeRPC(w, RPCFail(req.ID, RPCInvalidParams, "malformed params"))
 		return
 	}
+	// 目的地由 operator 記在 caller 記錄裡。請求裡出現任何 callback 欄位就
+	// 拒絕整個請求（不是忽略）—— 忽略會讓呼叫方以為自己設定成功了。
+	var rawParams map[string]json.RawMessage
+	_ = json.Unmarshal(req.Params, &rawParams)
+	for _, k := range []string{"callbackUrl", "callback_url", "webhookUrl", "webhook_url", "callbackToken", "callback_token"} {
+		if _, present := rawParams[k]; present {
+			s.auditBadRequest(r, caller.CallerID, p.Agent, p.ContextID, "request supplied a callback destination")
+			writeRPC(w, RPCFail(req.ID, RPCInvalidParams, "callback destinations are configured by the operator, not per request"))
+			return
+		}
+	}
 	if p.Agent == "" || p.ContextID == "" {
 		writeRPC(w, RPCFail(req.ID, RPCInvalidParams, "agent and contextId are required"))
 		return
