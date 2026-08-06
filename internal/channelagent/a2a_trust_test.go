@@ -91,3 +91,25 @@ func TestEnsureFolderTrustedRejectsMissingConfig(t *testing.T) {
 		t.Fatal("a missing config must error rather than create a fresh one")
 	}
 }
+
+// The config is live-shared by every running claude process on the box; a
+// crash mid-write must never leave it truncated or with altered
+// permissions. This pins both the atomic-write behaviour and that the
+// original file mode survives the rewrite unchanged.
+func TestEnsureFolderTrustedPreservesFileMode(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "claude.json")
+	if err := os.WriteFile(path, []byte(`{"projects":{}}`), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureFolderTrusted(path, "/p/x"); err != nil {
+		t.Fatalf("EnsureFolderTrusted: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if info.Mode().Perm() != 0o640 {
+		t.Fatalf("file mode changed: got %v, want 0640", info.Mode().Perm())
+	}
+}

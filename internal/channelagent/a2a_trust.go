@@ -31,6 +31,10 @@ func ClaudeConfigPath() string {
 // 其他不相關的 session。設定檔不存在時絕不會建立新檔：那代表環境本身有問題，
 // 生出一個空殼設定檔只會把問題蓋住。
 func EnsureFolderTrusted(configPath, projectDir string) error {
+	info, err := os.Stat(configPath)
+	if err != nil {
+		return fmt.Errorf("stat claude config: %w", err)
+	}
 	blob, err := os.ReadFile(configPath)
 	if err != nil {
 		return fmt.Errorf("read claude config: %w", err)
@@ -59,5 +63,11 @@ func EnsureFolderTrusted(configPath, projectDir string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(configPath, out, 0o600)
+	// 這支設定檔是這台機器上所有 claude 行程共用的活生生設定檔，中斷（OOM、被
+	// kill）發生在寫到一半時絕不能留下截斷或無效 JSON 的檔案——那會讓機器上
+	// 每一個正在跑的 claude 行程（含 production bindings 與 control session
+	// 本身）全部壞掉。因此透過 AtomicWriteFile 寫到同目錄的暫存檔再 rename，
+	// 檔案永遠只會是「舊內容」或「新內容」兩者之一。權限沿用原檔的 mode，
+	// 不要硬編一個假的權限值誤導讀者以為這裡會收緊權限。
+	return AtomicWriteFile(configPath, out, info.Mode())
 }
