@@ -1513,6 +1513,126 @@ func TestSweepRevokesRunningTaskWhoseCallerWasRevoked(t *testing.T) {
 	}
 }
 
+// TestSweepRevokesRunningTaskWhoseAgentWasGenuinelyRemoved is the contrast
+// case for the D10-5 fix below: an agent that is truly gone from
+// agents.json (not merely filtered by LoadAgents's new validation) must
+// still revoke every running task under it — revokeReasonForRunningTask
+// must not become a blanket amnesty for every "agent not found" case, only
+// for the specific one D10-5 targets.
+func TestSweepRevokesRunningTaskWhoseAgentWasGenuinelyRemoved(t *testing.T) {
+	root := t.TempDir()
+	var callers CallerStore
+	_ = callers.Register("peer-a", "s")
+	callers.Approve("peer-a", []string{"read"})
+	_ = SaveCallers(root, callers)
+	// agents.json 存在，但完全沒有 "a" 這個名字——操作者真的把它刪掉了。
+	var agents AgentStore
+	_ = agents.Add(Agent{Name: "other", ProjectDir: "/p/other", Capabilities: []string{"read"}, Enabled: true})
+	_ = SaveAgents(root, agents)
+
+	now := time.Now().UTC()
+	const session = "aa-a-c1"
+	var s TaskStore
+	s.Upsert(A2ATask{
+		ContextID: "c1", TaskID: "t1", Agent: "a", CallerID: "peer-a", Level: GrantReadOnly,
+		Session: session, State: TaskWorking, StartedAt: now.Format(time.RFC3339),
+	})
+	if err := SaveTasks(root, s); err != nil {
+		t.Fatalf("SaveTasks: %v", err)
+	}
+	if err := WriteSandboxPolicy(root, SandboxPolicy{
+		Session: session, ContextID: "c1", Agent: "a", CallerID: "peer-a", Level: GrantReadOnly,
+	}); err != nil {
+		t.Fatalf("WriteSandboxPolicy: %v", err)
+	}
+
+	fake := &FakeSessionManager{}
+	if _, _, err := SweepTimeouts(context.Background(), root, fake, now, nil); err != nil {
+		t.Fatalf("SweepTimeouts: %v", err)
+	}
+
+	got, _ := LoadTasks(root)
+	tk, _ := got.ByContext("c1")
+	if tk.State != TaskFailed {
+		t.Fatalf("state = %s, want failed: a genuinely removed agent must still revoke its running tasks", tk.State)
+	}
+	if len(fake.Stopped) != 1 || fake.Stopped[0] != session {
+		t.Fatalf("session not stopped: %#v", fake.Stopped)
+	}
+}
+
+// TestSweepDoesNotRevokeRunningTaskWhenAgentOnlyFailedValidation pins the
+// D10-5 fix (round 10 review, Important): LoadAgents now drops any agent
+// whose channel_id collides with a binding's (or whose name is invalid),
+// closing a routing-hijack hole (D10-c). But that filter reacting to an
+// operator creating an UNRELATED binding elsewhere must not have the side
+// effect of revoking every currently-running task for an agent that was,
+// and still is, perfectly validly configured on its own terms — a config
+// coincidence is not a deliberate removal, and treating it as one gives an
+// unrelated action (creating a binding) the power to kill live sandboxes for
+// an agent nobody touched.
+func TestSweepDoesNotRevokeRunningTaskWhenAgentOnlyFailedValidation(t *testing.T) {
+	root := t.TempDir()
+	if err := Init(root); err != nil {
+		t.Fatal(err)
+	}
+	// 一個跟這個 agent 完全無關的 binding，剛好用了同一個 channel_id——
+	// 這才是唯一讓 agent "a" 被 LoadAgents 濾掉的原因，agents.json 裡它自
+	// 己的欄位完全沒改過。
+	seedBinding(t, root, Binding{Name: "w", ChannelID: "chan-1", Worktree: t.TempDir(), Root: pathIn(root, "bindings", "w")})
+
+	var callers CallerStore
+	_ = callers.Register("peer-a", "s")
+	callers.Approve("peer-a", []string{"read"})
+	_ = SaveCallers(root, callers)
+	var agents AgentStore
+	_ = agents.Add(Agent{Name: "a", ProjectDir: "/p/a", ChannelID: "chan-1", Capabilities: []string{"read"}, Enabled: true})
+	_ = SaveAgents(root, agents)
+
+	now := time.Now().UTC()
+	const session = "aa-a-c1"
+	var s TaskStore
+	s.Upsert(A2ATask{
+		ContextID: "c1", TaskID: "t1", Agent: "a", CallerID: "peer-a", Level: GrantReadOnly,
+		Session: session, State: TaskWorking, StartedAt: now.Format(time.RFC3339),
+	})
+	if err := SaveTasks(root, s); err != nil {
+		t.Fatalf("SaveTasks: %v", err)
+	}
+	if err := WriteSandboxPolicy(root, SandboxPolicy{
+		Session: session, ContextID: "c1", Agent: "a", CallerID: "peer-a", Level: GrantReadOnly,
+	}); err != nil {
+		t.Fatalf("WriteSandboxPolicy: %v", err)
+	}
+
+	// 先確認 LoadAgents 真的把它濾掉了——否則這個測試沒測到 D10-5 想擋的
+	// 那條路徑。
+	if got, _ := LoadAgents(root); len(got.Agents) != 0 {
+		t.Fatalf("precondition failed: agent %q should have been filtered by LoadAgents, got %#v", "a", got.Agents)
+	}
+
+	fake := &FakeSessionManager{}
+	if _, _, err := SweepTimeouts(context.Background(), root, fake, now, nil); err != nil {
+		t.Fatalf("SweepTimeouts: %v", err)
+	}
+
+	got, _ := LoadTasks(root)
+	tk, _ := got.ByContext("c1")
+	if tk.State != TaskWorking {
+		t.Fatalf("state = %s, want working: a config coincidence (an unrelated binding sharing this agent's channel_id) must not revoke a running task", tk.State)
+	}
+	if len(fake.Stopped) != 0 {
+		t.Fatalf("session must not be stopped over a validation-only filtering, got Stopped=%#v", fake.Stopped)
+	}
+	pol, err := LoadSandboxPolicy(root, session)
+	if err != nil {
+		t.Fatalf("LoadSandboxPolicy: %v", err)
+	}
+	if pol.Level == GrantRevoked {
+		t.Fatal("sandbox policy must not have been revoked")
+	}
+}
+
 // task 9 review: ordering must be fail-safe in the OTHER direction too — the
 // slower step (stopping the session) failing must never leave the sandbox
 // MORE capable than the (already revoked) policy says. Capability removal

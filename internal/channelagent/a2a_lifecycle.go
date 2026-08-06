@@ -137,6 +137,37 @@ func drainRejectReason(callers CallerStore, agents AgentStore, cerr, aerr error,
 	return ""
 }
 
+// revokeReasonForRunningTask 跟 drainRejectReason 幾乎一樣，只多一層保護，
+// 只用在撤銷偵測（正在跑的 TaskWorking / TaskDispatching row），DrainQueue
+// 的新派送閘門不走這條、繼續用原本嚴格的 drainRejectReason（round 10 review,
+// Important，D10-5）：
+//
+// LoadAgents 現在會把名字不合法、或 channel_id 撞到某個 binding 的 agent
+// 濾掉。那個過濾對「要不要接受新派送」是對的——不該讓一個名字有問題的 agent
+// 建立新沙盒；但對「要不要撤銷已經在跑的任務」是不對的——一次手誤（打錯字、
+// channel_id 恰好跟某個新建的 binding 撞了）不該跟操作者刻意把 agent
+// 刪除/停用有一樣的後果。於是這裡在 drainRejectReason 判定「agent 不存在」
+// 之後，多查一次未過濾的 rawAgents：如果那個名字其實還在 agents.json 裡
+// （只是這次驗證沒通過），就不算數——放過這一列，留給 operator 修好設定檔，
+// 而不是連坐撤銷這個 agent 名下每一個正在跑的沙盒。rawErr != nil（讀檔失敗）
+// 時無法分辨兩種情況，保守起見維持 drainRejectReason 原本的判定（fail
+// closed，跟 cerr/aerr 那條既有規則一致的方向）。
+func revokeReasonForRunningTask(callers CallerStore, agents, rawAgents AgentStore, rawErr error, t A2ATask) string {
+	reason := drainRejectReason(callers, agents, nil, nil, t)
+	if reason == "" {
+		return ""
+	}
+	if rawErr == nil {
+		if _, filteredOK := agents.Get(t.Agent); !filteredOK {
+			if _, rawOK := rawAgents.Get(t.Agent); rawOK {
+				log.Printf("a2a: sweep: agent %q 在 agents.json 裡存在但這次驗證沒通過（名稱不合法或 channel_id 跟某個 binding 撞了），不對它正在跑的任務做撤銷——這是設定檔問題，不是操作者刻意移除；context %s 保持原樣，等 operator 修好設定", t.Agent, t.ContextID)
+				return ""
+			}
+		}
+	}
+	return reason
+}
+
 func failDrainedTask(root string, t A2ATask, reason string) {
 	_ = WithTasks(root, func(tasks *TaskStore) error {
 		cur, ok := tasks.ByContext(t.ContextID)
@@ -733,6 +764,15 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 	if len(authCheck) > 0 {
 		callers, cerr := LoadCallers(root)
 		agents, aerr := LoadAgents(root)
+		// round 10 review, Important（D10-5）：LoadAgents 現在會把名字不合法、
+		// 或 channel_id 撞到某個 binding 的 agent 濾掉（見 a2a_agents.go）。
+		// 那個過濾對「要不要接受新派送」是對的，但對「要不要撤銷已經在跑的
+		// 任務」是不對的——一次手誤（打錯字、channel_id 恰好跟某個新建的
+		// binding 撞了）不該跟操作者刻意把 agent 刪除/停用有一樣的後果（連
+		// 坐撤銷這個 agent 名下每一個正在跑的沙盒）。這裡額外讀一份未過濾
+		// 的版本，只用來分辨下面 revokeReasonForRunningTask 裡「agents.json
+		// 真的沒有這個名字」跟「有，只是這次驗證沒通過」兩種情況。
+		rawAgents, rawErr := LoadAgentsRaw(root)
 		// round 9 review, Critical：讀 callers.json / agents.json 失敗，對
 		// 「還沒起沙盒」的排隊工作該當拒絕（fail closed，DrainQueue 走的
 		// 路，drainRejectReason 對它維持原樣）；但對「已經在跑」的沙盒，套
@@ -747,7 +787,7 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 			authCheck = nil
 		}
 		for _, t := range authCheck {
-			reason := drainRejectReason(callers, agents, nil, nil, t)
+			reason := revokeReasonForRunningTask(callers, agents, rawAgents, rawErr, t)
 			if reason == "" {
 				continue
 			}

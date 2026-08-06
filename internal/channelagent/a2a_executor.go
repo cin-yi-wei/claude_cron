@@ -287,6 +287,14 @@ func (e *SandboxExecutor) Start(ctx context.Context, task A2ATask, prompt string
 		}
 		if ok && !CanTransition(cur.State, TaskWorking) {
 			log.Printf("a2a: session %s is running but task %s is in state %s (not submitted); leaving its state alone", task.Session, task.ContextID, cur.State)
+			// round 10 review, Minor（D10-4）：Inject 已經真的把訊息送進沙盒
+			// 了——即使這一列現在的狀態不允許我們把它轉成 working，這個
+			// MessageID 仍然是「這個沙盒最後收到的訊息」，CollectResults 之
+			// 後得靠它才能比對到接下來的回覆。只更新 LastMessageID，其餘欄
+			// 位（尤其是 State）完全不動——那屬於別的路徑（不是這次 Start
+			// 呼叫）的決定權。
+			cur.LastMessageID = task.LastMessageID
+			tasks.Upsert(cur)
 			return nil
 		}
 		task.State = TaskWorking

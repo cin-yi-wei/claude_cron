@@ -389,6 +389,68 @@ func TestSandboxExecutorTearsDownSessionWhenTaskCanceledDuringStart(t *testing.T
 	}
 }
 
+// alreadyWorkingDuringInject wraps FakeSessionManager and, immediately after
+// a successful Inject, flips the on-disk row to TaskWorking — simulating the
+// row having already moved past whatever CanTransition(_, TaskWorking) will
+// accept by the time Start reaches its final check (the exact branch that
+// used to return without recording anything).
+type alreadyWorkingDuringInject struct {
+	*FakeSessionManager
+	root      string
+	contextID string
+}
+
+func (a *alreadyWorkingDuringInject) Inject(ctx context.Context, root string, msg SourceMessage) error {
+	if err := a.FakeSessionManager.Inject(ctx, root, msg); err != nil {
+		return err
+	}
+	tasks, _ := LoadTasks(a.root)
+	if cur, ok := tasks.ByContext(a.contextID); ok {
+		cur.State = TaskWorking
+		tasks.Upsert(cur)
+		_ = SaveTasks(a.root, tasks)
+	}
+	return nil
+}
+
+// TestSandboxExecutorRecordsLastMessageIDEvenWhenRowCannotTransition pins
+// the D10-4 fix (round 10 review, Minor): Inject already genuinely delivered
+// the message into a real sandbox before Start's final check runs, so
+// whatever the row's bookkeeping ends up being at that point, LastMessageID
+// must still be recorded — without it, CollectResults can never match this
+// sandbox's eventual reply and the task is permanently unmatchable, even
+// though the branch itself correctly leaves State/Detail alone (that
+// decision belongs to whichever path actually put the row in this state).
+func TestSandboxExecutorRecordsLastMessageIDEvenWhenRowCannotTransition(t *testing.T) {
+	root := t.TempDir()
+	agents := AgentStore{}
+	_ = agents.Add(Agent{Name: "codereview", ProjectDir: "/p/x", Enabled: true})
+	_ = SaveAgents(root, agents)
+
+	session := SessionNameFor("codereview", "c1")
+	spy := &alreadyWorkingDuringInject{FakeSessionManager: &FakeSessionManager{}, root: root, contextID: "c1"}
+	ex := NewSandboxExecutor(root, spy)
+
+	task := A2ATask{ContextID: "c1", Agent: "codereview", Session: session, State: TaskSubmitted, Level: GrantReadOnly}
+	seedSubmittedTask(t, root, task)
+
+	if err := ex.Start(context.Background(), task, "x"); err != nil {
+		t.Fatalf("Start should report success, got: %v", err)
+	}
+
+	tasks, _ := LoadTasks(root)
+	got, ok := tasks.ByContext("c1")
+	if !ok {
+		t.Fatal("task row must not disappear")
+	}
+	if got.State != TaskWorking {
+		t.Fatalf("state must be left exactly as the concurrent actor set it, got %s", got.State)
+	}
+	if got.LastMessageID == "" {
+		t.Fatal("LastMessageID must still be recorded even when the row could not be transitioned by this call")
+	}
+}
+
 // realInjectSessionManager fakes every side effect except Inject: workspace
 // creation and session start/stop never touch git or tmux (inherited from
 // FakeSessionManager), but Inject calls the real IngestMessages. That is the

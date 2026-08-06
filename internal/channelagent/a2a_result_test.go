@@ -260,21 +260,212 @@ func TestCollectResultsAcceptsItsOwnResultFile(t *testing.T) {
 	}
 }
 
-// 壞掉的結果檔不能每 10 秒被重讀一次直到永遠。
+// 壞掉的結果檔不能每 10 秒被重讀一次直到永遠——但也不能一撞見就隔離
+// （round 10 review, Important, D10-2）：寫入合約是先寫 .tmp 再 rename
+// （adapters.go 的 BuildClaudePrompt），但那個合約只活在提示詞裡，不是程式
+// 碼保證的；一個沒照合約走、直接寫最終檔名的 agent，可能剛好在被讀到的那
+// 一刻還沒寫完。第一次撞見必須放過，只有超過寬限期還讀不動，才真的判定壞
+// 掉並隔離。
 func TestCollectResultsQuarantinesUnreadableResultFiles(t *testing.T) {
 	root := t.TempDir()
 	session := SessionNameFor("a", "c1")
 	sandbox := SandboxRoot(root, session)
 	_ = Init(sandbox)
-	if err := os.WriteFile(pathIn(sandbox, "outbox", "pending", "broken.json"), []byte("{not json"), 0o644); err != nil {
+	brokenPath := pathIn(sandbox, "outbox", "pending", "broken.json")
+	if err := os.WriteFile(brokenPath, []byte("{not json"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	var s TaskStore
 	s.Upsert(A2ATask{ContextID: "c1", TaskID: "t1", Agent: "a", Session: session, State: TaskWorking, LastMessageID: "m"})
 	_ = SaveTasks(root, s)
 
+	// 第一次撞見:檔案剛剛才寫(mtime = 現在),必須放過,不能立刻隔離——
+	// 否則一份其實正在被寫、寫完就會完整的檔案,會被這一輪的誤判活活摧毀。
+	_, _ = CollectResults(root, time.Now())
+	if _, err := os.Stat(brokenPath); err != nil {
+		t.Fatalf("a fresh unreadable result file must survive the first pass (not be quarantined immediately): %v", err)
+	}
+	if _, err := os.Stat(pathIn(sandbox, "outbox", "failed", "broken.json")); err == nil {
+		t.Fatal("must not quarantine an unreadable result file on first sight")
+	}
+
+	// 把 mtime 往回調到寬限期之前,模擬「這份檔案已經壞掉很久了,不是正在寫」。
+	old := time.Now().Add(-unreadableResultGrace - time.Second)
+	if err := os.Chtimes(brokenPath, old, old); err != nil {
+		t.Fatal(err)
+	}
+
 	_, _ = CollectResults(root, time.Now())
 	if _, err := os.Stat(pathIn(sandbox, "outbox", "failed", "broken.json")); err != nil {
-		t.Fatalf("an unreadable result file must be moved to outbox/failed: %v", err)
+		t.Fatalf("a genuinely broken result file past the grace period must be moved to outbox/failed: %v", err)
+	}
+	if _, err := os.Stat(brokenPath); !os.IsNotExist(err) {
+		t.Fatalf("quarantined file must be gone from pending, stat err = %v", err)
+	}
+}
+
+// TestCollectResultsRejectsResultForASupersededMessage pins the D10-1 fix
+// (round 10 review, Important): CollectResults's lock-free scan (stage 1)
+// can match a result file against the row's LastMessageID as it stood at
+// scan time, but DeliverFollowUp can advance that same row's LastMessageID
+// in place (same TaskID, same Session — a genuine follow-up, not a
+// resubmission) before stage 2 ever reacquires tasksMu to apply what stage 1
+// found. Without re-running resultBelongsToTask under the lock against the
+// row's CURRENT LastMessageID, the stale match would be applied: the caller
+// would receive the answer to the message it already superseded, and the
+// real answer to the one it actually asked would land on a now-terminal row
+// and never be collectable again.
+//
+// The window between stage 1 and stage 2 has no lock a test could hold to
+// force this interleaving deterministically — stage 1 never touches
+// tasksMu, so a real goroutine racing an unsynchronized mutation against it
+// would itself be a timing gamble (nothing blocks stage 1 relative to that
+// mutation; whichever the scheduler happens to run first decides the
+// outcome). Instead this uses collectResultsAfterScanForTest, a seam that
+// runs synchronously between stage 1 and stage 2 inside the SAME call to
+// CollectResults, no goroutine involved: by the time it fires, stage 1 has
+// deterministically already matched the m1 file against LastMessageID="m1"
+// (that's the only way `found` becomes non-empty and this hook ever gets
+// called at all); the hook then advances the row to LastMessageID="m2" —
+// same TaskID, same Session, exactly what DeliverFollowUp does in place —
+// before stage 2 gets to run.
+func TestCollectResultsRejectsResultForASupersededMessage(t *testing.T) {
+	root := t.TempDir()
+	session := SessionNameFor("a", "c1")
+	sandbox := SandboxRoot(root, session)
+	if err := Init(sandbox); err != nil {
+		t.Fatal(err)
+	}
+
+	// m1 的結果先出現——這是 CollectResults 鎖外掃描（stage 1）會找到並通過
+	// 比對的那一份。
+	if err := AtomicWriteJSON(pathIn(sandbox, "outbox", "pending", "r1.json"), OutputJob{
+		Schema: 1, JobID: "20260101T000000Z-m1-abcdef012345", Send: true, Text: "answer-to-m1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var s TaskStore
+	s.Upsert(A2ATask{ContextID: "c1", TaskID: "t1", Agent: "a", Session: session, State: TaskWorking, LastMessageID: "m1"})
+	if err := SaveTasks(root, s); err != nil {
+		t.Fatal(err)
+	}
+
+	hookRan := false
+	collectResultsAfterScanForTest = func() {
+		hookRan = true
+		// 模擬 DeliverFollowUp 把同一個 row 的 LastMessageID 從 m1 換成
+		// m2:TaskID、Session 都沒變。這一刻 stage 1 已經確定跑完(否則這
+		// 個 hook 不會被呼叫),stage 2 還沒開始——這正是要測的窗口。
+		advanced, err := LoadTasks(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cur, ok := advanced.ByContext("c1")
+		if !ok {
+			t.Fatal("task c1 missing")
+		}
+		cur.LastMessageID = "m2"
+		advanced.Upsert(cur)
+		if err := SaveTasks(root, advanced); err != nil {
+			t.Fatal(err)
+		}
+	}
+	defer func() { collectResultsAfterScanForTest = nil }()
+
+	n, err := CollectResults(root, time.Now())
+	if err != nil {
+		t.Fatalf("CollectResults: %v", err)
+	}
+	if !hookRan {
+		t.Fatal("test hook never ran — stage 1 did not find the m1 match, this test proves nothing")
+	}
+	if n != 0 {
+		t.Fatalf("promoted = %d, want 0: a result for the superseded message m1 must not complete a task now waiting on m2", n)
+	}
+	got, _ := LoadTasks(root)
+	tk, _ := got.ByContext("c1")
+	if tk.State != TaskWorking {
+		t.Fatalf("state = %s, want working: m1's stale result must not have completed the task", tk.State)
+	}
+	if tk.Detail == "answer-to-m1" {
+		t.Fatal("task.Detail was overwritten with the superseded message's answer")
+	}
+	if _, err := os.Stat(pathIn(sandbox, "outbox", "pending", "r1.json")); err != nil {
+		t.Fatalf("m1's result file must stay in pending, unconsumed: %v", err)
+	}
+
+	// m2 的真正回覆後來才出現，必須仍然收得到——不能因為上面那次誤判就永
+	// 遠卡住。
+	collectResultsAfterScanForTest = nil // 第二輪不再需要這個 hook
+	if err := AtomicWriteJSON(pathIn(sandbox, "outbox", "pending", "r2.json"), OutputJob{
+		Schema: 1, JobID: "20260101T000100Z-m2-abcdef012345", Send: true, Text: "answer-to-m2",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	n, err = CollectResults(root, time.Now())
+	if err != nil || n != 1 {
+		t.Fatalf("second collect = %d err = %v, want 1", n, err)
+	}
+	got, _ = LoadTasks(root)
+	tk, _ = got.ByContext("c1")
+	if tk.State != TaskCompleted || tk.Detail != "answer-to-m2" {
+		t.Fatalf("task = %#v, want completed with m2's answer", tk)
+	}
+}
+
+// TestCollectResultsScanRunsWithoutTasksMu proves the actual mechanism the
+// three-stage split exists for, not just an outward symptom of it: stage 1's
+// directory scan and quarantine of an unreadable result file need no lock at
+// all. tasksMu is held for the whole test (any WithTasks call anywhere would
+// stall on it for as long as the test wants); if the split were ever
+// reverted back into a single WithTasks callback — even while keeping every
+// other change in this task, including LastMessageID — the quarantine below
+// would itself be stuck behind that same lock and this test would time out
+// waiting for it.
+func TestCollectResultsScanRunsWithoutTasksMu(t *testing.T) {
+	root := t.TempDir()
+	session := SessionNameFor("a", "c1")
+	sandbox := SandboxRoot(root, session)
+	if err := Init(sandbox); err != nil {
+		t.Fatal(err)
+	}
+	brokenPath := pathIn(sandbox, "outbox", "pending", "broken.json")
+	if err := os.WriteFile(brokenPath, []byte("{not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-unreadableResultGrace - time.Second)
+	if err := os.Chtimes(brokenPath, old, old); err != nil {
+		t.Fatal(err)
+	}
+	var s TaskStore
+	s.Upsert(A2ATask{ContextID: "c1", TaskID: "t1", Agent: "a", Session: session, State: TaskWorking, LastMessageID: "m"})
+	if err := SaveTasks(root, s); err != nil {
+		t.Fatal(err)
+	}
+
+	tasksMu.Lock()
+	done := make(chan struct{})
+	go func() {
+		_, _ = CollectResults(root, time.Now())
+		close(done)
+	}()
+
+	failedPath := pathIn(sandbox, "outbox", "failed", "broken.json")
+	deadline := time.Now().Add(2 * time.Second)
+	quarantined := false
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(failedPath); err == nil {
+			quarantined = true
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	// 不論上面等到還是逾時都先放手、等 goroutine 收尾，絕不留一個還在跑、
+	// 之後可能跟下一個測試搶同一個 package 級 tasksMu 的殘留 goroutine。
+	tasksMu.Unlock()
+	<-done
+
+	if !quarantined {
+		t.Fatal("stage 1's quarantine never happened while tasksMu was held externally by this test — some I/O must still be running inside the lock")
 	}
 }

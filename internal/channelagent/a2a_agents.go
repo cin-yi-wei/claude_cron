@@ -48,11 +48,8 @@ func AgentsPath(root string) string { return filepath.Join(root, "agents.json") 
 //
 // 兩者都是「跳過並 log」而不是整份載入失敗：一個手寫錯誤不該讓所有 agent 消失。
 func LoadAgents(root string) (AgentStore, error) {
-	var s AgentStore
-	if err := ReadJSON(AgentsPath(root), &s); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return AgentStore{}, nil
-		}
+	s, err := LoadAgentsRaw(root)
+	if err != nil {
 		return AgentStore{}, err
 	}
 	bindingChannels := map[string]string{}
@@ -76,6 +73,22 @@ func LoadAgents(root string) (AgentStore, error) {
 		kept = append(kept, a)
 	}
 	s.Agents = kept
+	return s, nil
+}
+
+// LoadAgentsRaw 讀 agents.json，不套用 LoadAgents 的任何驗證過濾。只給撤銷
+// 偵測用（a2a_lifecycle.go 的 revokeReasonForRunningTask）：分辨一個 agent
+// 名字是「agents.json 裡真的不存在」還是「存在，只是這次驗證沒通過」——兩者
+// 對正在跑的任務後果不該一樣（round 10 review, Important，D10-5）。一般的
+// 新派送路徑（Start、DrainQueue）必須繼續呼叫 LoadAgents，絕不能改用這個。
+func LoadAgentsRaw(root string) (AgentStore, error) {
+	var s AgentStore
+	if err := ReadJSON(AgentsPath(root), &s); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return AgentStore{}, nil
+		}
+		return AgentStore{}, err
+	}
 	return s, nil
 }
 

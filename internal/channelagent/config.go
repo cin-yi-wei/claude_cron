@@ -2,7 +2,9 @@ package channelagent
 
 import (
 	"fmt"
+	"net"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -271,8 +273,69 @@ func LoadConfig(root string) (Config, error) {
 	// address，但從來沒有人驗證過。admin API 能建立可執行 shell 的 binding，
 	// 讓它跟對外監聽器共用位址等於把管理面公開出去。只在 A2A 啟用時檢查，
 	// 於是預設關閉的既有部署行為完全不變。
-	if cfg.A2A.Enabled && cfg.Admin.Listen != "" && cfg.A2AListen() == cfg.Admin.Listen {
-		return Config{}, fmt.Errorf("a2a.listen (%s) must differ from admin.listen: the admin API can create shell-capable bindings and must never be externally reachable", cfg.A2AListen())
+	//
+	// round 10 review, Minor（D10-3）：比對用 addrsCollide，不是原始字串
+	// ==——":8787"、"127.0.0.1:8787"、"localhost:8787" 是同一台機器上同一個
+	// port 的三種不同寫法，naive 字串比對會被其中任何一種寫法差異繞過這道
+	// 檢查。
+	if cfg.A2A.Enabled && cfg.Admin.Listen != "" && addrsCollide(cfg.A2AListen(), cfg.Admin.Listen) {
+		return Config{}, fmt.Errorf("a2a.listen (%s) must differ from admin.listen (%s): the admin API can create shell-capable bindings and must never be externally reachable", cfg.A2AListen(), cfg.Admin.Listen)
 	}
 	return cfg, nil
+}
+
+// addrsCollide reports whether two "host:port" listen addresses would
+// actually contend for the same port on the same machine. A raw string
+// comparison misses this: ":8787", "127.0.0.1:8787" and "localhost:8787" are
+// three different strings but the same port on the same loopback interface.
+// Addresses that don't parse as host:port are compared as raw strings —
+// conservative, since an unparseable value can't be proven equivalent to
+// anything else.
+func addrsCollide(a, b string) bool {
+	if a == "" || b == "" {
+		return a == b
+	}
+	ha, pa, erra := net.SplitHostPort(a)
+	hb, pb, errb := net.SplitHostPort(b)
+	if erra != nil || errb != nil {
+		return a == b
+	}
+	if pa != pb {
+		return false
+	}
+	na, nb := normalizeListenHost(ha), normalizeListenHost(hb)
+	// 「所有介面」跟任何其他寫法在同一個 port 上都算衝突——它本身就佔住了
+	// 那個 port 在每一個介面上，包括 loopback，不是只跟另一個「所有介面」
+	// 寫法衝突。
+	if na == anyInterfaceHost || nb == anyInterfaceHost {
+		return true
+	}
+	return na == nb
+}
+
+// anyInterfaceHost is normalizeListenHost's sentinel for "binds every
+// interface" (""/"0.0.0.0"/"::"). Never a value a real hostname could
+// produce (leading NUL), so it can't collide with normalizeListenHost's
+// literal default branch by accident.
+const anyInterfaceHost = "\x00any"
+
+// loopbackHost is normalizeListenHost's sentinel for "127.0.0.1"/"localhost"/
+// "::1" — three different spellings of the same loopback interface.
+const loopbackHost = "\x00loopback"
+
+// normalizeListenHost 把「同一台機器上等價」的幾種常見寫法收斂成同一個代表
+// 值：空字串／0.0.0.0／:: 代表「所有介面」；127.0.0.1／localhost／::1 收斂
+// 成 loopback。其他寫法只做小寫化、原樣比對，刻意不做 DNS 解析：這個檢查只
+// 在 serve 啟動載入設定檔時跑一次，不該為了比對兩個位址而依賴網路或本機解
+// 析器行為（測試也不可以因此需要真的網路存取）。
+func normalizeListenHost(h string) string {
+	h = strings.ToLower(h)
+	switch h {
+	case "", "0.0.0.0", "::":
+		return anyInterfaceHost
+	case "127.0.0.1", "localhost", "::1":
+		return loopbackHost
+	default:
+		return h
+	}
 }
