@@ -3,6 +3,7 @@ package channelagent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -41,6 +42,13 @@ func (s *StubExecutor) Start(_ context.Context, task A2ATask, prompt string) err
 // contextId, so distinct valid contextIds can never collide downstream.
 // 1-128 chars is a conservative bound on a caller-supplied token.
 var a2aContextIDRe = regexp.MustCompile(`^[A-Za-z0-9]{1,128}$`)
+
+// errContextHijack signals, from inside a WithTasks callback, that the
+// submitted contextId is actively owned by a different caller. Returning it
+// makes WithTasks discard the attempted upsert; handleRPC then distinguishes
+// it from a genuine store error to decide which RPC failure and audit entry
+// to write.
+var errContextHijack = errors.New("a2a: contextId is owned by another caller")
 
 // MessageSendParams is the params body of the message/send method.
 type MessageSendParams struct {
@@ -176,20 +184,38 @@ func (s *A2AServer) handleRPC(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	tasks, err := LoadTasks(s.Root)
-	if err != nil {
-		writeRPC(w, RPCFail(req.ID, RPCInternalError, "task store unavailable"))
-		return
+	task := A2ATask{
+		ContextID: p.ContextID,
+		TaskID:    p.TaskID,
+		Agent:     agent.Name,
+		CallerID:  caller.CallerID,
+		Session:   SessionNameFor(agent.Name, p.ContextID),
+		State:     TaskSubmitted,
+		StartedAt: time.Now().UTC().Format(time.RFC3339),
+		Prompt:    p.Text,
 	}
 
 	// contextId is caller-controlled. Without an ownership check, a second
 	// caller could reuse another caller's contextId and overwrite its task row
 	// (CallerID, Session, State), making the original task unbookkeepable. A
 	// caller may only reuse a contextId that is unclaimed, terminal, or
-	// already theirs.
-	if existing, ok := tasks.ByContext(p.ContextID); ok {
-		active := existing.State == TaskSubmitted || existing.State == TaskWorking
-		if active && existing.CallerID != caller.CallerID {
+	// already theirs. The load, ownership check and upsert all happen inside
+	// one WithTasks call so a concurrent request can never interleave between
+	// the check and the write (the lost-update bug this task closes).
+	var hasCapacity bool
+	err = WithTasks(s.Root, func(tasks *TaskStore) error {
+		if existing, ok := tasks.ByContext(p.ContextID); ok {
+			active := existing.State == TaskSubmitted || existing.State == TaskWorking
+			if active && existing.CallerID != caller.CallerID {
+				return errContextHijack
+			}
+		}
+		tasks.Upsert(task)
+		hasCapacity = HasCapacity(*tasks)
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, errContextHijack) {
 			// The most operationally important audit path: this looks like a
 			// deliberate attempt to interfere with another caller's task, so
 			// the entry must record both who was rejected (caller.CallerID)
@@ -205,25 +231,11 @@ func (s *A2AServer) handleRPC(w http.ResponseWriter, r *http.Request) {
 			writeRPC(w, RPCFail(req.ID, RPCForbidden, "contextId is owned by another caller"))
 			return
 		}
-	}
-
-	task := A2ATask{
-		ContextID: p.ContextID,
-		TaskID:    p.TaskID,
-		Agent:     agent.Name,
-		CallerID:  caller.CallerID,
-		Session:   SessionNameFor(agent.Name, p.ContextID),
-		State:     TaskSubmitted,
-		StartedAt: time.Now().UTC().Format(time.RFC3339),
-		Prompt:    p.Text,
-	}
-	tasks.Upsert(task)
-	if err := SaveTasks(s.Root, tasks); err != nil {
 		writeRPC(w, RPCFail(req.ID, RPCInternalError, "cannot persist task"))
 		return
 	}
 
-	if !HasCapacity(tasks) {
+	if !hasCapacity {
 		// Queued, not rejected: it stays in TaskSubmitted for DrainQueue.
 		// Distinct outcome from "accepted": no sandbox actually started.
 		_ = AppendAudit(s.Root, AuditEntry{
@@ -253,8 +265,10 @@ func (s *A2AServer) handleRPC(w http.ResponseWriter, r *http.Request) {
 		log.Printf("a2a: dispatch failed for task %s (agent=%s contextId=%s): %v", task.TaskID, task.Agent, task.ContextID, err)
 		task.State = TaskFailed
 		task.Detail = err.Error()
-		tasks.Upsert(task)
-		if serr := SaveTasks(s.Root, tasks); serr != nil {
+		if serr := WithTasks(s.Root, func(tasks *TaskStore) error {
+			tasks.Upsert(task)
+			return nil
+		}); serr != nil {
 			log.Printf("a2a: failed to persist failed task state for %s/%s: %v", task.Agent, task.ContextID, serr)
 		}
 		// This branch mutates task state (TaskFailed) and must not do so without

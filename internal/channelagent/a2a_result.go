@@ -1,12 +1,19 @@
 package channelagent
 
 import (
+	"errors"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 )
+
+// errNothingCollected signals, from inside a WithTasks callback, that no task
+// was promoted this pass. Returning it makes WithTasks discard the (empty)
+// mutation and skip the save entirely — CollectResults must still write
+// nothing when it promotes nothing.
+var errNothingCollected = errors.New("a2a: no results to collect")
 
 // ResultFor reports the sandbox's reply text, if it has written one. Completion
 // is detected by the same outbox-file convention every worker already uses —
@@ -51,35 +58,37 @@ func pendingResultFile(root string, task A2ATask) (path string, text string, ok 
 // out of pending (into outbox/sent, mirroring sender.go's convention) the
 // moment it completes the task it belongs to.
 func CollectResults(root string, now time.Time) (int, error) {
-	tasks, err := LoadTasks(root)
-	if err != nil {
-		return 0, err
-	}
 	n := 0
-	for i := range tasks.Tasks {
-		t := tasks.Tasks[i]
-		if !CanTransition(t.State, TaskCompleted) {
-			continue
-		}
-		path, text, ok := pendingResultFile(root, t)
-		if !ok {
-			continue
-		}
-		t.State = TaskCompleted
-		t.Detail = text
-		t.CompletedAt = now.UTC().Format(time.RFC3339)
-		tasks.Tasks[i] = t
-		n++
+	err := WithTasks(root, func(tasks *TaskStore) error {
+		for i := range tasks.Tasks {
+			t := tasks.Tasks[i]
+			if !CanTransition(t.State, TaskCompleted) {
+				continue
+			}
+			path, text, ok := pendingResultFile(root, t)
+			if !ok {
+				continue
+			}
+			t.State = TaskCompleted
+			t.Detail = text
+			t.CompletedAt = now.UTC().Format(time.RFC3339)
+			tasks.Tasks[i] = t
+			n++
 
-		// The task genuinely completed; a failure to relocate the result
-		// file must not undo or block that. Log it rather than erroring.
-		sentPath := filepath.Join(pathIn(SandboxRoot(root, t.Session), "outbox", "sent"), filepath.Base(path))
-		if err := moveFile(path, sentPath); err != nil {
-			log.Printf("a2a: task %s completed but moving result file %s to %s failed: %v", t.ContextID, path, sentPath, err)
+			// The task genuinely completed; a failure to relocate the result
+			// file must not undo or block that. Log it rather than erroring.
+			sentPath := filepath.Join(pathIn(SandboxRoot(root, t.Session), "outbox", "sent"), filepath.Base(path))
+			if err := moveFile(path, sentPath); err != nil {
+				log.Printf("a2a: task %s completed but moving result file %s to %s failed: %v", t.ContextID, path, sentPath, err)
+			}
 		}
-	}
-	if n == 0 {
+		if n == 0 {
+			return errNothingCollected
+		}
+		return nil
+	})
+	if errors.Is(err, errNothingCollected) {
 		return 0, nil
 	}
-	return n, SaveTasks(root, tasks)
+	return n, err
 }

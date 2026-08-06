@@ -1,6 +1,8 @@
 package channelagent
 
 import (
+	"bytes"
+	"os"
 	"sync"
 	"testing"
 )
@@ -52,5 +54,22 @@ func TestWithTasksDoesNotSaveWhenCallbackErrors(t *testing.T) {
 	got, _ := LoadTasks(root)
 	if len(got.Tasks) != 1 || got.Tasks[0].ContextID != "keep" {
 		t.Fatalf("callback error must discard the mutation, got %#v", got.Tasks)
+	}
+}
+
+// No LoadTasks/SaveTasks pair may remain outside WithTasks: an unguarded
+// read-modify-write reintroduces the lost update this task exists to close.
+func TestNoUnguardedTaskStoreMutations(t *testing.T) {
+	files := []string{
+		"a2a_server.go", "a2a_executor.go", "a2a_result.go", "a2a_lifecycle.go",
+	}
+	for _, name := range files {
+		src, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		if bytes.Contains(src, []byte("SaveTasks(")) {
+			t.Errorf("%s calls SaveTasks directly; route it through WithTasks", name)
+		}
 	}
 }

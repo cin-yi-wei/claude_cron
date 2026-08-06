@@ -60,15 +60,13 @@ var errTaskAlreadyTerminal = errors.New("task already reached a terminal state")
 // latent-issue finding — unreachable today, but task 11 adds a sweep that
 // would hit it).
 func (e *SandboxExecutor) persist(task A2ATask) error {
-	tasks, err := LoadTasks(e.Root)
-	if err != nil {
-		return err
-	}
-	if cur, ok := tasks.ByContext(task.ContextID); ok && isTerminal(cur.State) {
-		return errTaskAlreadyTerminal
-	}
-	tasks.Upsert(task)
-	return SaveTasks(e.Root, tasks)
+	return WithTasks(e.Root, func(tasks *TaskStore) error {
+		if cur, ok := tasks.ByContext(task.ContextID); ok && isTerminal(cur.State) {
+			return errTaskAlreadyTerminal
+		}
+		tasks.Upsert(task)
+		return nil
+	})
 }
 
 // markFailed persists task as TaskFailed. The caller's in-memory task (which
@@ -80,28 +78,27 @@ func (e *SandboxExecutor) persist(task A2ATask) error {
 // identity with the stale row would strand a real worktree or tmux session
 // that nothing could then find to clean up.
 func (e *SandboxExecutor) markFailed(task A2ATask, detail string) {
-	tasks, err := LoadTasks(e.Root)
-	if err != nil {
-		return
-	}
-	worktree, branch, session := task.Worktree, task.Branch, task.Session
-	if cur, ok := tasks.ByContext(task.ContextID); ok {
-		task = cur
-	}
-	if worktree != "" {
-		task.Worktree = worktree
-	}
-	if branch != "" {
-		task.Branch = branch
-	}
-	if session != "" {
-		task.Session = session
-	}
-	task.State = TaskFailed
-	task.Detail = detail
-	task.CompletedAt = time.Now().UTC().Format(time.RFC3339)
-	tasks.Upsert(task)
-	_ = SaveTasks(e.Root, tasks)
+	_ = WithTasks(e.Root, func(tasks *TaskStore) error {
+		worktree, branch, session := task.Worktree, task.Branch, task.Session
+		t := task
+		if cur, ok := tasks.ByContext(t.ContextID); ok {
+			t = cur
+		}
+		if worktree != "" {
+			t.Worktree = worktree
+		}
+		if branch != "" {
+			t.Branch = branch
+		}
+		if session != "" {
+			t.Session = session
+		}
+		t.State = TaskFailed
+		t.Detail = detail
+		t.CompletedAt = time.Now().UTC().Format(time.RFC3339)
+		tasks.Upsert(t)
+		return nil
+	})
 }
 
 func (e *SandboxExecutor) Start(ctx context.Context, task A2ATask, prompt string) error {
@@ -172,35 +169,48 @@ func (e *SandboxExecutor) Start(ctx context.Context, task A2ATask, prompt string
 	// terminal state gets clobbered back to Failed). Every branch here
 	// reports success; the two terminal-vs-transient sub-cases are handled
 	// distinctly (task-8 review round 2, finding 2).
-	tasks, err := LoadTasks(e.Root)
-	if err != nil {
-		// Transient I/O error: the session really is running and we simply
-		// couldn't reload the store to record TaskWorking. Log and leave the
-		// row for the normal lifecycle to reconcile rather than fabricate a
-		// failure that contradicts the sandbox's actual state.
-		log.Printf("a2a: session %s is running but reloading the task store to mark it working failed: %v", task.Session, err)
-		return nil
-	}
-	if cur, ok := tasks.ByContext(task.ContextID); ok && isTerminal(cur.State) {
-		// The task reached a terminal state (most likely canceled) while its
-		// session was starting: EnsureWorkspace/Start/Inject already
-		// succeeded, so a real tmux session is now running that this
-		// terminal row does not reference. Tear it down — the work in
-		// flight is correctly discarded, since the task was already decided
-		// — and leave the terminal row exactly as it is.
-		if serr := e.Sessions.Stop(ctx, task.Session); serr != nil {
-			log.Printf("a2a: task %s reached terminal state %s during start; stopping its orphaned session %s failed: %v", task.ContextID, cur.State, task.Session, serr)
+	// The store load, terminal/transition checks and the TaskWorking upsert
+	// all happen inside one WithTasks call so a concurrent cancel/complete
+	// can never land between the check and the write. Sessions.Stop is kept
+	// OUTSIDE the callback: it shells out to tmux, and nothing that touches a
+	// session or process may run while tasksMu is held.
+	var (
+		stopOrphan  bool
+		orphanState TaskState
+	)
+	err = WithTasks(e.Root, func(tasks *TaskStore) error {
+		if cur, ok := tasks.ByContext(task.ContextID); ok && isTerminal(cur.State) {
+			// The task reached a terminal state (most likely canceled) while
+			// its session was starting: EnsureWorkspace/Start/Inject already
+			// succeeded, so a real tmux session is now running that this
+			// terminal row does not reference. Leave the terminal row exactly
+			// as it is; the actual teardown happens after this call returns.
+			stopOrphan = true
+			orphanState = cur.State
+			return nil
 		}
+		if cur, ok := tasks.ByContext(task.ContextID); ok && !CanTransition(cur.State, TaskWorking) {
+			log.Printf("a2a: session %s is running but task %s is in state %s (not submitted); leaving its state alone", task.Session, task.ContextID, cur.State)
+			return nil
+		}
+		task.State = TaskWorking
+		tasks.Upsert(task)
+		return nil
+	})
+	if err != nil {
+		// Transient I/O error (on load or on save): the session really is
+		// running and we simply couldn't persist TaskWorking. Log and leave
+		// the row for the normal lifecycle to reconcile rather than
+		// fabricate a failure that contradicts the sandbox's actual state.
+		log.Printf("a2a: session %s is running but recording its state failed: %v", task.Session, err)
 		return nil
 	}
-	if cur, ok := tasks.ByContext(task.ContextID); ok && !CanTransition(cur.State, TaskWorking) {
-		log.Printf("a2a: session %s is running but task %s is in state %s (not submitted); leaving its state alone", task.Session, task.ContextID, cur.State)
-		return nil
-	}
-	task.State = TaskWorking
-	tasks.Upsert(task)
-	if err := SaveTasks(e.Root, tasks); err != nil {
-		log.Printf("a2a: session %s is running but persisting TaskWorking failed: %v", task.Session, err)
+	if stopOrphan {
+		// The work in flight is correctly discarded, since the task was
+		// already decided elsewhere.
+		if serr := e.Sessions.Stop(ctx, task.Session); serr != nil {
+			log.Printf("a2a: task %s reached terminal state %s during start; stopping its orphaned session %s failed: %v", task.ContextID, orphanState, task.Session, serr)
+		}
 	}
 	return nil
 }
