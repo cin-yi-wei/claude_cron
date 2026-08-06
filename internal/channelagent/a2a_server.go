@@ -147,6 +147,17 @@ func (s *A2AServer) handleRPC(w http.ResponseWriter, r *http.Request) {
 	// declares zero capabilities must fail closed, not open — it must state
 	// what it needs in order to be callable at all.
 	if len(agent.Capabilities) == 0 {
+		// Distinct outcome from an ordinary grant denial: this means the agent
+		// itself is misconfigured (nothing to grant), not that the caller is
+		// under-privileged.
+		_ = AppendAudit(s.Root, AuditEntry{
+			At:        time.Now().UTC().Format(time.RFC3339),
+			CallerID:  caller.CallerID,
+			Agent:     p.Agent,
+			ContextID: p.ContextID,
+			Summary:   p.Text,
+			Outcome:   "forbidden_no_capabilities",
+		})
 		writeRPC(w, RPCFail(req.ID, RPCForbidden, "agent "+agent.Name+" declares no capabilities and cannot be called"))
 		return
 	}
@@ -179,6 +190,18 @@ func (s *A2AServer) handleRPC(w http.ResponseWriter, r *http.Request) {
 	if existing, ok := tasks.ByContext(p.ContextID); ok {
 		active := existing.State == TaskSubmitted || existing.State == TaskWorking
 		if active && existing.CallerID != caller.CallerID {
+			// The most operationally important audit path: this looks like a
+			// deliberate attempt to interfere with another caller's task, so
+			// the entry must record both who was rejected (caller.CallerID)
+			// and which contextId they tried to take over.
+			_ = AppendAudit(s.Root, AuditEntry{
+				At:        time.Now().UTC().Format(time.RFC3339),
+				CallerID:  caller.CallerID,
+				Agent:     p.Agent,
+				ContextID: p.ContextID,
+				Summary:   p.Text,
+				Outcome:   "forbidden_hijack",
+			})
 			writeRPC(w, RPCFail(req.ID, RPCForbidden, "contextId is owned by another caller"))
 			return
 		}
@@ -202,6 +225,16 @@ func (s *A2AServer) handleRPC(w http.ResponseWriter, r *http.Request) {
 
 	if !HasCapacity(tasks) {
 		// Queued, not rejected: it stays in TaskSubmitted for DrainQueue.
+		// Distinct outcome from "accepted": no sandbox actually started.
+		_ = AppendAudit(s.Root, AuditEntry{
+			At:        time.Now().UTC().Format(time.RFC3339),
+			CallerID:  caller.CallerID,
+			Agent:     agent.Name,
+			ContextID: task.ContextID,
+			TaskID:    task.TaskID,
+			Summary:   p.Text,
+			Outcome:   "queued",
+		})
 		writeRPC(w, RPCOK(req.ID, map[string]any{
 			"contextId": task.ContextID,
 			"taskId":    task.TaskID,

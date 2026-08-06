@@ -371,25 +371,94 @@ func TestOversizedBodyNeverProducesATask(t *testing.T) {
 
 // Task 12: every accepted/rejected delegation must leave a durable audit
 // trail — the endpoint is externally reachable with no interactive prompt,
-// so this log is the only record of who asked for what.
+// so this log is the only record of who asked for what. Fix round: the
+// header's "every accepted/rejected delegation" promise covers five distinct
+// outcomes, each of which must be independently distinguishable in the log.
 func TestServerWritesAuditOnAcceptAndDeny(t *testing.T) {
 	s, root := newTestA2AServer(t)
+
+	// 1: ordinary accept.
 	postRPC(t, s.Handler(), "secret-1", `{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"agent":"codereview","contextId":"c1","text":"ok"}}`)
 
+	// 2: ordinary grant denial (agent needs "write", caller only granted "read").
 	agents, _ := LoadAgents(root)
 	agents.Agents[0].Capabilities = []string{"write"}
 	_ = SaveAgents(root, agents)
 	postRPC(t, s.Handler(), "secret-1", `{"jsonrpc":"2.0","id":2,"method":"message/send","params":{"agent":"codereview","contextId":"c2","text":"denied"}}`)
 
+	// 3: agent misconfigured — declares zero capabilities, so nothing can be
+	// granted. Must be distinguishable from an ordinary grant denial.
+	agents, _ = LoadAgents(root)
+	agents.Agents[0].Capabilities = nil
+	_ = SaveAgents(root, agents)
+	postRPC(t, s.Handler(), "secret-1", `{"jsonrpc":"2.0","id":3,"method":"message/send","params":{"agent":"codereview","contextId":"c3","text":"nobody home"}}`)
+
+	// Restore a grantable capability for the remaining scenarios.
+	agents, _ = LoadAgents(root)
+	agents.Agents[0].Capabilities = []string{"read"}
+	_ = SaveAgents(root, agents)
+
+	// 4: peer-a opens context c4 (accepted); then peer-b tries to hijack it —
+	// the most important path, since it looks like a deliberate attempt to
+	// interfere with another caller's task. The entry must name both the
+	// rejected caller and the contextId.
+	postRPC(t, s.Handler(), "secret-1", `{"jsonrpc":"2.0","id":4,"method":"message/send","params":{"agent":"codereview","contextId":"c4","text":"mine"}}`)
+	callers, _ := LoadCallers(root)
+	_ = callers.Register("peer-b", "secret-2")
+	callers.Approve("peer-b", []string{"read"})
+	_ = SaveCallers(root, callers)
+	postRPC(t, s.Handler(), "secret-2", `{"jsonrpc":"2.0","id":5,"method":"message/send","params":{"agent":"codereview","contextId":"c4","text":"steal"}}`)
+
+	// 5: accepted but held at capacity — queued, not dispatched. Fill every
+	// sandbox slot directly (bypassing the RPC, matching the pattern used in
+	// a2a_lifecycle_test.go) so the next message/send is queued rather than
+	// started.
+	tasks, _ := LoadTasks(root)
+	for i := 0; i < MaxConcurrentSandboxes; i++ {
+		tasks.Upsert(A2ATask{ContextID: "full" + string(rune('a'+i)), Agent: "codereview", State: TaskWorking})
+	}
+	if err := SaveTasks(root, tasks); err != nil {
+		t.Fatalf("SaveTasks: %v", err)
+	}
+	postRPC(t, s.Handler(), "secret-1", `{"jsonrpc":"2.0","id":6,"method":"message/send","params":{"agent":"codereview","contextId":"c5","text":"hold please"}}`)
+
 	entries, err := ReadAudit(root)
 	if err != nil {
 		t.Fatalf("ReadAudit: %v", err)
 	}
-	if len(entries) != 2 {
-		t.Fatalf("audit entries = %d, want 2", len(entries))
+	if len(entries) != 6 {
+		t.Fatalf("audit entries = %d, want 6: %#v", len(entries), entries)
 	}
-	if entries[0].Outcome != "accepted" || entries[1].Outcome != "forbidden" {
-		t.Fatalf("outcomes = %q, %q", entries[0].Outcome, entries[1].Outcome)
+
+	if entries[0].Outcome != "accepted" {
+		t.Fatalf("entry 0 outcome = %q, want accepted", entries[0].Outcome)
+	}
+	if entries[1].Outcome != "forbidden" {
+		t.Fatalf("entry 1 outcome = %q, want forbidden", entries[1].Outcome)
+	}
+	if entries[2].Outcome != "forbidden_no_capabilities" {
+		t.Fatalf("entry 2 outcome = %q, want forbidden_no_capabilities (misconfigured agent, distinct from an ordinary grant denial)", entries[2].Outcome)
+	}
+	if entries[2].Outcome == entries[1].Outcome {
+		t.Fatal("zero-capability denial must not share an outcome string with an ordinary grant denial")
+	}
+	if entries[3].Outcome != "accepted" {
+		t.Fatalf("entry 3 (peer-a opens c4) outcome = %q, want accepted", entries[3].Outcome)
+	}
+	if entries[4].Outcome != "forbidden_hijack" {
+		t.Fatalf("entry 4 outcome = %q, want forbidden_hijack", entries[4].Outcome)
+	}
+	if entries[4].CallerID != "peer-b" {
+		t.Fatalf("hijack entry CallerID = %q, want peer-b (the rejected caller)", entries[4].CallerID)
+	}
+	if entries[4].ContextID != "c4" {
+		t.Fatalf("hijack entry ContextID = %q, want c4", entries[4].ContextID)
+	}
+	if entries[5].Outcome != "queued" {
+		t.Fatalf("entry 5 outcome = %q, want queued", entries[5].Outcome)
+	}
+	if entries[5].Outcome == entries[0].Outcome || entries[5].Outcome == entries[3].Outcome {
+		t.Fatal("a queued (not dispatched) task must not share an outcome string with an accepted (dispatched) task")
 	}
 }
 
