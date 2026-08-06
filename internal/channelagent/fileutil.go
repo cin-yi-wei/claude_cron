@@ -8,12 +8,19 @@ import (
 )
 
 func AtomicWriteJSON(path string, v any) error {
+	return AtomicWriteJSONMode(path, v, 0o644)
+}
+
+// AtomicWriteJSONMode 與 AtomicWriteJSON 相同，但可指定檔案權限。沙盒政策檔與
+// callers.json 需要 0600（前者帶授權等級、後者帶明文 bearer 憑證），而
+// AtomicWriteJSON 的預設 0644 被 bindings.json / triggers.json 等共用，不能改。
+func AtomicWriteJSONMode(path string, v any, mode os.FileMode) error {
 	payload, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
 		return err
 	}
 	payload = append(payload, '\n')
-	return AtomicWriteFile(path, payload, 0o644)
+	return AtomicWriteFile(path, payload, mode)
 }
 
 func AtomicWriteFile(path string, payload []byte, mode os.FileMode) error {
