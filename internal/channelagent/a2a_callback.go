@@ -85,6 +85,15 @@ type CallbackDispatcher struct {
 	retryDelays []time.Duration
 }
 
+// defaultCallbackResolver 是正式路徑的 DNS 解析器。抽出來讓 admin API 與
+// dispatcher 共用同一份行為。
+func defaultCallbackResolver(host string) ([]net.IP, error) {
+	// 逾時封頂：見 callbackResolveTimeout 的說明。
+	rctx, cancel := context.WithTimeout(context.Background(), callbackResolveTimeout)
+	defer cancel()
+	return net.DefaultResolver.LookupIP(rctx, "ip", host)
+}
+
 func NewCallbackDispatcher(ctx context.Context, root string) *CallbackDispatcher {
 	d := &CallbackDispatcher{
 		root:         root,
@@ -92,14 +101,9 @@ func NewCallbackDispatcher(ctx context.Context, root string) *CallbackDispatcher
 		done:         make(chan struct{}),
 		inflight:     map[string]bool{},
 		resolveFails: map[string]int{},
-		resolve: func(host string) ([]net.IP, error) {
-			// 逾時封頂：見 callbackResolveTimeout 的說明。
-			rctx, cancel := context.WithTimeout(context.Background(), callbackResolveTimeout)
-			defer cancel()
-			return net.DefaultResolver.LookupIP(rctx, "ip", host)
-		},
-		scheme:      "https",
-		retryDelays: callbackRetryDelays,
+		resolve:      defaultCallbackResolver,
+		scheme:       "https",
+		retryDelays:  callbackRetryDelays,
 	}
 	d.transport = &http.Transport{
 		// DialContext 一律連「這次呼叫已經驗證過的 IP」，不重新解析 hostname

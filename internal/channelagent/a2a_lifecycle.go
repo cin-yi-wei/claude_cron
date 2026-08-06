@@ -3,6 +3,7 @@ package channelagent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"os"
 	"sort"
@@ -1242,4 +1243,122 @@ func removeCandidate(ctx context.Context, root string, sm SessionManager, c recl
 		}
 	}
 	return ok
+}
+
+// terminateTasks 是 caller revoke / agent disable / task cancel 共用的終止流程。
+// 全部在 serve 行程內一次完成，順序刻意如下：
+//
+//  1. WithTasks：所有 match 且非終止的 row → TaskCanceled + detail + CompletedAt；
+//     收集它們的 session。
+//  2. 鎖外，且**在停任何東西之前**：把每個 session 的政策檔覆寫成 revoked。
+//     這樣 in-flight 的工具呼叫在 session 真的死掉之前就已經開始被 gate 拒絕。
+//  3. 停 driver（Stop 阻塞到 goroutine 真的結束），再停 tmux session。
+//  4. worktree 回收交給下一趟 sweep —— 它已經會回收 canceled 且仍持有
+//     session/worktree 的 row，這裡重做一次只會跟 sweep 搶同一組路徑。
+//
+// 回傳被終止的 row 數。
+func terminateTasks(ctx context.Context, root string, match func(A2ATask) bool, detail string, sm SessionManager, stopper SandboxStopper) (int, error) {
+	var sessions []string
+	n := 0
+	err := WithTasks(root, func(tasks *TaskStore) error {
+		now := time.Now().UTC().Format(time.RFC3339)
+		for i := range tasks.Tasks {
+			t := tasks.Tasks[i]
+			if isTerminal(t.State) || !match(t) {
+				continue
+			}
+			t.State = TaskCanceled
+			t.Detail = detail
+			t.CompletedAt = now
+			tasks.Tasks[i] = t
+			if t.Session != "" {
+				sessions = append(sessions, t.Session)
+			}
+			n++
+		}
+		if n == 0 {
+			return errNothingSwept
+		}
+		return nil
+	})
+	if err != nil && !errors.Is(err, errNothingSwept) {
+		return 0, err
+	}
+	for _, s := range sessions {
+		if rerr := RevokeSandboxPolicy(root, s); rerr != nil {
+			log.Printf("a2a: 撤銷 %s 的政策檔失敗（session 仍會被停掉）: %v", s, rerr)
+		}
+	}
+	for _, s := range sessions {
+		if stopper != nil {
+			stopper.Stop(s)
+		}
+		if sm != nil {
+			_ = sm.Stop(ctx, s)
+		}
+	}
+	return n, nil
+}
+
+// RevokeCaller 撤銷一個呼叫方，並讓撤銷對已排隊與執行中的工作生效。
+func RevokeCaller(ctx context.Context, root, id string, sm SessionManager, stopper SandboxStopper) (int, error) {
+	callers, err := LoadCallers(root)
+	if err != nil {
+		return 0, err
+	}
+	if !callers.Revoke(id) {
+		return 0, fmt.Errorf("unknown caller %q", id)
+	}
+	if err := SaveCallers(root, callers); err != nil {
+		return 0, err
+	}
+	n, err := terminateTasks(ctx, root, func(t A2ATask) bool { return t.CallerID == id }, "caller revoked", sm, stopper)
+	_ = AppendAudit(root, AuditEntry{
+		At:       time.Now().UTC().Format(time.RFC3339),
+		CallerID: id,
+		Summary:  fmt.Sprintf("revoked by operator; %d in-flight task(s) canceled", n),
+		Outcome:  "revoked",
+	})
+	return n, err
+}
+
+// DisableAgent 停用一個 agent，語意與 RevokeCaller 相同。
+func DisableAgent(ctx context.Context, root, name string, sm SessionManager, stopper SandboxStopper) (int, error) {
+	agents, err := LoadAgents(root)
+	if err != nil {
+		return 0, err
+	}
+	a, ok := agents.Get(name)
+	if !ok {
+		return 0, fmt.Errorf("unknown agent %q", name)
+	}
+	a.Enabled = false
+	agents.Remove(name)
+	if err := agents.Add(a); err != nil {
+		return 0, err
+	}
+	if err := SaveAgents(root, agents); err != nil {
+		return 0, err
+	}
+	n, err := terminateTasks(ctx, root, func(t A2ATask) bool { return t.Agent == name }, "agent disabled", sm, stopper)
+	_ = AppendAudit(root, AuditEntry{
+		At:      time.Now().UTC().Format(time.RFC3339),
+		Agent:   name,
+		Summary: fmt.Sprintf("disabled by operator; %d in-flight task(s) canceled", n),
+		Outcome: "agent_disabled",
+	})
+	return n, err
+}
+
+// CancelTask 取消單一 contextId。取消由 operator 執行 —— 刻意不做
+// tasks/cancel RPC，呼叫方自助取消屬獨立範圍決策（規格第五節）。
+func CancelTask(ctx context.Context, root, contextID string, sm SessionManager, stopper SandboxStopper) error {
+	n, err := terminateTasks(ctx, root, func(t A2ATask) bool { return t.ContextID == contextID }, "canceled by operator", sm, stopper)
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("no active task for contextId %q", contextID)
+	}
+	return nil
 }

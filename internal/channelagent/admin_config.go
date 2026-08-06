@@ -45,6 +45,7 @@ type adminConfigDTO struct {
 	TelegramChatID    string `json:"telegram_chat_id"`
 	DiscordTokenSet   bool   `json:"discord_token_set"`
 	TelegramTokenSet  bool   `json:"telegram_token_set"`
+	A2AEnabled        bool   `json:"a2a_enabled"`
 }
 
 // adminConfigUpdate is the PUT /api/config body: pointer fields so only the
@@ -75,6 +76,7 @@ func (h AdminHandler) getConfig(w http.ResponseWriter) {
 		TelegramChatID:    cfg.Control.TelegramChatID,
 		DiscordTokenSet:   os.Getenv(cfg.Discord.TokenEnv) != "",
 		TelegramTokenSet:  os.Getenv(cfg.Telegram.TokenEnv) != "",
+		A2AEnabled:        cfg.A2A.Enabled,
 	})
 }
 

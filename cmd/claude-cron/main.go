@@ -301,6 +301,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 		// starts no extra goroutine at all — byte-for-byte unchanged behaviour.
 		if !*once && cfg.A2A.Enabled {
 			driver := agent.NewSandboxDriver(*root, timeout)
+			// 讓 admin API 的撤銷停得掉真的 driver goroutine 與真的 tmux
+			// session。整段都在 cfg.A2A.Enabled 底下，關掉時 admin 完全不知道
+			// 有這回事。
+			agent.SetA2ARuntime(agent.TmuxSessionManager{}, driver)
 			// AgentOutputSink streams each sandbox's transcript activity (plus
 			// lifecycle/error lines) to its agent's Discord channel — output-only
 			// visibility, never an input path (see a2a_channel.go). Tied to

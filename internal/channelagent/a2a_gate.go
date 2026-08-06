@@ -1,6 +1,8 @@
 package channelagent
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -608,4 +610,42 @@ func AppendGateLog(root string, e GateLogEntry) error {
 	}
 	// 與 a2a-audit.jsonl 共用同一套 rotation 規則。
 	return appendRotatingLine(GateLogPath(root), append(blob, '\n'), 0o600)
+}
+
+// ReadGateLog 讀 a2a-gate.jsonl，可選擇只留某個 session，回傳最後 limit 筆。
+// 與 ReadAudit 同樣耐壞行：一行壞掉或超長不得讓整份讀不出來。
+func ReadGateLog(root, session string, limit int) ([]GateLogEntry, error) {
+	f, err := os.Open(GateLogPath(root))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer f.Close()
+
+	var out []GateLogEntry
+	r := bufio.NewReaderSize(f, 64*1024)
+	for {
+		line, rErr := r.ReadBytes('\n')
+		if len(line) > 0 {
+			line = bytes.TrimRight(line, "\r\n")
+			if len(line) > 0 && len(line) <= maxAuditLineBytes {
+				var e GateLogEntry
+				if json.Unmarshal(line, &e) == nil && (session == "" || e.Session == session) {
+					out = append(out, e)
+				}
+			}
+		}
+		if rErr != nil {
+			if !errors.Is(rErr, io.EOF) {
+				return out, rErr
+			}
+			break
+		}
+	}
+	if limit > 0 && len(out) > limit {
+		out = out[len(out)-limit:]
+	}
+	return out, nil
 }
