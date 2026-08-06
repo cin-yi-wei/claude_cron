@@ -214,3 +214,121 @@ func TestSweepLeavesFailedSandboxForensics(t *testing.T) {
 		t.Fatalf("failed sandbox must not be torn down: %#v", fake.Stopped)
 	}
 }
+
+// TestSweepCancelsWorkingTaskWithEmptyStartedAt guards against a malformed
+// timestamp permanently defeating the hard-timeout backstop: a non-terminal
+// task with no StartedAt at all is at least as likely to be wedged as one
+// with a known-old timestamp, so it must be sweep-eligible rather than
+// skipped forever.
+func TestSweepCancelsWorkingTaskWithEmptyStartedAt(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	var s TaskStore
+	s.Upsert(A2ATask{
+		ContextID: "c1", Session: "aa-a-c1", State: TaskWorking,
+		StartedAt: "",
+	})
+	_ = SaveTasks(root, s)
+
+	fake := &FakeSessionManager{}
+	canceled, _, err := SweepTimeouts(context.Background(), root, fake, now)
+	if err != nil {
+		t.Fatalf("SweepTimeouts: %v", err)
+	}
+	if canceled != 1 {
+		t.Fatalf("canceled = %d, want 1 (empty StartedAt must be sweep-eligible)", canceled)
+	}
+	if len(fake.Stopped) != 1 || fake.Stopped[0] != "aa-a-c1" {
+		t.Fatalf("session not stopped: %#v", fake.Stopped)
+	}
+	got, _ := LoadTasks(root)
+	tk, _ := got.ByContext("c1")
+	if tk.State != TaskCanceled {
+		t.Fatalf("state = %s, want canceled", tk.State)
+	}
+	if tk.Detail == "" || tk.Detail == "hard timeout exceeded" {
+		t.Fatalf("Detail = %q, want a distinct reason naming the unreadable timestamp", tk.Detail)
+	}
+}
+
+// TestSweepCancelsWorkingTaskWithGarbageStartedAt is the same guard for a
+// StartedAt that fails to parse (as opposed to being merely empty).
+func TestSweepCancelsWorkingTaskWithGarbageStartedAt(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	var s TaskStore
+	s.Upsert(A2ATask{
+		ContextID: "c1", Session: "aa-a-c1", State: TaskSubmitted,
+		StartedAt: "not-a-timestamp",
+	})
+	_ = SaveTasks(root, s)
+
+	fake := &FakeSessionManager{}
+	canceled, _, err := SweepTimeouts(context.Background(), root, fake, now)
+	if err != nil {
+		t.Fatalf("SweepTimeouts: %v", err)
+	}
+	if canceled != 1 {
+		t.Fatalf("canceled = %d, want 1 (garbage StartedAt must be sweep-eligible)", canceled)
+	}
+	if len(fake.Stopped) != 1 || fake.Stopped[0] != "aa-a-c1" {
+		t.Fatalf("session not stopped: %#v", fake.Stopped)
+	}
+	got, _ := LoadTasks(root)
+	tk, _ := got.ByContext("c1")
+	if tk.State != TaskCanceled {
+		t.Fatalf("state = %s, want canceled", tk.State)
+	}
+	if tk.Detail == "" || tk.Detail == "hard timeout exceeded" {
+		t.Fatalf("Detail = %q, want a distinct reason naming the unreadable timestamp", tk.Detail)
+	}
+}
+
+// TestSweepReclaimsCompletedTaskWithUnparseableCompletedAt applies the same
+// reasoning to the retention path: an unparseable CompletedAt on a completed
+// task must not pin its sandbox forever.
+func TestSweepReclaimsCompletedTaskWithUnparseableCompletedAt(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	var s TaskStore
+	s.Upsert(A2ATask{
+		ContextID: "c1", Session: "aa-a-c1", State: TaskCompleted,
+		CompletedAt: "garbage",
+	})
+	_ = SaveTasks(root, s)
+
+	fake := &FakeSessionManager{}
+	_, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now)
+	if err != nil {
+		t.Fatalf("SweepTimeouts: %v", err)
+	}
+	if reclaimed != 1 {
+		t.Fatalf("reclaimed = %d, want 1 (unparseable CompletedAt must be sweep-eligible)", reclaimed)
+	}
+	if len(fake.Stopped) != 1 || fake.Stopped[0] != "aa-a-c1" {
+		t.Fatalf("wrong session reclaimed: %#v", fake.Stopped)
+	}
+}
+
+// TestSweepLeavesFailedSandboxForensicsEvenWithGarbageTimestamp pins that the
+// forensics exemption is not weakened by the corrupt-timestamp fix: a failed
+// task must never be reclaimed, regardless of how unreadable its CompletedAt
+// is.
+func TestSweepLeavesFailedSandboxForensicsEvenWithGarbageTimestamp(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	var s TaskStore
+	s.Upsert(A2ATask{
+		ContextID: "c1", Session: "aa-a-c1", State: TaskFailed,
+		CompletedAt: "garbage",
+	})
+	_ = SaveTasks(root, s)
+
+	fake := &FakeSessionManager{}
+	if _, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now); err != nil || reclaimed != 0 {
+		t.Fatalf("failed sandboxes must be kept even with a corrupt timestamp: reclaimed=%d err=%v", reclaimed, err)
+	}
+	if len(fake.Stopped) != 0 {
+		t.Fatalf("failed sandbox must not be torn down: %#v", fake.Stopped)
+	}
+}

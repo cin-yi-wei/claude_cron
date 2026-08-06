@@ -2,6 +2,7 @@ package channelagent
 
 import (
 	"context"
+	"log"
 	"time"
 )
 
@@ -88,21 +89,46 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 		t := tasks.Tasks[i]
 		switch t.State {
 		case TaskWorking, TaskSubmitted:
+			if !CanTransition(t.State, TaskCanceled) {
+				continue
+			}
+			// A missing or corrupt StartedAt must NOT pin this task's
+			// sandbox forever: HardTimeout exists precisely as the backstop
+			// against a wedged sandbox, and a task with unreadable state is
+			// among the most likely to be wedged. Treat it as sweep-eligible
+			// immediately (we cannot compute elapsed time), but record and
+			// log a distinct reason so an operator can tell a corrupt-data
+			// cancel apart from an ordinary hard timeout.
+			var reason string
 			started, ok := parseRFC3339(t.StartedAt)
-			if !ok || now.Sub(started) < HardTimeout {
+			switch {
+			case !ok:
+				reason = "start time unreadable (missing or corrupt StartedAt); canceled as a hard-timeout backstop"
+				log.Printf("a2a: sweep: task %s (session %s) has an unparseable StartedAt %q; canceling rather than leaving it unreclaimable forever", t.ContextID, t.Session, t.StartedAt)
+			case now.Sub(started) >= HardTimeout:
+				reason = "hard timeout exceeded"
+			default:
 				continue
 			}
 			_ = sm.Stop(ctx, t.Session)
 			t.State = TaskCanceled
-			t.Detail = "hard timeout exceeded"
+			t.Detail = reason
 			t.CompletedAt = now.UTC().Format(time.RFC3339)
 			tasks.Tasks[i] = t
 			canceled++
 			changed = true
 		case TaskCompleted:
+			// Same reasoning on the retention path: an unparseable
+			// CompletedAt must make the task reclaim-eligible rather than
+			// pinning its sandbox forever. TaskFailed is a separate switch
+			// case (or rather, no case at all below) and is therefore never
+			// touched here — the forensics exemption is untouched by this.
 			done, ok := parseRFC3339(t.CompletedAt)
-			if !ok || now.Sub(done) < RetainAfterComplete {
+			if ok && now.Sub(done) < RetainAfterComplete {
 				continue
+			}
+			if !ok {
+				log.Printf("a2a: sweep: task %s (session %s) has an unparseable CompletedAt %q; reclaiming its sandbox rather than pinning it forever", t.ContextID, t.Session, t.CompletedAt)
 			}
 			if t.Session == "" {
 				continue
