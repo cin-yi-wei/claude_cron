@@ -21,7 +21,9 @@
       if (tab === 'tasks') tasks = await getJSON(token, '/api/a2a/tasks');
     } catch (e) {
       const s = String(e);
-      err = s.includes('404') ? t('agents.disabled') : s;
+      // 404 也可能是伺服器讀設定檔失敗（a2a_admin.go 把「讀不到」跟「沒啟用」
+      // 當成同一件事），所以訊息不能斷言原因。
+      err = s.includes('404') ? t('agents.unavailable') : s;
     }
     loading = false;
   }
@@ -45,11 +47,28 @@
     try { const j = await sendJSON(token, 'DELETE', url, null); msg = j.status || 'ok'; await load(); }
     catch (e) { err = String(e); }
   }
-  async function setLevel(id, level) {
+  // 等級順序：只有「往上調」需要確認。full 等同把主機交出去（無限制 Bash
+  // 加 MCP），而這是這個頁面上唯一一個會擴權的控制項——撤銷跟刪除都有確認，
+  // 它不能沒有。往下調是收緊權限，不擋。
+  const levelRank = { readonly: 1, develop: 2, full: 3 };
+  async function setLevel(id, level, from) {
+    if ((levelRank[level] || 0) > (levelRank[from] || 0)) {
+      if (!confirm(t('agents.confirmRaiseLevel', { id, level }))) {
+        await load(); // 使用者取消：把 select 拉回伺服器實際持有的值
+        return;
+      }
+    }
     err = '';
-    try { await sendJSON(token, 'POST', `/api/a2a/callers/${encodeURIComponent(id)}/level`, { level }); await load(); }
+    try { await sendJSON(token, 'POST', `/api/a2a/callers/${encodeURIComponent(id)}/level`, { level }); }
     catch (e) { err = String(e); }
+    // 成功或失敗都重讀。失敗時不重讀的話，select 會一直顯示使用者選的那個值，
+    // 而伺服器持有的還是舊的——頁面等於在謊報誰有什麼權限。
+    await load();
   }
+
+  // submitting 擋住連點。註冊尤其要擋：兩次都成功的話，第二次的回應會蓋掉
+  // newCredential，操作者複製到的憑證就屬於另一個呼叫方了。
+  let submitting = $state(false);
 
   function parseCaps(s) {
     return s.split(',').map((x) => x.trim()).filter(Boolean);
@@ -60,6 +79,8 @@
   let af = $state({ name: '', project_dir: '', description: '', capabilities: '', enabled: true });
 
   async function createAgent() {
+    if (submitting) return;
+    submitting = true;
     err = ''; msg = '';
     try {
       await sendJSON(token, 'POST', '/api/a2a/agents', {
@@ -74,6 +95,7 @@
       addingAgent = false;
       load();
     } catch (e) { err = String(e); }
+    finally { submitting = false; }
   }
 
   function removeAgent(name) {
@@ -92,6 +114,8 @@
   let copied = $state(false);
 
   async function registerCaller() {
+    if (submitting) return;
+    submitting = true;
     err = ''; msg = '';
     try {
       const j = await sendJSON(token, 'POST', '/api/a2a/callers', {
@@ -104,12 +128,18 @@
       addingCaller = false;
       load();
     } catch (e) { err = String(e); }
+    finally { submitting = false; }
   }
 
   async function copyCredential() {
     if (!newCredential) return;
-    try { await navigator.clipboard.writeText(newCredential.credential); copied = true; }
-    catch { /* clipboard API unavailable — the text is still selectable on screen */ }
+    // 純 HTTP 之下 navigator.clipboard 是 undefined，原本這裡會靜靜什麼都不做，
+    // 按鈕看起來壞掉。給明確回饋，文字本身仍然可以手動選取。
+    try {
+      if (!navigator.clipboard) throw new Error('clipboard unavailable');
+      await navigator.clipboard.writeText(newCredential.credential);
+      copied = true;
+    } catch { err = t('agents.copyUnavailable'); }
   }
 
   function dismissCredential() {
@@ -184,7 +214,7 @@
           <input type="checkbox" bind:checked={af.enabled} />
           {t('agents.agent.enabledLabel')}
         </label>
-        <button onclick={createAgent}>{t('agents.agent.submit')}</button>
+        <button onclick={createAgent} disabled={submitting}>{t('agents.agent.submit')}</button>
       </div>
     {/if}
 
@@ -249,7 +279,7 @@
       <div class="addform">
         <label>{t('agents.caller.id')} <input bind:value={cf.caller_id} placeholder="peer-a" /></label>
         <label>{t('agents.caller.credentialOptional')} <input bind:value={cf.credential} autocomplete="off" /></label>
-        <button onclick={registerCaller}>{t('agents.caller.submit')}</button>
+        <button onclick={registerCaller} disabled={submitting}>{t('agents.caller.submit')}</button>
       </div>
     {/if}
 
@@ -266,7 +296,7 @@
               <td>{c.caller_id}</td>
               <td>{statusLabel(c.status)}</td>
               <td>
-                <select value={c.grant_level} disabled={c.status === 'revoked'} onchange={(e) => setLevel(c.caller_id, e.currentTarget.value)}>
+                <select value={c.grant_level} disabled={c.status === 'revoked'} onchange={(e) => setLevel(c.caller_id, e.currentTarget.value, c.grant_level)}>
                   {#each ['readonly', 'develop', 'full'] as l}<option value={l}>{l}</option>{/each}
                 </select>
               </td>
