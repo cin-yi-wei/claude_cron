@@ -70,6 +70,20 @@ func TestActiveCountIgnoresTerminalStates(t *testing.T) {
 	}
 }
 
+func TestRunningCountCountsOnlyWorking(t *testing.T) {
+	s := TaskStore{Tasks: []A2ATask{
+		{ContextID: "a", State: TaskSubmitted},
+		{ContextID: "b", State: TaskWorking},
+		{ContextID: "c", State: TaskWorking},
+		{ContextID: "d", State: TaskCompleted},
+		{ContextID: "e", State: TaskFailed},
+		{ContextID: "f", State: TaskCanceled},
+	}}
+	if got := s.RunningCount(); got != 2 {
+		t.Fatalf("RunningCount = %d, want 2 (only the two working tasks occupy a sandbox slot)", got)
+	}
+}
+
 func TestTaskStoreRoundTrip(t *testing.T) {
 	root := t.TempDir()
 	var s TaskStore

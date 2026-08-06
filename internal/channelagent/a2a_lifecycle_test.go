@@ -53,6 +53,37 @@ func TestDrainQueueStartsSubmittedTasksUpToCap(t *testing.T) {
 	}
 }
 
+// TestDrainQueueRecoversWhenOnlyQueuedTasksExist guards against a permanent
+// deadlock: if capacity were gated on ActiveCount (submitted OR working),
+// a pile of queued (submitted) work with zero tasks actually running would
+// read as "full" even though no sandbox is occupied — and since nothing is
+// running, nothing can ever complete to lower that count. Nothing would ever
+// start again. Capacity must be gated on RunningCount (working only), under
+// which a submitted task waiting for a slot doesn't count against itself.
+func TestDrainQueueRecoversWhenOnlyQueuedTasksExist(t *testing.T) {
+	root := t.TempDir()
+	var s TaskStore
+	// More queued tasks than the cap, and nothing running at all.
+	for i := 0; i < MaxConcurrentSandboxes+2; i++ {
+		s.Upsert(A2ATask{ContextID: string(rune('a' + i)), Agent: "a", State: TaskSubmitted, Prompt: "work"})
+	}
+	if err := SaveTasks(root, s); err != nil {
+		t.Fatalf("SaveTasks: %v", err)
+	}
+
+	stub := &StubExecutor{}
+	n, err := DrainQueue(context.Background(), root, stub)
+	if err != nil {
+		t.Fatalf("DrainQueue: %v", err)
+	}
+	if n != MaxConcurrentSandboxes {
+		t.Fatalf("started = %d, want %d — queued-only work must still drain up to the cap", n, MaxConcurrentSandboxes)
+	}
+	if stub.Calls != MaxConcurrentSandboxes {
+		t.Fatalf("executor calls = %d, want %d", stub.Calls, MaxConcurrentSandboxes)
+	}
+}
+
 func TestDrainQueueStopsAtCapacity(t *testing.T) {
 	root := t.TempDir()
 	var s TaskStore

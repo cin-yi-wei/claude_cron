@@ -77,11 +77,29 @@ func (s *TaskStore) ByContext(contextID string) (A2ATask, bool) {
 	return A2ATask{}, false
 }
 
-// ActiveCount counts tasks occupying a sandbox slot (submitted or working).
+// ActiveCount counts tasks that have not yet finished (submitted or working).
+// This is NOT the same as "occupying a sandbox slot" — a submitted task is
+// still waiting for one. Use RunningCount for capacity gating.
 func (s TaskStore) ActiveCount() int {
 	n := 0
 	for _, t := range s.Tasks {
 		if t.State == TaskSubmitted || t.State == TaskWorking {
+			n++
+		}
+	}
+	return n
+}
+
+// RunningCount counts only tasks actually occupying a sandbox slot
+// (TaskWorking). A submitted task has no sandbox yet — it is queued
+// precisely because it doesn't occupy one — so it must not count here.
+// Gating capacity on ActiveCount instead would deadlock permanently: a pile
+// of queued work with nothing running would read as "full" forever, since
+// nothing running means nothing can ever complete to free a slot.
+func (s TaskStore) RunningCount() int {
+	n := 0
+	for _, t := range s.Tasks {
+		if t.State == TaskWorking {
 			n++
 		}
 	}
