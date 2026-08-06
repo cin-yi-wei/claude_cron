@@ -197,8 +197,17 @@ const LivenessGrace = 2 * time.Minute
 // 時被取消，都可能讓某一輪的判定不可靠——round 9 review, Critical：這些情
 // 況現在都會讓 TmuxSessionAlive 回傳非 nil 的 error（見該函式），不會累計
 // 到這個計數上；只有「真的問到了、tmux 明確回報沒有這個 session」才會累
-// 計。要求連續 2 次才動手，用一次 sweep 週期（預設 10 秒）換掉單次快照判定
-// 帶來的誤殺風險。
+// 計。
+//
+// 2 次在真實時間上大約是一個 A2ACycleInterval（預設 10 秒）：第一次取樣
+// 把 strikes 記到 1，下一輪 sweep（約 10 秒後）再取樣一次才會真的動手，
+// 兩次取樣之間的真實間隔大約就是這 10 秒，不是 2 個週期。round 10 review,
+// Minor：既然 ctx 取消、fork 失敗、執行檔找不到這些「問不到答案」的情況都
+// 已經被排除在計數之外（見上），這個門檻真正要擋的只剩下「tmux 兩次都真
+// 的跑起來、兩次都明確回報沒有這個 session，但其實搞錯了」這一種極窄的
+// 剩餘情況——用一次額外的 ~10 秒延遲換掉單次快照判定帶來的誤殺風險，是合
+// 理的取捨；調高這個值代價是拉長 vanished 偵測的真實延遲（每加 1 就多約
+// 一個 A2ACycleInterval），調低則是放寬到單次取樣，兩者都要一起考慮。
 const VanishedConfirmStrikes = 2
 
 // appendDetail 把新的理由接在既有 Detail 後面（用「; 」分隔），不覆寫掉卡
@@ -650,7 +659,6 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 		}
 		toIncrement = append(toIncrement, t)
 	}
-	var vanished []A2ATask
 	if len(toIncrement) > 0 || len(toReset) > 0 {
 		_ = WithTasks(root, func(tasks *TaskStore) error {
 			changed := false
@@ -677,7 +685,13 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 					cur.Detail = appendDetail(cur.Detail, "sandbox session vanished")
 					cur.CompletedAt = now.UTC().Format(time.RFC3339)
 					cur.VanishedStrikes = 0 // row 已經是終態，不必再留計數
-					vanished = append(vanished, cur)
+					// round 10 review, Important：不在這裡直接塞進 stopOnly
+					// 一次性名單——鎖忙的那一刻恰好可能是「session 其實還
+					// 活著」的假陽性場景（一個合法的 DeliverFollowUp 正在
+					// 投遞），不能假設之後不會再有機會。改成設一個耐久標
+					// 記，交給下面統一、每輪都會重新掃描的可重試機制（見
+					// A2ATask.SessionStopPending）。
+					cur.SessionStopPending = true
 				}
 				tasks.Upsert(cur)
 				changed = true
@@ -687,15 +701,6 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 			}
 			return nil
 		})
-	}
-	// round 9 review, Critical：vanished 的 row 先前不會產生任何 stopTarget
-	// ——false positive（或真的死掉）會孤兒化一個活著的 tmux session/claude
-	// 行程，沒有任何 row 再指向它、沒有任何 sweep 再回頭看它，直到
-	// MaxRetainedFailedSandboxes 的上限把它連 worktree 一起刪掉。併入既有
-	// 的 stopOnly，跟撤銷偵測與派送中崩潰完全同一條落地方式——不多開一條拆
-	// 除路徑。
-	for _, v := range vanished {
-		stopOnly = append(stopOnly, stopTarget{taskID: v.TaskID, contextID: v.ContextID, session: v.Session, state: TaskFailed})
 	}
 
 	// --- 撤銷偵測，跑得到的一半（D6）。DrainQueue 的重驗證只碰得到還在佇列
@@ -770,7 +775,6 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 				unlock()
 				continue
 			}
-			changed := false
 			_ = WithTasks(root, func(tasks *TaskStore) error {
 				cur, ok := tasks.ByContext(t.ContextID)
 				if !ok || cur.TaskID != t.TaskID || cur.State != t.State || cur.Session != t.Session {
@@ -779,20 +783,67 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 				cur.State = TaskFailed
 				cur.Detail = appendDetail(cur.Detail, reason)
 				cur.CompletedAt = now.UTC().Format(time.RFC3339)
+				// round 10 review, Important：跟存活偵測同一個道理——鎖忙
+				// 的那一刻不代表之後不會再有機會，改成設耐久標記交給下面
+				// 統一的可重試掃描，不在這裡直接塞一次性的 stopOnly。
+				cur.SessionStopPending = true
 				tasks.Upsert(cur)
-				changed = true
 				return nil
 			})
 			unlock()
-			if changed {
-				// 併入既有的 stopOnly：跟派送中崩潰那條路完全相同的落地
-				// 方式——不多開一條拆除路徑，只是多一種產生 stopTarget 的
-				// 理由。worktree/Session 留給鑑識，跟任何其他 TaskFailed
-				// row 一樣，由 MaxRetainedFailedSandboxes 的上限機制決定
-				// 何時真的回收。
-				stopOnly = append(stopOnly, stopTarget{taskID: t.TaskID, contextID: t.ContextID, session: t.Session, state: TaskFailed})
+		}
+	}
+
+	// --- 可重試的 session-stop（round 10 review, Important）。存活偵測與
+	// 撤銷偵測轉終態時只設 SessionStopPending，不直接塞進一次性的
+	// stopOnly——這裡才是真正動手、而且每一輪都會重新掃描的地方。跟
+	// dispatch-stall 那條既有的一次性 stopTarget 不一樣：那條路徑窄範圍成
+	// 立「鎖忙代表另一個合法呼叫正在用同一個 session 名，之後身分本來就會
+	// 變」的自我化解論證，這裡不成立——鎖忙的那一刻（最典型是一個合法的
+	// DeliverFollowUp 正在投遞）恰好是「這個 session 其實還活著」的假陽性
+	// 場景，row 已經轉成終態、不會再變身分，之後也不會有任何其他機制回頭
+	// 看它。SessionStopPending 因此設計成完全從「這一列現在的樣子」就能重
+	// 新推導出來的耐久狀態：只要它還是 true，就代表這個 session 還沒被確
+	// 認停過，任何一輪都該再試一次；stopSessionGuarded 本身已經有鎖
+	// +身分重確認，這裡只需要「試過、且真的在有效鎖下動手了」才清旗標
+	// ——不論 sm.Stop/stopper.Stop 本身回報成功或失敗（best-effort，整份檔
+	// 案一貫的取捨）。完全不動 Session/Worktree：停 session 從來不代表可
+	// 以回收磁碟，鑑識保留規則不受影響。
+	var pendingStop []A2ATask
+	_ = WithTasks(root, func(tasks *TaskStore) error {
+		for _, t := range tasks.Tasks {
+			if t.State == TaskFailed && t.SessionStopPending && t.Session != "" {
+				pendingStop = append(pendingStop, t)
 			}
 		}
+		return errNothingSwept // 只讀不寫
+	})
+	var stopped []A2ATask
+	for _, t := range pendingStop {
+		st := stopTarget{taskID: t.TaskID, contextID: t.ContextID, session: t.Session, state: t.State}
+		if stopSessionGuarded(ctx, root, sm, stopper, st) {
+			stopped = append(stopped, t)
+		}
+	}
+	if len(stopped) > 0 {
+		_ = WithTasks(root, func(tasks *TaskStore) error {
+			changed := false
+			for _, t := range stopped {
+				cur, ok := tasks.ByContext(t.ContextID)
+				if !ok || cur.TaskID != t.TaskID || cur.State != t.State || cur.Session != t.Session {
+					continue
+				}
+				if cur.SessionStopPending {
+					cur.SessionStopPending = false
+					tasks.Upsert(cur)
+					changed = true
+				}
+			}
+			if !changed {
+				return errNothingSwept
+			}
+			return nil
+		})
 	}
 
 	// --- Step 2: 鎖外。每個 session 一把鎖，鎖內才准動手，動不了就放棄。 ---
@@ -918,29 +969,38 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 }
 
 // stopSessionGuarded 在同一把互斥鎖與身分重確認之下，停掉一個「只停不拆」
-// 的 session（目前只有派送中崩潰這條路會用到：t.State 轉成 TaskFailed，但
-// worktree/sandbox root 保留給鑑識，只需要把可能還殘留的 tmux session 與
-// driver 收掉）。拿不到鎖，或鎖內重新確認發現身分已經變了，都直接放棄，留
-// 給下一次 sweep —— 跟 candidates 那邊同一套規則，絕不在查核之前或鎖外做
-// 任何破壞性動作。
-func stopSessionGuarded(ctx context.Context, root string, sm SessionManager, stopper SandboxStopper, st stopTarget) {
+// 的 session：worktree/sandbox root 保留給鑑識，只需要把可能還殘留的 tmux
+// session 與 driver 收掉。用在派送中崩潰的一次性 stopTarget，也用在
+// vanished/revoked 兩條可重試路徑的每一次嘗試（見 A2ATask.SessionStopPending
+// 的說明）。拿不到鎖，或鎖內重新確認發現身分已經變了，都直接放棄，留給下
+// 一次 sweep —— 跟 candidates 那邊同一套規則，絕不在查核之前或鎖外做任何
+// 破壞性動作。
+//
+// 回傳值只代表「這一輪有沒有真的在一把有效、身分核對過的鎖底下嘗試過」，
+// 不代表 sm.Stop/stopper.Stop 本身有沒有回報成功——那個 error 一律
+// best-effort 丟棄（整個檔案的一貫慣例：對一個可能已經不在的 session 呼叫
+// Stop 本身無害，不值得為了它的回傳值另外設計重試）。呼叫方（可重試路徑）
+// 用這個回傳值決定要不要清掉 SessionStopPending：拿不到鎖或身分不符才是
+// 真正需要下一輪再試的情況。
+func stopSessionGuarded(ctx context.Context, root string, sm SessionManager, stopper SandboxStopper, st stopTarget) bool {
 	if st.session == "" {
-		return
+		return false
 	}
 	unlock, ok := tryLockSandboxSessionForTeardown(st.session)
 	if !ok {
 		log.Printf("a2a: sweep: context %s 的 session %s 目前正在使用中，本輪跳過停止，留給下一次 sweep", st.contextID, st.session)
-		return
+		return false
 	}
 	defer unlock()
 	if !stopTargetStillMatches(root, st) {
 		log.Printf("a2a: sweep: context %s 在停止前已換身分，跳過（不動它的 session）", st.contextID)
-		return
+		return false
 	}
 	if stopper != nil {
 		stopper.Stop(st.session)
 	}
 	_ = sm.Stop(ctx, st.session)
+	return true
 }
 
 // stopTargetStillMatches 是 stopSessionGuarded 專用的重確認：只比對

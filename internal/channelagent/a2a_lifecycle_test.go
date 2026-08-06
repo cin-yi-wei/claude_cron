@@ -1814,3 +1814,116 @@ func TestSweepPreservesPriorDetailOnRunningRevocation(t *testing.T) {
 		t.Fatalf("Detail = %q, want both the prior trust-failure note AND the revocation reason", tk.Detail)
 	}
 }
+
+// round 10 review, Important: reproduces the reviewer's own probe. Holding
+// the session's SHARED lock across the exact pass that confirms a session
+// vanished must not make the stop a permanent no-op: pre-fix, the stop was a
+// one-shot decision made only at the instant of the TaskFailed transition,
+// so a busy lock right then meant NO later pass would ever try again — the
+// row is TaskFailed, liveCheck only re-selects Working/Dispatching rows, and
+// nothing else would ever produce a stopTarget for it until the
+// MaxRetainedFailedSandboxes trim eventually reclaimed it. The fix makes the
+// stop derivable from durable state (A2ATask.SessionStopPending): a later
+// pass, once the lock is free, must still find and stop it.
+func TestSweepRetriesVanishedSessionStopOnALaterPass(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	const session = "aa-a-c1"
+	var s TaskStore
+	s.Upsert(A2ATask{
+		ContextID: "c1", TaskID: "t1", Agent: "a", Session: session, Worktree: "/p/aa-a-c1",
+		State: TaskWorking, StartedAt: now.Format(time.RFC3339),
+	})
+	_ = SaveTasks(root, s)
+
+	fake := &FakeSessionManager{AliveSessions: map[string]bool{session: false}}
+
+	// Pass 1：只是第一次取樣，strikes 1->還不到門檻，不會碰到 session 鎖。
+	if _, _, err := SweepTimeouts(context.Background(), root, fake, now, nil); err != nil {
+		t.Fatalf("SweepTimeouts (pass 1): %v", err)
+	}
+
+	// Pass 2（確認 vanished 的那一輪）：session 的共享鎖被一個合法的呼叫
+	// （模擬 DeliverFollowUp 正在投遞）持有著——這正是「session 其實還活
+	// 著」的假陽性場景，重試機制存在的理由。
+	unlock := lockSandboxSession(session)
+	if _, _, err := SweepTimeouts(context.Background(), root, fake, now, nil); err != nil {
+		unlock()
+		t.Fatalf("SweepTimeouts (pass 2): %v", err)
+	}
+	unlock()
+
+	got, _ := LoadTasks(root)
+	c1, _ := got.ByContext("c1")
+	if c1.State != TaskFailed || !c1.SessionStopPending {
+		t.Fatalf("c1 after pass 2 = state=%q pending=%v, want failed with the stop still pending (lock was busy)", c1.State, c1.SessionStopPending)
+	}
+	if len(fake.Stopped) != 0 {
+		t.Fatalf("pass 2 must not have stopped anything while the lock was busy: %#v", fake.Stopped)
+	}
+
+	// Pass 3：鎖放開了，這是修好之後才有的行為——一個已經是終態、還帶著
+	// SessionStopPending 的 row，必須在下一輪被重新找到並真的停掉。
+	if _, _, err := SweepTimeouts(context.Background(), root, fake, now, nil); err != nil {
+		t.Fatalf("SweepTimeouts (pass 3): %v", err)
+	}
+	if len(fake.Stopped) != 1 || fake.Stopped[0] != session {
+		t.Fatalf("pass 3 stopped = %#v, want [%s] — a skipped stop must be retried once the lock is free", fake.Stopped, session)
+	}
+	got, _ = LoadTasks(root)
+	c1, _ = got.ByContext("c1")
+	if c1.SessionStopPending {
+		t.Fatal("SessionStopPending must be cleared once the stop actually succeeds")
+	}
+	// forensics 不受影響：停 session 從來不代表回收磁碟。
+	if c1.Worktree == "" {
+		t.Fatal("worktree must still be kept for forensics after the retried stop")
+	}
+}
+
+// round 10 review, Important (revocation half): the same durable-state retry
+// mechanism serves the revocation path too — SandboxPolicy is already
+// revoked and the row already TaskFailed the moment SessionStopPending is
+// set (both paths write the exact same field, consumed by the exact same
+// scan), so this seeds that post-transition state directly rather than
+// re-driving the whole caller-revocation detection, and proves the shared
+// mechanism retries a busy-lock stop on a later pass regardless of which
+// path produced it.
+func TestSweepRetriesPendingSessionStopOnALaterPass(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	const session = "aa-a-c1"
+	var s TaskStore
+	s.Upsert(A2ATask{
+		ContextID: "c1", TaskID: "t1", Agent: "a", Session: session, Worktree: "/p/aa-a-c1",
+		State: TaskFailed, Detail: "caller peer-a is no longer approved (revoked or removed)",
+		CompletedAt: now.Format(time.RFC3339), SessionStopPending: true,
+	})
+	_ = SaveTasks(root, s)
+
+	fake := &FakeSessionManager{}
+	unlock := lockSandboxSession(session)
+	if _, _, err := SweepTimeouts(context.Background(), root, fake, now, nil); err != nil {
+		unlock()
+		t.Fatalf("SweepTimeouts (lock busy): %v", err)
+	}
+	unlock()
+
+	got, _ := LoadTasks(root)
+	c1, _ := got.ByContext("c1")
+	if !c1.SessionStopPending || len(fake.Stopped) != 0 {
+		t.Fatalf("while the lock was busy: pending=%v stopped=%#v, want pending still true and nothing stopped", c1.SessionStopPending, fake.Stopped)
+	}
+
+	if _, _, err := SweepTimeouts(context.Background(), root, fake, now, nil); err != nil {
+		t.Fatalf("SweepTimeouts (lock free): %v", err)
+	}
+	if len(fake.Stopped) != 1 || fake.Stopped[0] != session {
+		t.Fatalf("stopped = %#v, want [%s] once the lock is free", fake.Stopped, session)
+	}
+	got, _ = LoadTasks(root)
+	c1, _ = got.ByContext("c1")
+	if c1.SessionStopPending {
+		t.Fatal("SessionStopPending must be cleared once the stop actually succeeds")
+	}
+}

@@ -59,6 +59,16 @@ type A2ATask struct {
 	// 並轉 TaskFailed。任何一次判定結果是「活著」就清零——不是遞減，因為
 	// 這是「連續」而不是「累計」次數。
 	VanishedStrikes int `json:"vanished_strikes,omitempty"`
+	// SessionStopPending 是「這一列被存活偵測或撤銷偵測判定終態的當下，它的
+	// session 還沒被確認停掉」的耐久標記。只有這兩條路徑會把它設成 true；
+	// dispatch-stall 那條既有的一次性 stopTarget 路徑（有自己審過的、窄範
+	// 圍才成立的自我化解論證）完全不動它，行為不變。鎖忙的那一刻——最典型
+	// 的是一個合法的 DeliverFollowUp 正在投遞，恰好是「這個 session 其實
+	// 還活著」的假陽性場景——不能假設之後不會再有機會停掉它，也不能假設
+	// 不需要再試：只要這個欄位還是 true，SweepTimeouts 每一輪都會重新嘗
+	// 試，成功了才清掉；不論成功與否都完全不動 Session/Worktree（鑑識保留
+	// 不受影響，round 10 review, Important）。
+	SessionStopPending bool `json:"session_stop_pending,omitempty"`
 }
 
 type TaskStore struct {
