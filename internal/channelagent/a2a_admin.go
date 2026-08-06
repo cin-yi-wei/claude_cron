@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -140,10 +141,40 @@ func (h AdminHandler) listA2AAgents(w http.ResponseWriter) {
 	writeJSONResponse(w, out)
 }
 
+// bindingChannelClaim 回傳（若有）root 底下哪個 binding 正佔用著這個
+// channel_id。createA2AAgent 與 updateA2AAgent 都用它在存檔前擋掉「把
+// agent 的 channel_id 指到一個 cc- binding 的頻道」這個操作——LoadAgents
+// 的驗證過濾（見 a2a_agents.go）會在下一次載入時把撞到的 agent 整個濾
+// 掉：不只從 dispatch 消失，GET /api/a2a/agents 這份清單也看不到它，UI
+// 再也碰不到，只能靠 CLI 直接改 agents.json 救回來。這正是 a2a_agents.go
+// 那條過濾規則原本要防的事（人類訊息被 ingest 進錯的 session）——擋在
+// 操作者眼前用 400 拒絕，遠比讓它悄悄存進去、事後才在別的路徑上消失安全。
+// bindings.json 只讀不寫，讀取失敗（幾乎不會發生）視為沒有撞名，交由既有
+// 的 admin 操作繼續，不因為讀一份不相關的檔案失敗而擋住 agent 管理。
+func bindingChannelClaim(root, channelID string) (string, bool) {
+	if channelID == "" {
+		return "", false
+	}
+	reg, err := LoadRegistry(root)
+	if err != nil {
+		return "", false
+	}
+	for _, b := range reg.Bindings {
+		if b.ChannelID == channelID {
+			return b.Name, true
+		}
+	}
+	return "", false
+}
+
 func (h AdminHandler) createA2AAgent(w http.ResponseWriter, r *http.Request) {
 	var in adminAgentDTO
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if name, clash := bindingChannelClaim(h.Root, in.ChannelID); clash {
+		http.Error(w, fmt.Sprintf("channel_id %s already belongs to binding %q; an agent's channel must not collide with a binding's, or LoadAgents will silently drop this agent", in.ChannelID, name), http.StatusBadRequest)
 		return
 	}
 	// 讀 → 改 → 寫全部包在 WithAgents 的鎖內：兩個併發建立請求各自讀到同一
@@ -194,8 +225,8 @@ func (h AdminHandler) a2aAgentAction(w http.ResponseWriter, r *http.Request, res
 				return errA2AStoreUnchanged
 			}
 			a.Enabled = true
-			agents.Remove(name)
-			return agents.Add(a)
+			agents.replace(a)
+			return nil
 		}); err != nil {
 			if missing {
 				http.Error(w, "unknown agent", http.StatusNotFound)
@@ -284,6 +315,12 @@ func (h AdminHandler) updateA2AAgent(w http.ResponseWriter, r *http.Request, nam
 		http.Error(w, "agent name is immutable (it derives session and worktree names); delete and recreate to rename", http.StatusBadRequest)
 		return
 	}
+	if in.ChannelID != nil {
+		if bname, clash := bindingChannelClaim(h.Root, *in.ChannelID); clash {
+			http.Error(w, fmt.Sprintf("channel_id %s already belongs to binding %q; an agent's channel must not collide with a binding's, or LoadAgents will silently drop this agent", *in.ChannelID, bname), http.StatusBadRequest)
+			return
+		}
+	}
 	missing := false
 	if err := WithAgents(h.Root, func(agents *AgentStore) error {
 		a, ok := agents.Get(name)
@@ -303,8 +340,8 @@ func (h AdminHandler) updateA2AAgent(w http.ResponseWriter, r *http.Request, nam
 		if in.ChannelID != nil {
 			a.ChannelID = *in.ChannelID
 		}
-		agents.Remove(name)
-		return agents.Add(a)
+		agents.replace(a)
+		return nil
 	}); err != nil {
 		if missing {
 			http.Error(w, "unknown agent", http.StatusNotFound)

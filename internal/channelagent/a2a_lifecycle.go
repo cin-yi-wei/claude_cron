@@ -1013,10 +1013,11 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 	// 看它。SessionStopPending 因此設計成完全從「這一列現在的樣子」就能重
 	// 新推導出來的耐久狀態：只要它還是 true，就代表這個 session 還沒被確
 	// 認停過，任何一輪都該再試一次；stopSessionGuarded 本身已經有鎖
-	// +身分重確認，這裡只需要「試過、且真的在有效鎖下動手了」才清旗標
-	// ——不論 sm.Stop/stopper.Stop 本身回報成功或失敗（best-effort，整份檔
-	// 案一貫的取捨）。完全不動 Session/Worktree：停 session 從來不代表可
-	// 以回收磁碟，鑑識保留規則不受影響。
+	// +身分重確認，這裡只需要它回 true（2026-08-06 followup review：真的
+	// 停成功，不再是「試過就算」）才清旗標。停不掉（sm.Stop 回報失敗）跟
+	// 拿不到鎖、身分不符是同一類「這一輪什麼都沒發生」，一律留給下一次
+	// sweep 重試——完全不動 Session/Worktree：停 session 從來不代表可以
+	// 回收磁碟，鑑識保留規則不受影響。
 	var pendingStop []A2ATask
 	_ = WithTasks(root, func(tasks *TaskStore) error {
 		for _, t := range tasks.Tasks {
@@ -1233,12 +1234,23 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 // 一次 sweep —— 跟 candidates 那邊同一套規則，絕不在查核之前或鎖外做任何
 // 破壞性動作。
 //
-// 回傳值只代表「這一輪有沒有真的在一把有效、身分核對過的鎖底下嘗試過」，
-// 不代表 sm.Stop/stopper.Stop 本身有沒有回報成功——那個 error 一律
-// best-effort 丟棄（整個檔案的一貫慣例：對一個可能已經不在的 session 呼叫
-// Stop 本身無害，不值得為了它的回傳值另外設計重試）。呼叫方（可重試路徑）
-// 用這個回傳值決定要不要清掉 SessionStopPending：拿不到鎖或身分不符才是
-// 真正需要下一輪再試的情況。
+// 回傳值代表「這一輪是不是真的在一把有效、身分核對過的鎖底下，把 session
+// 停成功了」——拿不到鎖、身分不符，或 sm.Stop 本身回報失敗，三者都回 false
+// （2026-08-06 followup review：stopper.Stop 仍然 best-effort 丟棄，它只是
+// 給已經在被 sm.Stop 處理的同一個 tmux session 補一次 driver 層的收尾，沒有
+// 獨立的成功/失敗語意可言；但 sm.Stop 不一樣——它是「這個 session 到底停了
+// 沒有」唯一有意義的答案）。停不掉就不准清 SessionStopPending，跟 step 2
+// candidates 迴圈那條「停不掉就不准拆」（`if err := sm.Stop(...); err != nil
+// { ...continue }`）是同一件事在鏡子的另一邊：candidates 那條擋的是「刪掉
+// 磁碟卻留下一個還活著的行程」，這裡擋的是「清掉旗標卻留下一個還活著、
+// 沒有任何機制會再回頭看它的 session」——上一輪 review 只補了前者，讓後者
+// 繼續用「best-effort、一律回 true」的舊語意，於是同一種 sm.Fail 場景經
+// candidates 路徑會被正確攔住、經這條路徑卻會把 SessionStopPending 悄悄清
+// 成 false，PruneTasks 把這個旗標當永久豁免，旗標一旦被錯誤清掉，這一列就
+// 從「保證會被下一次 sweep 重試」變成「保證會在保留期滿後被直接丟棄」，不
+// 論那個 session 是否真的還在跑。呼叫方（可重試路徑）用這個回傳值決定要不
+// 要清掉 SessionStopPending：只有這裡回 true，才代表 session 已經被確認停
+// 掉、旗標可以放心清除。
 func stopSessionGuarded(ctx context.Context, root string, sm SessionManager, stopper SandboxStopper, st stopTarget) bool {
 	if st.session == "" {
 		return false
@@ -1256,7 +1268,10 @@ func stopSessionGuarded(ctx context.Context, root string, sm SessionManager, sto
 	if stopper != nil {
 		stopper.Stop(st.session)
 	}
-	_ = sm.Stop(ctx, st.session)
+	if err := sm.Stop(ctx, st.session); err != nil {
+		log.Printf("a2a: sweep: context %s 的 session %s 停不掉，本輪不清 SessionStopPending（留給下一次 sweep 重試）: %v", st.contextID, st.session, err)
+		return false
+	}
 	return true
 }
 
@@ -1428,8 +1443,8 @@ func DisableAgent(root, name string) (int, error) {
 			return errA2AStoreUnchanged
 		}
 		a.Enabled = false
-		agents.Remove(name)
-		return agents.Add(a)
+		agents.replace(a)
+		return nil
 	}); err != nil {
 		if unknown {
 			return 0, fmt.Errorf("unknown agent %q", name)

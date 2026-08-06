@@ -103,9 +103,9 @@ func SaveAgents(root string, s AgentStore) error {
 // （round 14 review, Critical 2）。
 //
 // 同樣不可重入、鎖內不得有慢動作，也絕不與 session 鎖或 tasksMu 巢狀
-// （DisableAgent 因此把 terminateTasks 留在 WithAgents 之外）。載入刻意沿用
-// LoadAgents（含既有的名稱／channel_id 驗證過濾），維持 admin 路徑原本的
-// 行為不變。
+// （DisableAgent 因此把 terminateTasks 留在 WithAgents 之外）。載入刻意用
+// LoadAgentsRaw、不套用 LoadAgents 的名稱／channel_id 驗證過濾——理由見下
+// 面 WithAgents 的說明，這裡不重複。
 var agentsMu sync.Mutex
 
 // WithAgents 在鎖內載入 agents.json、交給 fn 修改、再存檔。fn 回傳 error 時
@@ -121,10 +121,16 @@ var agentsMu sync.Mutex
 // 虛設——那個豁免的前提正是「壞掉的 entry 還留在檔案裡」，如果它已經被這
 // 裡的讀-改-寫循環悄悄刪掉，豁免就沒有東西可以豁免。fn 看到的是完整、未
 // 過濾的清單，跟過去用 LoadAgents 相比，唯一差別是壞 entry 現在也在 fn 可
-// 以 Get/Add/Remove 的範圍內——這正是讓 operator 有辦法用 API 修好或刪掉
-// 它們，而不是被過濾規則永久攔在外面、只能手改 agents.json。一般的新派
-// 送路徑（Start、DrainQueue）完全不受影響：它們繼續呼叫 LoadAgents，過濾
-// 規則對「要不要接受新派送」的效力不變。
+// 以 Get/replace/Remove 的範圍內——這正是讓 operator 有辦法用 API 修好或
+// 刪掉它們，而不是被過濾規則永久攔在外面、只能手改 agents.json：Enable／
+// Disable／Update 三條路由改欄位一律呼叫 replace（見該函式），不再像
+// Remove 再 Add 那樣、每次都對著一個名字從沒被要求改過的既有 entry 重跑
+// Add 的名稱格式檢查（2026-08-06 followup review——那個重跑會讓 Update／
+// Enable 回 500、DisableAgent／DELETE 回 400，剛好把這裡承諾的「修好或
+// 刪掉」擋在門外，只留下「手改 agents.json」這條退路，跟本段開頭想避免的
+// 事一樣）；DELETE 最終呼叫的 Remove 本身從不驗證格式，一路都能刪掉一個
+// 名字不合法的 entry。一般的新派送路徑（Start、DrainQueue）完全不受影響：
+// 它們繼續呼叫 LoadAgents，過濾規則對「要不要接受新派送」的效力不變。
 func WithAgents(root string, fn func(*AgentStore) error) error {
 	agentsMu.Lock()
 	defer agentsMu.Unlock()
@@ -157,6 +163,28 @@ func (s *AgentStore) Add(a Agent) error {
 	}
 	s.Agents = append(s.Agents, a)
 	return nil
+}
+
+// replace 原地覆寫一個已知存在、且不改名的 entry：找到同名的那一列，直接
+// 整列換掉。跟 Remove 再 Add 不同，這裡刻意不呼叫 Add——Add 的名字格式與
+// 唯一性檢查是為「這是一個全新的名字」把關的，對「這個名字已經在清單裡、
+// 呼叫方只是要換掉它其餘的欄位」這件事完全用不上，卻會擋下這件事：一個
+// 名字不合法（例如含空白）的既有 entry，Enable／Disable／Update 三條路由
+// 都是「讀到它 → 改欄位 → Remove → Add」，Add 每次都會重新驗證這個早就
+// 存在、格式從沒被要求改過的名字，於是全部擋下——回報成 500（Update／
+// Enable）或 400（Disable，DELETE 的第一步），不論這次操作想改的其實是
+// Enabled 或 description 或 channel_id，通通打不到。見 WithAgents 上方對
+// 「操作者可以修好或刪掉壞掉的 entry」這個保證的說明；replace 是讓那個保
+// 證對「改欄位」這一半成立的關鍵——找不到就是呼叫方自己的邏輯錯誤（呼叫
+// 前一定先 Get 確認過存在），直接讓它整段被 fn 的失敗吸收沒有意義，所以
+// 用 no-op 表達：找不到就什麼都不做，讓上層自己的 Get 檢查去把關。
+func (s *AgentStore) replace(a Agent) {
+	for i := range s.Agents {
+		if s.Agents[i].Name == a.Name {
+			s.Agents[i] = a
+			return
+		}
+	}
 }
 
 func (s *AgentStore) Remove(name string) bool {

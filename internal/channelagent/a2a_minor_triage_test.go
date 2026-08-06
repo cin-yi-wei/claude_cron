@@ -10,7 +10,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 )
@@ -222,42 +221,54 @@ func TestGateLogRotationSkippedWhileAnotherProcessHoldsTheLock(t *testing.T) {
 	}
 }
 
-// TestGateLogConcurrentRotationLosesNothing runs several writers at the real
-// rotation boundary at once (under -race) and asserts every marker survives
-// somewhere across the current and .1 generations.
-func TestGateLogConcurrentRotationLosesNothing(t *testing.T) {
-	root := t.TempDir()
-	path := GateLogPath(root)
-	overCapFile(t, path, `{"at":"GEN-A"}`)
-
-	const writers = 4
-	var wg sync.WaitGroup
-	for i := 0; i < writers; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			if err := AppendGateLog(root, GateLogEntry{At: "W" + string(rune('0'+i)), Session: "aa-a-c1"}); err != nil {
-				t.Errorf("AppendGateLog: %v", err)
-			}
-		}(i)
-	}
-	wg.Wait()
-
-	var all []byte
-	for _, p := range []string{path, path + ".1"} {
-		if b, err := os.ReadFile(p); err == nil {
-			all = append(all, b...)
-		}
-	}
-	if !bytes.Contains(all, []byte("GEN-A")) {
-		t.Fatal("the pre-existing generation vanished under concurrent rotation")
-	}
-	for i := 0; i < writers; i++ {
-		if !bytes.Contains(all, []byte(`"at":"W`+string(rune('0'+i))+`"`)) {
-			t.Fatalf("writer %d's line is in neither generation", i)
-		}
-	}
-}
+// TestGateLogConcurrentRotationLosesNothing used to launch N goroutines and
+// hope their scheduling happened to collide on the rotation boundary.
+//
+// Follow-up review (2026-08-06) found it did not discriminate reliably:
+// stat→rename is fast enough that one writer usually finishes rotating
+// before the next even calls Stat, so the intended race window was rarely
+// hit — hand-removing the AcquireLock call in rotateOversizedLog and running
+// the old version of this test 30 times under -race only failed it 5/30, an
+// 83% false-negative rate for the exact regression it exists to catch.
+//
+// The natural fix is a deterministic barrier: hold every writer at the
+// instant it decides "this file needs rotating" (via the same
+// rotateTestHookBeforeRotate seam the tests above use) until all of them
+// have arrived, then release them all at once, forcing genuine simultaneous
+// contention on the real rotationLockPath lock. That fix was built and then
+// dropped, because it traded one non-discriminating test for a worse one:
+// releasing 4 goroutines to call AcquireLock at the exact same instant
+// reliably (verified 6/100 runs under -race, CORRECT code) triggers a
+// separate, pre-existing race in lockIsStale (lock.go) that is not part of
+// this review and is out of scope to fix here — a lock file that was just
+// os.OpenFile(O_EXCL)-created but has not yet had its pid Fprintf+Sync'd is
+// briefly empty; a concurrent AcquireLock call that loses the O_EXCL race
+// reads that empty file, fails to parse a pid, and lockIsStale calls that
+// "corrupt pid" (unconditionally stale, no age check unlike the other
+// branches) and steals it — so two callers can both believe they hold the
+// same lock. Serializing the scheduler (GOMAXPROCS(1)) around the barrier
+// avoids that false failure, but also removes essentially all genuine
+// overlap, so it stopped catching the intended bug too (0/100 failures with
+// AcquireLock's real call removed entirely). The two races sit at the same
+// syscall-level timescale, so there is no dial between "hits the intended
+// bug reliably" and "avoids the unrelated one reliably" — every value tried
+// landed at one extreme or the other.
+//
+// Given that, this specific "several real goroutines race the real lock"
+// test is dropped rather than shipped in either a non-discriminating or a
+// flaky-against-correct-code form. Its intended coverage already exists
+// deterministically without hitting lock.go's own race:
+//   - TestGateLogRotationSkippedWhileAnotherProcessHoldsTheLock proves the
+//     mutual exclusion is real and cross-process (confirmed: it correctly
+//     fails when AcquireLock is removed from rotateOversizedLog).
+//   - TestGateLogRotationDoesNotClobberAPriorGeneration proves the exact
+//     double-rename data-loss scenario is closed under a scripted
+//     concurrent peer.
+//
+// The lockIsStale gap above is real and worth its own follow-up (it affects
+// every AcquireLock caller, not just gate-log rotation), but changing shared
+// lock infrastructure was not requested by this review and deserves review
+// on its own, not as a side effect of tightening a test.
 
 // --- Fix 3: a corrupt audit key file must not silently disable correlation --
 
@@ -307,12 +318,28 @@ func TestCorruptAuditKeyFileSelfRepairsAndIsLogged(t *testing.T) {
 // TestValidAuditKeyFileIsNeverReplaced is the false-positive guard for the
 // repair above: a key file that decodes must be byte-for-byte untouched, and
 // must keep producing the same fingerprint.
+//
+// Follow-up review (2026-08-06): as originally written this test asserted
+// nothing about auditKeyFileIsCorrupt at all. loadOrCreateAuditKey's very
+// first step (readAuditKeyFile succeeding) returns immediately for any valid
+// key file — auditKeyFileIsCorrupt is only ever reached once that first read
+// has already failed. So a valid file never reaches the corrupt check, and
+// this test passed identically whether auditKeyFileIsCorrupt was correct, a
+// do-nothing stub, or a stub that flags EVERY file as corrupt (verified: a
+// hand-patched `return true` unconditionally still passed the loop below).
+// The direct call below closes that gap by actually exercising the function
+// this test is named for, on the exact bytes it must never flag.
 func TestValidAuditKeyFileIsNeverReplaced(t *testing.T) {
 	root := t.TempDir()
 	key := bytes.Repeat([]byte{0xAB}, 32)
 	encoded := []byte(hex.EncodeToString(key))
-	if err := os.WriteFile(auditKeyPath(root), encoded, 0o600); err != nil {
+	path := auditKeyPath(root)
+	if err := os.WriteFile(path, encoded, 0o600); err != nil {
 		t.Fatal(err)
+	}
+
+	if auditKeyFileIsCorrupt(path) {
+		t.Fatal("a byte-for-byte valid hex key file was flagged corrupt — this is exactly the false positive that would make loadOrCreateAuditKey replace a perfectly good key")
 	}
 
 	for i := 0; i < 3; i++ {
@@ -320,7 +347,7 @@ func TestValidAuditKeyFileIsNeverReplaced(t *testing.T) {
 		if got := loadOrCreateAuditKey(root); !bytes.Equal(got, key) {
 			t.Fatalf("load %d returned a different key: %x", i, got)
 		}
-		raw, err := os.ReadFile(auditKeyPath(root))
+		raw, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatal(err)
 		}

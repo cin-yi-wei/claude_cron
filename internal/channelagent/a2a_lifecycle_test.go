@@ -1918,6 +1918,75 @@ func TestSweepPolicyRevocationSurvivesSessionStopFailure(t *testing.T) {
 	}
 }
 
+// Follow-up review (2026-08-06): the sm.Stop-failure fix ("停不掉就不准拆",
+// step 2's candidates loop) was applied to one path only. stopSessionGuarded
+// — used by the durable SessionStopPending retry loop, and by the
+// dispatch-stall stopOnly path — still discarded sm.Stop's error and
+// unconditionally reported success, so a genuine stop failure cleared
+// SessionStopPending anyway. That strands the row exactly the way the
+// sibling fix exists to prevent: PruneTasks treats SessionStopPending as a
+// permanent exemption, so once it is wrongly cleared, a row whose session may
+// still be alive becomes eligible to be dropped outright.
+//
+// A single SweepTimeouts call is enough to reach the bug: the revoke-
+// detection block above (authCheck) sets SessionStopPending=true and marks
+// the row TaskFailed; the durable retry loop that runs later in the SAME
+// call re-reads tasks.json, finds this row now eligible, and immediately
+// calls stopSessionGuarded against it.
+func TestSessionStopPendingSurvivesStopFailure(t *testing.T) {
+	root := t.TempDir()
+	var callers CallerStore
+	_ = callers.Register("peer-a", "s")
+	callers.Approve("peer-a", []string{"read"})
+	callers.Revoke("peer-a")
+	_ = SaveCallers(root, callers)
+	var agents AgentStore
+	_ = agents.Add(Agent{Name: "a", ProjectDir: "/p/a", Capabilities: []string{"read"}, Enabled: true})
+	_ = SaveAgents(root, agents)
+
+	now := time.Now().UTC()
+	const session = "aa-a-c1"
+	var s TaskStore
+	s.Upsert(A2ATask{
+		ContextID: "c1", TaskID: "t1", Agent: "a", CallerID: "peer-a", Level: GrantReadOnly,
+		Session: session, State: TaskWorking, StartedAt: now.Format(time.RFC3339),
+	})
+	if err := SaveTasks(root, s); err != nil {
+		t.Fatalf("SaveTasks: %v", err)
+	}
+	if err := WriteSandboxPolicy(root, SandboxPolicy{
+		Session: session, ContextID: "c1", Agent: "a", CallerID: "peer-a", Level: GrantReadOnly,
+	}); err != nil {
+		t.Fatalf("WriteSandboxPolicy: %v", err)
+	}
+
+	fake := &FakeSessionManager{FailOn: "stop"}
+	if _, _, err := SweepTimeouts(context.Background(), root, fake, now, nil); err != nil {
+		t.Fatalf("SweepTimeouts: %v", err)
+	}
+	got, _ := LoadTasks(root)
+	tk, _ := got.ByContext("c1")
+	if tk.State != TaskFailed {
+		t.Fatalf("state = %s, want failed", tk.State)
+	}
+	if !tk.SessionStopPending {
+		t.Fatal("SessionStopPending was cleared despite sm.Stop failing — the row can never be retried again, and PruneTasks will eventually drop it while the session may still be alive")
+	}
+
+	// The practical consequence the probe named: PruneTasks must still treat
+	// this row as exempt.
+	tk.CompletedAt = now.Add(-2 * TaskRetention).Format(time.RFC3339)
+	got.Upsert(tk)
+	if err := SaveTasks(root, got); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := PruneTasks(root, now); err != nil {
+		t.Fatalf("PruneTasks: %v", err)
+	} else if n != 0 {
+		t.Fatalf("PruneTasks dropped %d row(s); a row with SessionStopPending must stay exempt regardless of age", n)
+	}
+}
+
 // task 9 review: the mirror ordering proof — if the FIRST, fastest step
 // (the policy rewrite itself) fails, nothing downstream may run: the row
 // must stay exactly as capable as before (still TaskWorking, session never

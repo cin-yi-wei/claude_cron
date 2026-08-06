@@ -534,9 +534,12 @@ func StartControlSession(ctx context.Context, session, cwd, registryRoot, tokenE
 // sandbox root，留下一個 cwd 已被刪除、沒有任何 row 指得到的 claude 行程。
 // 判定方式與 TmuxSessionAlive 完全一致（同樣的三分法），理由也一樣。
 //
-// cc- 的四個呼叫點（supervisor.go 三處、control.go 經 ControlDeps.StopSession、
-// admin.go）今天全部寫成 `_ = StopTmuxSession(...)`，一律忽略回傳值，所以這個
-// 修正對 cc- 沒有任何可觀察到的行為改變；只有 A2A 的拆除路徑會去看它。
+// cc- 的十個呼叫點（supervisor.go 四處、control.go 經 ControlDeps.StopSession
+// 轉呼叫的四處加上接線本身、admin.go 一處）今天全部寫成
+// `_ = StopTmuxSession(...)` / `_ = deps.StopSession(...)`，一律忽略回傳值，
+// 所以這個修正對 cc- 沒有任何可觀察到的行為改變；只有 A2A 的拆除路徑會去看
+// 它。（2026-08-06 followup review：先前這裡寫「四個呼叫點」，是還沒把
+// control.go 經 ControlDeps.StopSession 間接呼叫的那四處算進去時的舊數字。）
 func StopTmuxSession(ctx context.Context, session string) error {
 	err := runExternalCommand(ctx, "tmux", "kill-session", "-t", session)
 	if err == nil {

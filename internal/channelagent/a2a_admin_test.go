@@ -177,6 +177,129 @@ func TestAdminA2AAgentUpdateWrongMethodIs405(t *testing.T) {
 	}
 }
 
+// Follow-up review (2026-08-06): /update let an operator point a live agent's
+// channel_id at a cc- binding's channel with no collision check. LoadAgents'
+// validation filter (a2a_agents.go) then silently drops that agent on every
+// future load — it vanishes from dispatch AND from GET /api/a2a/agents, and
+// only the CLI (editing agents.json directly) can recover it. The fix must
+// reject the collision with 400 before it is ever written to disk.
+func TestAdminA2AAgentUpdateRejectsChannelCollisionWithBinding(t *testing.T) {
+	h, root := newA2AAdmin(t)
+
+	reg := Registry{Bindings: []Binding{{Name: "cc-thing", ChannelID: "12345"}}}
+	if err := SaveRegistry(root, reg); err != nil {
+		t.Fatalf("SaveRegistry: %v", err)
+	}
+
+	rec := adminReq(t, h, http.MethodPost, "/api/a2a/agents",
+		`{"name":"probe","project_dir":"/p/probe","description":"probe agent","enabled":true}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create = %d %s", rec.Code, rec.Body.String())
+	}
+
+	rec = adminReq(t, h, http.MethodPost, "/api/a2a/agents/probe/update", `{"channel_id":"12345"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("update to a colliding channel_id = %d %s, want 400", rec.Code, rec.Body.String())
+	}
+
+	got, err := LoadAgents(root)
+	if err != nil {
+		t.Fatalf("LoadAgents: %v", err)
+	}
+	if len(got.Agents) != 1 || got.Agents[0].Name != "probe" {
+		t.Fatalf("agents = %#v; the agent must still be visible to LoadAgents — a rejected update must never make it vanish", got.Agents)
+	}
+	if got.Agents[0].ChannelID != "" {
+		t.Fatalf("ChannelID = %q, want unchanged (empty): a rejected request must not apply any of its fields", got.Agents[0].ChannelID)
+	}
+
+	rec = adminReq(t, h, http.MethodGet, "/api/a2a/agents", "")
+	var listed []adminAgentDTO
+	if err := json.Unmarshal(rec.Body.Bytes(), &listed); err != nil {
+		t.Fatalf("unmarshal agent list: %v", err)
+	}
+	if len(listed) != 1 {
+		t.Fatalf("GET /api/a2a/agents returned %d agents, want 1: the agent must not disappear from the admin listing", len(listed))
+	}
+}
+
+// create has the identical hole — it just cannot hide an already-working
+// agent, since the agent never existed to begin with. Still worth closing:
+// a created-then-immediately-invisible agent is just as confusing.
+func TestAdminA2AAgentCreateRejectsChannelCollisionWithBinding(t *testing.T) {
+	h, root := newA2AAdmin(t)
+
+	reg := Registry{Bindings: []Binding{{Name: "cc-thing", ChannelID: "12345"}}}
+	if err := SaveRegistry(root, reg); err != nil {
+		t.Fatalf("SaveRegistry: %v", err)
+	}
+
+	rec := adminReq(t, h, http.MethodPost, "/api/a2a/agents",
+		`{"name":"probe","project_dir":"/p/probe","channel_id":"12345","enabled":true}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("create with a colliding channel_id = %d %s, want 400", rec.Code, rec.Body.String())
+	}
+	got, err := LoadAgents(root)
+	if err != nil {
+		t.Fatalf("LoadAgents: %v", err)
+	}
+	if len(got.Agents) != 0 {
+		t.Fatalf("agents = %#v, want none created", got.Agents)
+	}
+}
+
+// Follow-up review (2026-08-06): a2a_agents.go's WithAgents doc comment
+// claims the raw (unfiltered) load lets an operator "fix or delete" a
+// validation-failing entry through the admin API. Before this fix none of
+// the three mutating routes could actually touch a name-malformed entry:
+// DisableAgent, updateA2AAgent, and the /enable branch all mutate via
+// Remove-then-Add, and Add() re-validates the name format on every call —
+// even though none of these requests ever changes Name — so the very entry
+// this comment claims is reachable was rejected by every route that could
+// have reached it (probe: DELETE -> 400 invalid agent name, /update -> 500,
+// /enable -> 500, where /enable used to be a clean 404 before raw loading).
+func TestAdminA2AMalformedEntryCanBeFixedAndRemoved(t *testing.T) {
+	h, root := newA2AAdmin(t)
+	if err := AtomicWriteJSON(AgentsPath(root), map[string]any{"agents": []map[string]any{
+		{"name": "Bad Name", "project_dir": "/p/bad", "enabled": false},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	if rec := adminReq(t, h, http.MethodPost, "/api/a2a/agents/Bad%20Name/update", `{"description":"fixed"}`); rec.Code != http.StatusOK {
+		t.Fatalf("update malformed entry = %d %s, want 200", rec.Code, rec.Body.String())
+	}
+	raw, err := LoadAgentsRaw(root)
+	if err != nil {
+		t.Fatalf("LoadAgentsRaw: %v", err)
+	}
+	if len(raw.Agents) != 1 || raw.Agents[0].Description != "fixed" {
+		t.Fatalf("agents = %#v, want the description applied", raw.Agents)
+	}
+
+	if rec := adminReq(t, h, http.MethodPost, "/api/a2a/agents/Bad%20Name/enable", ""); rec.Code != http.StatusOK {
+		t.Fatalf("enable malformed entry = %d %s, want 200", rec.Code, rec.Body.String())
+	}
+	raw, err = LoadAgentsRaw(root)
+	if err != nil {
+		t.Fatalf("LoadAgentsRaw: %v", err)
+	}
+	if len(raw.Agents) != 1 || !raw.Agents[0].Enabled {
+		t.Fatalf("agents = %#v, want Enabled=true", raw.Agents)
+	}
+
+	if rec := adminReq(t, h, http.MethodDelete, "/api/a2a/agents/Bad%20Name", ""); rec.Code != http.StatusOK {
+		t.Fatalf("delete malformed entry = %d %s, want 200", rec.Code, rec.Body.String())
+	}
+	raw, err = LoadAgentsRaw(root)
+	if err != nil {
+		t.Fatalf("LoadAgentsRaw: %v", err)
+	}
+	if len(raw.Agents) != 0 {
+		t.Fatalf("agents = %#v, want the malformed entry gone", raw.Agents)
+	}
+}
+
 // Gap 1 的核心動機：一個宣告零 capabilities 的 agent 在 a2a_server.go 會被
 // 永久 fail-closed（TestZeroCapabilityAgentDeniedByDefault），過去唯一的救法
 // 是刪掉重建——這會丟掉任何跟它綁在一起的東西。/update 讓它可以直接被修好。

@@ -672,8 +672,14 @@ type GateLogEntry struct {
 func GateLogPath(root string) string { return filepath.Join(root, "a2a-gate.jsonl") }
 
 // AppendGateLog 以單次 O_APPEND write 追加一行。gate 是每次工具呼叫都被 spawn
-// 的獨立行程，沒有共用鎖可用；Linux 上 < 4KB 的 append 是原子的，所以多個並發
-// gate 行程不會互相截斷。0600：這份 log 含 caller id 與指令內容。
+// 的獨立行程；append 本身沒有共用鎖，但 Linux 上 < 4KB 的 append 是原子的，
+// 所以多個並發 gate 行程的一般寫入不會互相截斷。輪替（檔案超過上限時的
+// rename）不一樣：那需要跨行程互斥，現在有一把（rotationLockPath 上的
+// AcquireLock，見 appendRotatingLine / rotateOversizedLog 的說明；
+// 2026-08-06 minor triage, Fix 2）——這裡先前寫「沒有共用鎖可用」，指的是
+// append 這件事本身，但讀起來容易被誤會成整條寫入路徑都沒有鎖，跟輪替現在
+// 確實有鎖的事實矛盾，故補這一句消歧義。0600：這份 log 含 caller id 與指令
+// 內容。
 func AppendGateLog(root string, e GateLogEntry) error {
 	blob, err := json.Marshal(e)
 	if err != nil {
