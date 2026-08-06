@@ -83,6 +83,14 @@ func sandboxDecision(root, session string, hi hookInput) (pol SandboxPolicy, dec
 	if !ValidGrantLevel(pol.Level) || pol.Worktree == "" || pol.SandboxRoot == "" {
 		return pol, gateDeny("denied_bad_policy", "a2a gate: 政策檔無法解讀")
 	}
+	// 自我一致性檢查（review Minor 1）：政策檔內的 session 與 sandbox_root
+	// 必須跟被查詢的 session 算出來的值完全一致。gate 從檔名（session 參數）
+	// 決定要套用哪份政策，但檔案內容本身可能寫錯——一份意外寫錯 session 名
+	// 字或 sandbox_root 的政策檔，不該被信任成「範圍檢查已經做過」而悄悄把
+	// 授權套用到別的沙盒身上。
+	if pol.Session != session || pol.SandboxRoot != SandboxRoot(root, session) {
+		return pol, gateDeny("denied_bad_policy", "a2a gate: 政策檔與 session 不一致")
+	}
 
 	switch hi.ToolName {
 	case "Edit", "Write", "NotebookEdit":
@@ -122,14 +130,85 @@ func editDecision(pol SandboxPolicy, hi hookInput) gateDecision {
 	if path == "" {
 		return gateDeny("denied_no_path", "a2a gate: 工具輸入沒有 file_path，無法判斷範圍")
 	}
-	inOutbox := inScope(filepath.Join(pol.SandboxRoot, "outbox"), path)
-	if !inScope(pol.Worktree, path) && !inOutbox {
+	// Review Critical 3：worktree 範圍內還有兩個地方寫了等於繞過閘門本身，
+	// 不管等級、不管是否落在 outbox，一律先擋。
+	if sandboxGateConfigPath(pol.Worktree, path) {
+		return gateDeny("denied_gate_config", "a2a gate: 不允許改寫沙盒自己的閘門設定（.claude/settings.local.json 或 .git）")
+	}
+	inOutbox := sandboxPathInScope(filepath.Join(pol.SandboxRoot, "outbox"), path)
+	if !sandboxPathInScope(pol.Worktree, path) && !inOutbox {
 		return gateDeny("denied_out_of_scope", "a2a gate: 寫入超出 worktree 範圍")
 	}
 	if pol.Level == GrantReadOnly && !inOutbox {
 		return gateDeny("denied_level", "a2a gate: readonly 不允許寫入")
 	}
 	return gateAllow("a2a gate: worktree/outbox 內的寫入")
+}
+
+// resolveExistingPrefix 盡量把 path 換成檔案系統實際落地的絕對路徑：從最深
+// 的「已存在」祖先開始解析 symlink，還不存在的尾段原樣接回去——Write 建新
+// 檔時最後一段幾乎必然不存在，EvalSymlinks 對不存在的路徑會直接回錯。任何
+// 一層解析失敗（權限、循環連結、中間節點根本不是目錄）就把那一層當終點，
+// 不再往上找：寧可少解析一層讓比對偏嚴格（更容易判成「不在範圍」），也不要
+// 偏寬鬆。
+func resolveExistingPrefix(p string) string {
+	if r, err := filepath.EvalSymlinks(p); err == nil {
+		return r
+	}
+	parent := filepath.Dir(p)
+	if parent == p {
+		return p
+	}
+	return filepath.Join(resolveExistingPrefix(parent), filepath.Base(p))
+}
+
+// sandboxPathInScope 是沙盒專用的範圍比對：在 inScope 的字面前綴比對之上，
+// 多解析一次 symlink（review「Important」發現：<worktree>/esc -> / 之後
+// Write <worktree>/esc/etc/... 會通過純字面比對，實際落地卻在 worktree 之
+// 外）。這個函式只給沙盒分支用，刻意不改 inScope 本身——cc- 的每一個判定都
+// 被 TestPermissionGateBindingPathUnchanged 逐字鎖住，共用 helper 的任何行
+// 為變動都會被那條測試打回來，也不應該打回來：cc- 的既有 binding 不是這輪
+// 要修的風險面。
+//
+// root 或 path 是空字串、或解析不出實際路徑時一律回 false：範圍比對不出來
+// 就是不在範圍內，不是預設放行。
+func sandboxPathInScope(root, path string) bool {
+	if root == "" || path == "" {
+		return false
+	}
+	rr := resolveExistingPrefix(cleanAbs(root))
+	rp := resolveExistingPrefix(cleanAbs(path))
+	return rp == rr || strings.HasPrefix(rp, rr+string(filepath.Separator))
+}
+
+// sandboxGateConfigPath 認出「沙盒自己的閘門機關」：改寫它們不是一般的
+// worktree 內寫入，是繞過閘門本身（review Critical 3）。
+//
+//   - <worktree>/.claude/settings.local.json：EnsureAgentSettings
+//     （worktree.go）寫入的就是這次 tmux session 的 PreToolUse hook 設定；
+//     writeAgentSettings 只在檔案不存在時才寫（worktree.go:176），所以沙盒
+//     把內容改掉之後不會被復原，破壞會撐過 session 重啟。
+//   - <worktree>/.git：EnsureWorktree 建立的是 `git worktree add` checkout，
+//     這裡的 .git 不是目錄，是一個指向真正 git dir 的指標檔
+//     （內容是 "gitdir: <路徑>"，已用真的 worktree 驗證過）。改寫這個檔案
+//     可以讓後續任何被允許的 git 指令（含 readonly 的 git status、develop
+//     的 git commit/push）改去讀一個攻擊者控制的 git dir——自己的 config、
+//     自己的 hooks，效果等同真的能寫 .git/hooks，只是路徑長得不一樣。這裡
+//     同時擋 .git 本身與任何 .git/... 前綴，不論解析出來是檔案還是目錄，
+//     避免依賴「.git 目前是檔案」這個實作細節。
+func sandboxGateConfigPath(worktree, path string) bool {
+	if worktree == "" || path == "" {
+		return false
+	}
+	rp := resolveExistingPrefix(cleanAbs(path))
+	wt := cleanAbs(worktree)
+
+	settings := resolveExistingPrefix(filepath.Join(wt, ".claude", "settings.local.json"))
+	if rp == settings {
+		return true
+	}
+	dotGit := resolveExistingPrefix(filepath.Join(wt, ".git"))
+	return rp == dotGit || strings.HasPrefix(rp, dotGit+string(filepath.Separator))
 }
 
 // bashMetaChars 是 readonly / develop 一律拒絕的 shell metacharacter。
@@ -139,7 +218,12 @@ func editDecision(pol SandboxPolicy, hi hookInput) gateDecision {
 // token 是允許的 rm。真正的路徑侷限需要容器層隔離，本輪不做（規格第五節）。
 // 引號也不解析：禁掉 metacharacter 之後，一個能繞過首 token 檢查的引號組合
 // 就不存在了，這是這條規則全部的保證。
-var bashMetaChars = []string{";", "&&", "||", "|", "`", "$(", ">", ">>", "<", "\n"}
+//
+// review Critical 1：原始清單漏了單獨的 "&"（background 運算子）——
+// `ls & rm -rf /home/conray/project` 的首 token 是允許的 ls，指令裡沒有
+// `&&`，就這樣繞過了整條規則。"&" 是 "&&" 的超集（Contains 對 "&&" 一樣會
+// 命中），加了它之後 "&&" 這條可以留著當文件用，不影響判定。
+var bashMetaChars = []string{";", "&", "&&", "||", "|", "`", "$(", ">", ">>", "<", "\n"}
 
 var readonlyBashHeads = map[string]bool{
 	"git": true, "ls": true, "cat": true, "head": true, "tail": true, "wc": true,
@@ -194,7 +278,30 @@ func bashDecision(level GrantLevel, cmd string) gateDecision {
 	if head == "git" {
 		return gitDecision(level, fields)
 	}
+	// review Critical 2：find 在允許清單內，但 -exec/-execdir/-ok/-okdir/
+	// -fprintf 可以讓 find 自己啟動任意程式，且用 `+` 收尾（不是 `;`）就不
+	// 含在 bashMetaChars 裡，能繞過整條規則。find 本身留在允許清單（列目錄
+	// 是 readonly 的正常需求），只擋帶執行旗標的用法。
+	if head == "find" && hasFindExecFlag(fields) {
+		return gateDeny("denied_bash_rule", "a2a gate: find 不允許帶 -exec/-execdir/-ok/-okdir/-fprintf")
+	}
 	return gateAllow("a2a gate: 等級 " + string(level) + " 允許指令 " + head)
+}
+
+// findExecFlags 是 find 會用來啟動另一個程式（或把輸出格式化成別的用途）的
+// 旗標。`+` 收尾的 -exec（如 `find x -exec rm -rf {} +`）不含分號，逃過
+// bashMetaChars 對 ";" 的檢查，因此改用旗標本身擋。
+var findExecFlags = map[string]bool{
+	"-exec": true, "-execdir": true, "-ok": true, "-okdir": true, "-fprintf": true,
+}
+
+func hasFindExecFlag(fields []string) bool {
+	for _, f := range fields[1:] {
+		if findExecFlags[f] {
+			return true
+		}
+	}
+	return false
 }
 
 // gitDecision 檢查 git 的子命令。子命令必須是 fields[1]：允許 `git -C <dir>
@@ -226,7 +333,30 @@ func gitDecision(level GrantLevel, fields []string) gateDecision {
 			}
 		}
 	}
+	if sub == "remote" {
+		// review Minor 2：readonly/develop 都能到 "remote"（readonlyGitSubs
+		// 允許），但 remote 有自己的子命令，原本沒檢查 fields[2]——
+		// `git remote set-url origin <attacker>` 可以把 origin 換掉，develop
+		// 允許的 git push 接著就會把東西送到攻擊者的遠端。只放行明顯是讀取
+		// 的用法，其餘（add/remove/rename/set-url/set-head/...）一律拒絕。
+		rsub := ""
+		if len(fields) > 2 {
+			rsub = fields[2]
+		}
+		if !readonlyGitRemoteSubs[rsub] {
+			return gateDeny("denied_bash_rule", "a2a gate: git remote 不允許子命令 "+rsub)
+		}
+	}
 	return gateAllow("a2a gate: 等級 " + string(level) + " 允許 git " + sub)
+}
+
+// readonlyGitRemoteSubs 是 `git remote` 允許的子命令：裸的 `git remote`
+// （列出）、`-v`（列出並顯示 URL）、`show <name>`、`get-url <name>`。任何會
+// 改動遠端設定的子命令（add/remove/rename/set-url/set-head/set-branches/
+// prune/update）都不在清單內，因為那些足以把 develop 允許的 git push 導向
+// 攻擊者控制的遠端。
+var readonlyGitRemoteSubs = map[string]bool{
+	"": true, "-v": true, "show": true, "get-url": true,
 }
 
 // GateLogEntry 是一次執行期判定的紀錄。
