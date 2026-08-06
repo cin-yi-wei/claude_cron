@@ -26,8 +26,11 @@ func seedA2ARoot(t *testing.T, adminAddr string) string {
 	return root
 }
 
-// CLI 是 admin API 的薄客戶端。它自己寫檔會打破「只有 serve 寫這些檔」這個
-// 不變量（a2a_store.go:10 的 in-process mutex 就是靠它成立的）。
+// CLI 是 admin API 的薄客戶端，唯一的寫入路徑。它自己寫檔會打破「只有 serve
+// 寫這些檔」這個不變量（a2a_store.go:10 的 in-process mutex 就是靠它成立
+// 的）。曾經有的 --offline 直寫模式已經整段移除：review 抓到它會與 serve 的
+// LoadCallers/SaveCallers 交錯而悄悄丟掉彼此的寫入（沒有跨行程鎖），且它唯一
+// 的安全前提只靠一次有 TOCTOU 的 /api/healthz 探測。
 func TestA2ACLIGoesThroughTheAdminAPI(t *testing.T) {
 	var gotPath, gotAuth, gotBody string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -56,15 +59,18 @@ func TestA2ACLIGoesThroughTheAdminAPI(t *testing.T) {
 		t.Fatalf("body = %s", gotBody)
 	}
 	if _, err := os.Stat(filepath.Join(root, "agents.json")); err == nil {
-		t.Fatal("the online path must not write agents.json directly")
+		t.Fatal("the CLI must never write agents.json directly; it has exactly one writer path, the admin API")
 	}
 }
 
-// --offline 必須先探 /api/healthz，探得到就拒絕執行。
-func TestA2ACLIOfflineRefusesWhileServeIsUp(t *testing.T) {
+// An unknown verb must fail specifically because it's an unknown verb, not
+// because the implementation refuses everything indiscriminately. Proven by
+// running a known verb against the very same server/root first and requiring
+// it to succeed before checking the unknown one fails.
+func TestA2ACLIRejectsUnknownVerb(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/api/healthz" {
-			_, _ = w.Write([]byte(`{"status":"ok"}`))
+		if r.URL.Path == "/api/a2a/agents" && r.Method == http.MethodGet {
+			_, _ = w.Write([]byte(`[]`))
 			return
 		}
 		http.NotFound(w, r)
@@ -73,32 +79,121 @@ func TestA2ACLIOfflineRefusesWhileServeIsUp(t *testing.T) {
 	root := seedA2ARoot(t, strings.TrimPrefix(srv.URL, "http://"))
 
 	var out, errOut bytes.Buffer
-	code := runA2ACommand([]string{"agent", "list", "--offline", "--root", root}, &out, &errOut)
-	if code == 0 {
-		t.Fatal("--offline must refuse while serve is reachable")
+	if code := runA2ACommand([]string{"agent", "list", "--root", root}, &out, &errOut); code != 0 {
+		t.Fatalf("a known verb must succeed against the same root: exit %d: %s", code, errOut.String())
 	}
-	if !strings.Contains(errOut.String(), "serve") {
-		t.Fatalf("the refusal must say why: %s", errOut.String())
+
+	out.Reset()
+	errOut.Reset()
+	if code := runA2ACommand([]string{"agent", "frobnicate", "x", "--root", root}, &out, &errOut); code == 0 {
+		t.Fatal("an unknown verb must exit non-zero")
 	}
 }
 
-func TestA2ACLIOfflineWritesWhenServeIsDown(t *testing.T) {
-	// 127.0.0.1:1 沒有東西在聽。
-	root := seedA2ARoot(t, "127.0.0.1:1")
+// cfg.A2A.Enabled is the kill switch for the whole surface. Disabled must
+// refuse before making any HTTP call and before touching any file, with a
+// message that says why.
+func TestA2ACLIRefusesWhenA2ADisabled(t *testing.T) {
+	hit := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit = true
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer srv.Close()
+
+	root := t.TempDir()
+	blob, _ := json.Marshal(map[string]any{
+		"admin": map[string]any{"listen": strings.TrimPrefix(srv.URL, "http://"), "token": "adm-token"},
+		"a2a":   map[string]any{"enabled": false},
+	})
+	if err := os.WriteFile(filepath.Join(root, "config.json"), blob, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
 	var out, errOut bytes.Buffer
-	code := runA2ACommand([]string{"agent", "add", "pm", "--project=/p/pm", "--enabled", "--offline", "--root", root}, &out, &errOut)
+	code := runA2ACommand([]string{"agent", "list", "--root", root}, &out, &errOut)
+	if code == 0 {
+		t.Fatal("must refuse when a2a is disabled")
+	}
+	if hit {
+		t.Fatal("must not call the admin API when a2a is disabled")
+	}
+	if !strings.Contains(errOut.String(), "disabled") {
+		t.Fatalf("the refusal must say why: %s", errOut.String())
+	}
+	if _, err := os.Stat(filepath.Join(root, "agents.json")); err == nil {
+		t.Fatal("must not write any file when a2a is disabled")
+	}
+}
+
+// `a2a audit` has no verb — only a group. A blanket `len(pos) < 2` guard
+// would reject this permanently; confirm it goes straight to
+// GET /api/a2a/audit instead.
+func TestA2ACLIAuditNeedsNoVerb(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer srv.Close()
+	root := seedA2ARoot(t, strings.TrimPrefix(srv.URL, "http://"))
+
+	var out, errOut bytes.Buffer
+	code := runA2ACommand([]string{"audit", "--root", root}, &out, &errOut)
 	if code != 0 {
 		t.Fatalf("exit %d: %s", code, errOut.String())
 	}
-	if _, err := os.Stat(filepath.Join(root, "agents.json")); err != nil {
-		t.Fatalf("offline mode must write agents.json: %v", err)
+	if gotPath != "/api/a2a/audit" {
+		t.Fatalf("path = %q", gotPath)
 	}
 }
 
-func TestA2ACLIRejectsUnknownVerb(t *testing.T) {
-	root := seedA2ARoot(t, "127.0.0.1:1")
+// --enabled is documented as a bare flag (`[--enabled]`), never
+// `--enabled=value`. Omitting it must default to false, and passing it must
+// set true — this is the semantics an earlier offline-mode implementation
+// got backwards (it read opts["enabled"] instead of flags["enabled"], so
+// omitting --enabled silently defaulted to enabled=true). Pinned here on the
+// one surviving (online) path.
+func TestA2ACLIAgentAddEnabledIsABareFlag(t *testing.T) {
+	var gotBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"name":"pm"}`))
+	}))
+	defer srv.Close()
+	root := seedA2ARoot(t, strings.TrimPrefix(srv.URL, "http://"))
+
 	var out, errOut bytes.Buffer
-	if code := runA2ACommand([]string{"agent", "frobnicate", "x", "--root", root}, &out, &errOut); code == 0 {
-		t.Fatal("an unknown verb must exit non-zero")
+	if code := runA2ACommand([]string{"agent", "add", "pm", "--project=/p/pm", "--root", root}, &out, &errOut); code != 0 {
+		t.Fatalf("exit %d: %s", code, errOut.String())
+	}
+	if !strings.Contains(gotBody, `"enabled":false`) {
+		t.Fatalf("omitting --enabled must default to false: body = %s", gotBody)
+	}
+
+	if code := runA2ACommand([]string{"agent", "add", "pm2", "--project=/p/pm2", "--enabled", "--root", root}, &out, &errOut); code != 0 {
+		t.Fatalf("exit %d: %s", code, errOut.String())
+	}
+	if !strings.Contains(gotBody, `"enabled":true`) {
+		t.Fatalf("bare --enabled must set true: body = %s", gotBody)
+	}
+}
+
+// --root must accept both `--root <dir>` and `--root=<dir>` — runBusyCommand
+// (main.go:745) already accepts both forms; a2a silently ignoring the
+// latter and falling back to ./.channel-agent would target the wrong tree.
+func TestA2ACLIRootAcceptsEqualsForm(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer srv.Close()
+	root := seedA2ARoot(t, strings.TrimPrefix(srv.URL, "http://"))
+
+	var out, errOut bytes.Buffer
+	code := runA2ACommand([]string{"agent", "list", "--root=" + root}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("--root=<dir> must work: exit %d: %s", code, errOut.String())
 	}
 }

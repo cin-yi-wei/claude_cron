@@ -2,8 +2,6 @@ package main
 
 import (
 	"bytes"
-	"crypto/rand"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,12 +15,18 @@ import (
 
 // runA2ACommand 實作 `claude-cron a2a <group> <verb> …`。旗標解析風格比照
 // runManageCommand（main.go:457）：--key=value 進 opts，裸 --flag 進 flags，
-// 其餘是位置參數。
+// 其餘是位置參數。--root 同時接受 `--root <dir>` 與 `--root=<dir>`，比照
+// runBusyCommand（main.go:745）。
 //
-// 預設一律走 admin API。CLI 是另一個行程，直接寫 tasks.json / agents.json /
-// callers.json 會打破 a2a_store.go:10 那句「Only serve writes tasks.json, so
-// an in-process mutex is sufficient」—— 那個 in-process mutex 是整個 A2A 併發
-// 正確性的基礎。--offline 才直接改檔，且必須先探 /api/healthz，探得到就拒絕。
+// 一律走 admin API，沒有第二種寫入路徑。CLI 是另一個行程，直接寫
+// tasks.json / agents.json / callers.json 會打破 a2a_store.go:10 那句
+// 「Only serve writes tasks.json, so an in-process mutex is sufficient」——
+// 那個 in-process mutex 是整個 A2A 併發正確性的基礎，Task 13 的 admin API
+// 存在正是為了讓這些檔案不再被手動編輯或被第二個行程搶寫。這裡曾經有一個
+// `--offline` 直寫模式，但它的唯一安全前提（「serve 沒在跑」）只能靠探測
+// /api/healthz 這種有 TOCTOU 的方式檢查，且沒有跨行程鎖，會與 serve 的
+// LoadCallers/SaveCallers 交錯而悄悄丟掉彼此的寫入（review 抓到的真實
+// repro）；已整段移除，改成一律要求可連通的 admin API。
 func runA2ACommand(rest []string, stdout, stderr io.Writer) int {
 	root := ".channel-agent"
 	opts := map[string]string{}
@@ -37,6 +41,8 @@ func runA2ACommand(rest []string, stdout, stderr io.Writer) int {
 			}
 			root = rest[i+1]
 			i++
+		case strings.HasPrefix(rest[i], "--root="):
+			root = strings.TrimPrefix(rest[i], "--root=")
 		case strings.HasPrefix(rest[i], "--"):
 			kv := strings.TrimPrefix(rest[i], "--")
 			if k, v, ok := strings.Cut(kv, "="); ok {
@@ -62,27 +68,22 @@ func runA2ACommand(rest []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	// 整個 A2A 表面都掛在這個 kill switch 底下（cfg.A2A.Enabled，預設
-	// false）。關掉的時候，admin API 的 /api/a2a/* 一律回 404
-	// （a2a_admin.go serveA2A），--offline 若照樣寫 agents.json /
-	// callers.json，serve 完全不會讀它們 —— 那是「默默改一個沒人管的檔案」，
-	// 不是「拒絕並說明」。兩種模式都在這裡統一擋下。
+	// false）。關掉的時候 admin API 的 /api/a2a/* 一律回 404
+	// （a2a_admin.go serveA2A），所以在這裡就先擋下並說明原因，而不是讓
+	// 每個子命令各自去踩一次 404。
 	if !cfg.A2A.Enabled {
 		fmt.Fprintln(stderr, "a2a is disabled (a2a.enabled=false in config.json); refusing to manage agents, callers, tasks, or audit until it is turned on")
 		return 1
 	}
-	// 注意：不在此統一要求 len(pos) >= 2 —— `a2a audit` 是唯一一個沒有第二個
-	// 位置參數（動詞）的頂層命令，缺動詞的其餘命令交給下面兩個 run 函式的
-	// switch default 去印 usage。
-
-	base := "http://" + cfg.Admin.Listen
-	if flags["offline"] {
-		if adminReachable(base) {
-			fmt.Fprintf(stderr, "拒絕執行：serve 正在 %s 上運行。所有 A2A 狀態的寫入必須經由 admin API 在 serve 行程內完成，否則會打破 tasks.json 的單寫者不變量。請拿掉 --offline。\n", cfg.Admin.Listen)
-			return 1
-		}
-		return runA2AOffline(root, pos, opts, flags, stdout, stderr)
+	if cfg.Admin.Listen == "" {
+		fmt.Fprintln(stderr, "admin.listen is not configured; the a2a CLI has no other way to reach agents.json/callers.json/tasks.json and refuses to write them directly")
+		return 1
 	}
-	c := a2aClient{base: base, token: cfg.Admin.Token}
+	// 注意：不要求 len(pos) >= 2 —— `a2a audit` 是唯一一個沒有第二個位置參數
+	// （動詞）的頂層命令；缺動詞的其餘命令交給 runA2AOnline 的 switch
+	// default 去印 usage。
+
+	c := a2aClient{base: "http://" + cfg.Admin.Listen, token: cfg.Admin.Token}
 	return runA2AOnline(c, pos, opts, flags, stdout, stderr)
 }
 
@@ -98,7 +99,8 @@ const a2aUsage = `用法：
   claude-cron a2a task list [--state=…]
   claude-cron a2a task cancel <contextId>
   claude-cron a2a audit [--limit=200]
-共用旗標：--root=<dir> --offline`
+共用旗標：--root=<dir>（或 --root <dir>）。所有動作都經由 admin API 執行，需要
+serve 正在跑且 admin.listen 已設定。`
 
 // a2aClient 是 /api/a2a/* 的薄 HTTP 客戶端。
 type a2aClient struct {
@@ -137,20 +139,11 @@ func (c a2aClient) do(method, path string, body any) ([]byte, error) {
 	return out, nil
 }
 
-// adminReachable 探 /api/healthz（未認證端點）。
-func adminReachable(base string) bool {
-	resp, err := (&http.Client{Timeout: 2 * time.Second}).Get(base + "/api/healthz")
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-	return resp.StatusCode == http.StatusOK
-}
-
 // a2aGroupVerbArg 把位置參數拆成 group、verb、arg，三者都容許缺席（`a2a
 // audit` 只有 group，沒有 verb 也沒有 arg）。呼叫端用 group+" "+verb 對應
 // switch case；verb 缺席時就是空字串，剛好對得上 `case "audit ":` 那個刻意
-// 留了尾端空白的 case label。
+// 留了尾端空白的 case label（這個空白只出現在內部的 switch key，從不寫進任何
+// 使用者可見的輸出）。
 func a2aGroupVerbArg(pos []string) (group, verb, arg string) {
 	if len(pos) > 0 {
 		group = pos[0]
@@ -261,124 +254,4 @@ func filterTasksByState(blob []byte, state string) []byte {
 		return blob
 	}
 	return out
-}
-
-// runA2AOffline 直接改檔。只在 serve 沒在跑時可用（呼叫端已經探過
-// /api/healthz）。刻意只支援不需要停 session 的動作：撤銷與取消必須在 serve
-// 行程內完成，因為它們要停 driver goroutine 與 tmux session。
-func runA2AOffline(root string, pos []string, opts map[string]string, flags map[string]bool, stdout, stderr io.Writer) int {
-	group, verb, arg := a2aGroupVerbArg(pos)
-	switch group + " " + verb {
-	case "agent add":
-		agents, err := agent.LoadAgents(root)
-		if err != nil {
-			fmt.Fprintln(stderr, err)
-			return 1
-		}
-		if err := agents.Add(agent.Agent{
-			Name: arg, ProjectDir: opts["project"], Description: opts["description"],
-			Capabilities: splitCSV(opts["capabilities"]), ChannelID: opts["channel"],
-			// 比對 online 路徑：enabled 是裸旗標，預設關閉，不是
-			// opts["enabled"]（那只會在寫成 --enabled=xxx 時填入，裸
-			// --enabled 永遠進 flags，兩條路徑不一致會讓同一條指令離線/連線
-			// 產生不同結果）。
-			Enabled: flags["enabled"],
-		}); err != nil {
-			fmt.Fprintln(stderr, err)
-			return 1
-		}
-		if err := agent.SaveAgents(root, agents); err != nil {
-			fmt.Fprintln(stderr, err)
-			return 1
-		}
-		fmt.Fprintf(stdout, "agent %s added (offline)\n", arg)
-		return 0
-	case "agent list":
-		agents, err := agent.LoadAgents(root)
-		if err != nil {
-			fmt.Fprintln(stderr, err)
-			return 1
-		}
-		blob, _ := json.MarshalIndent(agents.Agents, "", "  ")
-		fmt.Fprintln(stdout, string(blob))
-		return 0
-	case "agent remove":
-		agents, err := agent.LoadAgents(root)
-		if err != nil {
-			fmt.Fprintln(stderr, err)
-			return 1
-		}
-		if !agents.Remove(arg) {
-			fmt.Fprintf(stderr, "unknown agent %q\n", arg)
-			return 1
-		}
-		if err := agent.SaveAgents(root, agents); err != nil {
-			fmt.Fprintln(stderr, err)
-			return 1
-		}
-		fmt.Fprintf(stdout, "agent %s removed (offline)\n", arg)
-		return 0
-	case "caller register":
-		callers, err := agent.LoadCallers(root)
-		if err != nil {
-			fmt.Fprintln(stderr, err)
-			return 1
-		}
-		cred := opts["credential"]
-		if cred == "" {
-			buf := make([]byte, 32)
-			if _, rerr := rand.Read(buf); rerr != nil {
-				fmt.Fprintln(stderr, rerr)
-				return 1
-			}
-			cred = base64.RawURLEncoding.EncodeToString(buf)
-		}
-		if err := callers.Register(arg, cred); err != nil {
-			fmt.Fprintln(stderr, err)
-			return 1
-		}
-		if err := agent.SaveCallers(root, callers); err != nil {
-			fmt.Fprintln(stderr, err)
-			return 1
-		}
-		fmt.Fprintf(stdout, "憑證只會顯示這一次，請立即保存：\n%s\n", cred)
-		return 0
-	case "caller list":
-		callers, err := agent.LoadCallers(root)
-		if err != nil {
-			fmt.Fprintln(stderr, err)
-			return 1
-		}
-		for _, c := range callers.Callers {
-			// 永遠不印 credential。
-			fmt.Fprintf(stdout, "%s\tstatus=%s\tlevel=%s\tcaps=%s\n",
-				c.CallerID, c.Status, c.EffectiveGrantLevel(), strings.Join(c.GrantedCapabilities, ","))
-		}
-		return 0
-	case "caller approve":
-		callers, err := agent.LoadCallers(root)
-		if err != nil {
-			fmt.Fprintln(stderr, err)
-			return 1
-		}
-		lvl := agent.GrantLevel(opts["level"])
-		if !agent.ValidGrantLevel(lvl) {
-			fmt.Fprintln(stderr, "--level must be readonly, develop or full")
-			return 2
-		}
-		if !callers.Approve(arg, splitCSV(opts["capabilities"])) {
-			fmt.Fprintf(stderr, "unknown caller %q\n", arg)
-			return 1
-		}
-		callers.SetGrantLevel(arg, lvl)
-		if err := agent.SaveCallers(root, callers); err != nil {
-			fmt.Fprintln(stderr, err)
-			return 1
-		}
-		fmt.Fprintf(stdout, "caller %s approved at %s (offline)\n", arg, lvl)
-		return 0
-	default:
-		fmt.Fprintf(stderr, "%q 在 --offline 模式下不支援：此動作需要 serve 行程內才有的狀態或收尾動作（例如撤銷/取消要停掉 driver 與 tmux session），無法安全地離線完成。請移除 --offline，改走 admin API。\n", group+" "+verb)
-		return 2
-	}
 }
