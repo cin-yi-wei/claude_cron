@@ -13,6 +13,15 @@ import (
 
 // adminAgentDTO / adminCallerDTO：任何 GET 都不得回傳 credential 或
 // callback_token，改回 has_credential / has_callback。
+//
+// Filtered / FilterReason（2026-08-06 followup review）：只有 listA2AAgents
+// 會填,createA2AAgent 解碼請求體時這兩個欄位永遠是零值——客戶端送了也沒有
+// 任何程式碼會讀它們。標出「這筆 entry 存在於 agents.json,但被 LoadAgents
+// 的驗證過濾擋在 dispatch 之外」的情況：名稱不合法,或 channel_id 撞到一個
+// binding。沒有這兩個欄位，操作者只能看見 LoadAgents 濾過的清單——被排除
+// 的 agent 直接從畫面上消失，而且往往是在它建立之後、透過完全跟它無關的
+// 另一個操作（例如新建一個 binding）才被排除的，操作者根本沒做任何看起來
+// 相關的事，也就無從得知該去修哪一個 agent。
 type adminAgentDTO struct {
 	Name         string   `json:"name"`
 	ProjectDir   string   `json:"project_dir"`
@@ -20,6 +29,8 @@ type adminAgentDTO struct {
 	Capabilities []string `json:"capabilities"`
 	ChannelID    string   `json:"channel_id,omitempty"`
 	Enabled      bool     `json:"enabled"`
+	Filtered     bool     `json:"filtered,omitempty"`
+	FilterReason string   `json:"filter_reason,omitempty"`
 }
 
 type adminCallerDTO struct {
@@ -128,15 +139,31 @@ func tailAudit(entries []AuditEntry, limit int) []AuditEntry {
 	return entries
 }
 
+// listA2AAgents 用 LoadAgentsFiltered 而不是 LoadAgents：後者是 dispatch 唯一
+// 該看到的版本,語意不能動;這裡額外要的是「連被濾掉的也顯示,附上原因」,
+// 所以兩者一起列出,用 Filtered/FilterReason 分清楚哪個是哪個
+// （2026-08-06 followup review——見 adminAgentDTO 上方的說明）。CLI（原封不動
+// 轉印這份 JSON）跟著自動拿到這兩個欄位；UI 是唯一還需要另外改的地方
+// （Agents.svelte）。
 func (h AdminHandler) listA2AAgents(w http.ResponseWriter) {
-	agents, err := LoadAgents(h.Root)
+	agents, filtered, err := LoadAgentsFiltered(h.Root)
 	if err != nil {
 		http.Error(w, "agent store unavailable", http.StatusInternalServerError)
 		return
 	}
-	out := make([]adminAgentDTO, 0, len(agents.Agents))
+	out := make([]adminAgentDTO, 0, len(agents.Agents)+len(filtered))
 	for _, a := range agents.Agents {
-		out = append(out, adminAgentDTO{a.Name, a.ProjectDir, a.Description, a.Capabilities, a.ChannelID, a.Enabled})
+		out = append(out, adminAgentDTO{
+			Name: a.Name, ProjectDir: a.ProjectDir, Description: a.Description,
+			Capabilities: a.Capabilities, ChannelID: a.ChannelID, Enabled: a.Enabled,
+		})
+	}
+	for _, f := range filtered {
+		out = append(out, adminAgentDTO{
+			Name: f.Agent.Name, ProjectDir: f.Agent.ProjectDir, Description: f.Agent.Description,
+			Capabilities: f.Agent.Capabilities, ChannelID: f.Agent.ChannelID, Enabled: f.Agent.Enabled,
+			Filtered: true, FilterReason: f.Reason,
+		})
 	}
 	writeJSONResponse(w, out)
 }
@@ -281,10 +308,18 @@ func (h AdminHandler) a2aAgentAction(w http.ResponseWriter, r *http.Request, res
 // 只改一個欄位時，其餘沒帶的欄位會被 JSON 預設值（""、nil）整批覆寫過去，
 // 這正是 Gap 1 報告裡點名要避免的「改一個欄位卻清空其他欄位」。
 //
-// Name 只用來偵測「這個請求想改名」並拒絕它——name 是 agent 的身分，
+// Name 平時只用來偵測「這個請求想改名」並拒絕它——name 是 agent 的身分，
 // SessionNameFor／SandboxWorktree 都拿它派生 session 名與 worktree 路徑，
 // 改名會讓正在跑的沙盒（如果有）失去自己的記錄，且沒有任何程式碼會去搬移
 // 一個活著的 tmux session 或 worktree 去對上新名字。要換名字得刪除重建。
+//
+// 唯一例外（2026-08-06 followup review）：URL 路徑裡現有的那個名字本身就不
+// 合法（例如含空白）時，允許把它改成一個合法的新名字。這種 entry 從一開始
+// 就通不過 a2aNameRe，LoadAgents 永遠把它濾掉——dispatch 從沒看過它，
+// SessionNameFor 從沒替它算出任何 session 名或 worktree 路徑,所以沒有沙盒
+// 可能因此孤兒化。這是名字不合法這一類 entry 唯一真正的修復手段（見
+// a2a_agents.go replace 上方的說明：其他欄位可以直接透過 replace 改,名字
+// 本身不行）。新名字仍要通過一般的格式與唯一性檢查,見 updateA2AAgent。
 //
 // Enabled 刻意不在這裡：enable/disable 各自有專用路由，/update 完全不碰
 // 這個欄位，維持單一權責。
@@ -297,7 +332,7 @@ type adminAgentUpdateDTO struct {
 }
 
 // updateA2AAgent 改一個既有 agent 的 project_dir / description / capabilities /
-// channel_id。跟 enable 用同一個 Get → 改本地副本 → Remove → Add 手法（見上面
+// channel_id。跟 enable 用同一個 Get → 改本地副本 → replace 手法（見上面
 // a2aAgentAction 的 /enable 分支），一樣包在單次 WithAgents 呼叫裡，讀-改-寫
 // 對併發請求是原子的。
 //
@@ -305,15 +340,31 @@ type adminAgentUpdateDTO struct {
 // agent 是永久 fail-closed（TestZeroCapabilityAgentDeniedByDefault），過去只
 // 能刪除重建才能補上 capabilities，把任何跟這個 agent 綁在一起的東西都丟掉。
 // 現在操作者可以直接送一次 {"capabilities":[...]} 補救。
+//
+// renaming 這條分支是名字不合法這一類 entry 唯一能修好名字本身的路：只有
+// 「URL 裡現有的名字過不了 a2aNameRe」時才打開,新名字必須合法、且不能跟
+// 既有的任何 agent 撞名——兩個檢查都跟 Add 一樣,但故意不呼叫 Add（見
+// adminAgentUpdateDTO 與 a2a_agents.go replace 的說明）。renaming 時不能用
+// replace：replace 用新的 a.Name 去找同名的舊列,但舊列還是掛在舊名字下,
+// 找不到就什麼都不做,是一個看起來成功、實際上沒存到任何東西的假陽性。這裡
+// 改成明確的 Remove(舊名) + append(新 entry)。
 func (h AdminHandler) updateA2AAgent(w http.ResponseWriter, r *http.Request, name string) {
 	var in adminAgentUpdateDTO
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
+	renaming := false
 	if in.Name != nil && *in.Name != name {
-		http.Error(w, "agent name is immutable (it derives session and worktree names); delete and recreate to rename", http.StatusBadRequest)
-		return
+		if a2aNameRe.MatchString(name) {
+			http.Error(w, "agent name is immutable (it derives session and worktree names); delete and recreate to rename", http.StatusBadRequest)
+			return
+		}
+		if !a2aNameRe.MatchString(*in.Name) {
+			http.Error(w, fmt.Sprintf("invalid new agent name %q: use lowercase letters, digits, dashes", *in.Name), http.StatusBadRequest)
+			return
+		}
+		renaming = true
 	}
 	if in.ChannelID != nil {
 		if bname, clash := bindingChannelClaim(h.Root, *in.ChannelID); clash {
@@ -322,11 +373,18 @@ func (h AdminHandler) updateA2AAgent(w http.ResponseWriter, r *http.Request, nam
 		}
 	}
 	missing := false
+	renameConflict := false
 	if err := WithAgents(h.Root, func(agents *AgentStore) error {
 		a, ok := agents.Get(name)
 		if !ok {
 			missing = true
 			return errA2AStoreUnchanged
+		}
+		if renaming {
+			if _, exists := agents.Get(*in.Name); exists {
+				renameConflict = true
+				return errA2AStoreUnchanged
+			}
 		}
 		if in.ProjectDir != nil {
 			a.ProjectDir = *in.ProjectDir
@@ -340,11 +398,21 @@ func (h AdminHandler) updateA2AAgent(w http.ResponseWriter, r *http.Request, nam
 		if in.ChannelID != nil {
 			a.ChannelID = *in.ChannelID
 		}
-		agents.replace(a)
+		if renaming {
+			agents.Remove(name)
+			a.Name = *in.Name
+			agents.Agents = append(agents.Agents, a)
+		} else {
+			agents.replace(a)
+		}
 		return nil
 	}); err != nil {
 		if missing {
 			http.Error(w, "unknown agent", http.StatusNotFound)
+			return
+		}
+		if renameConflict {
+			http.Error(w, fmt.Sprintf("agent %q already exists", *in.Name), http.StatusBadRequest)
 			return
 		}
 		http.Error(w, "cannot save agents", http.StatusInternalServerError)

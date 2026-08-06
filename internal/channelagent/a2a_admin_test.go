@@ -300,6 +300,166 @@ func TestAdminA2AMalformedEntryCanBeFixedAndRemoved(t *testing.T) {
 	}
 }
 
+// Follow-up review (2026-08-06): an agent can disappear from the OTHER
+// direction — create the agent first, then create a binding on the same
+// channel. LoadAgents drops it silently on every future load: gone from
+// dispatch AND from GET /api/a2a/agents, and the only recovery
+// (POST .../update {"channel_id":""}) requires already knowing the name,
+// which the listing no longer shows. The fix must not reject the bind
+// (bindings always win) — it must make the admin listing surface the
+// excluded agent, marked distinctly, with a reason naming the colliding
+// binding.
+func TestAdminA2AAgentListSurfacesEntryFilteredByLateBindingChannelCollision(t *testing.T) {
+	h, root := newA2AAdmin(t)
+
+	rec := adminReq(t, h, http.MethodPost, "/api/a2a/agents",
+		`{"name":"probe","project_dir":"/p/probe","channel_id":"999","enabled":true}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create = %d %s", rec.Code, rec.Body.String())
+	}
+
+	reg := Registry{Bindings: []Binding{{Name: "cc-late", ChannelID: "999"}}}
+	if err := SaveRegistry(root, reg); err != nil {
+		t.Fatalf("SaveRegistry: %v", err)
+	}
+
+	got, err := LoadAgents(root)
+	if err != nil {
+		t.Fatalf("LoadAgents: %v", err)
+	}
+	if len(got.Agents) != 0 {
+		t.Fatalf("agents = %#v, want the agent gone from dispatch — the binding must still win", got.Agents)
+	}
+
+	rec = adminReq(t, h, http.MethodGet, "/api/a2a/agents", "")
+	var listed []adminAgentDTO
+	if err := json.Unmarshal(rec.Body.Bytes(), &listed); err != nil {
+		t.Fatalf("unmarshal agent list: %v", err)
+	}
+	if len(listed) != 1 {
+		t.Fatalf("GET /api/a2a/agents = %#v, want the excluded agent still visible to the operator", listed)
+	}
+	if listed[0].Name != "probe" {
+		t.Fatalf("listed[0].Name = %q, want probe", listed[0].Name)
+	}
+	if !listed[0].Filtered {
+		t.Fatal("want probe marked Filtered=true so it reads as excluded, not healthy")
+	}
+	if listed[0].FilterReason == "" || !strings.Contains(listed[0].FilterReason, "cc-late") {
+		t.Fatalf("FilterReason = %q, want it to name the colliding binding cc-late", listed[0].FilterReason)
+	}
+}
+
+// Minor follow-up (2026-08-06): a name-malformed entry could be reached by
+// /update, /enable and DELETE (TestAdminA2AMalformedEntryCanBeFixedAndRemoved
+// above) but never actually repaired at the one place its real defect lives
+// — its own name. Renaming out of an invalid name cannot orphan a live
+// sandbox: SessionNameFor/SandboxWorktree never derived anything for a name
+// that never passed a2aNameRe (LoadAgents always dropped it), so no sandbox
+// could ever have started under it. This is the one rename /update allows.
+func TestAdminA2AAgentUpdateAllowsRenameFromInvalidName(t *testing.T) {
+	h, root := newA2AAdmin(t)
+	if err := AtomicWriteJSON(AgentsPath(root), map[string]any{"agents": []map[string]any{
+		{"name": "Bad Name", "project_dir": "/p/bad", "description": "d", "enabled": false},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := adminReq(t, h, http.MethodPost, "/api/a2a/agents/Bad%20Name/update", `{"name":"badname"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("rename out of an invalid name = %d %s, want 200", rec.Code, rec.Body.String())
+	}
+
+	raw, err := LoadAgentsRaw(root)
+	if err != nil {
+		t.Fatalf("LoadAgentsRaw: %v", err)
+	}
+	if len(raw.Agents) != 1 || raw.Agents[0].Name != "badname" || raw.Agents[0].ProjectDir != "/p/bad" {
+		t.Fatalf("agents = %#v, want renamed to badname with its other fields preserved", raw.Agents)
+	}
+
+	got, err := LoadAgents(root)
+	if err != nil {
+		t.Fatalf("LoadAgents: %v", err)
+	}
+	if len(got.Agents) != 1 || got.Agents[0].Name != "badname" {
+		t.Fatalf("agents = %#v, want the repaired agent now visible to LoadAgents (and thus to dispatch)", got.Agents)
+	}
+}
+
+// A rename escape hatch that only checks "is the target new" would let an
+// operator swap one broken name for another, or collide with an existing
+// agent. Both must still 400.
+func TestAdminA2AAgentUpdateRenameFromInvalidNameRejectsInvalidTarget(t *testing.T) {
+	h, root := newA2AAdmin(t)
+	if err := AtomicWriteJSON(AgentsPath(root), map[string]any{"agents": []map[string]any{
+		{"name": "Bad Name", "project_dir": "/p/bad", "enabled": false},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	rec := adminReq(t, h, http.MethodPost, "/api/a2a/agents/Bad%20Name/update", `{"name":"Still Bad"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("rename to another invalid name = %d %s, want 400", rec.Code, rec.Body.String())
+	}
+	raw, err := LoadAgentsRaw(root)
+	if err != nil {
+		t.Fatalf("LoadAgentsRaw: %v", err)
+	}
+	if len(raw.Agents) != 1 || raw.Agents[0].Name != "Bad Name" {
+		t.Fatalf("agents = %#v, name must be unchanged after a rejected rename", raw.Agents)
+	}
+}
+
+func TestAdminA2AAgentUpdateRenameFromInvalidNameRejectsCollision(t *testing.T) {
+	h, root := newA2AAdmin(t)
+	if err := AtomicWriteJSON(AgentsPath(root), map[string]any{"agents": []map[string]any{
+		{"name": "Bad Name", "project_dir": "/p/bad", "enabled": false},
+		{"name": "taken", "project_dir": "/p/taken", "enabled": true},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	rec := adminReq(t, h, http.MethodPost, "/api/a2a/agents/Bad%20Name/update", `{"name":"taken"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("rename onto an existing name = %d %s, want 400", rec.Code, rec.Body.String())
+	}
+	raw, err := LoadAgentsRaw(root)
+	if err != nil {
+		t.Fatalf("LoadAgentsRaw: %v", err)
+	}
+	names := map[string]bool{}
+	for _, a := range raw.Agents {
+		names[a.Name] = true
+	}
+	if !names["Bad Name"] || !names["taken"] || len(raw.Agents) != 2 {
+		t.Fatalf("agents = %#v, a rejected rename must not touch either entry", raw.Agents)
+	}
+}
+
+// TestAdminA2AAgentUpdateRejectsRename (above) already pins that renaming a
+// VALID name stays rejected; this pins that the escape hatch cannot be used
+// to rename a valid name away via the same code path that opens for invalid
+// ones — the guard must key off the CURRENT name's validity, not merely
+// "target differs from current".
+func TestAdminA2AAgentUpdateStillRejectsRenameOfAValidName(t *testing.T) {
+	h, root := newA2AAdmin(t)
+	rec := adminReq(t, h, http.MethodPost, "/api/a2a/agents",
+		`{"name":"pm","project_dir":"/p/pm","enabled":true}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create = %d %s", rec.Code, rec.Body.String())
+	}
+	rec = adminReq(t, h, http.MethodPost, "/api/a2a/agents/pm/update", `{"name":"pm2"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("rename of a valid name = %d %s, want 400", rec.Code, rec.Body.String())
+	}
+	got, err := LoadAgents(root)
+	if err != nil {
+		t.Fatalf("LoadAgents: %v", err)
+	}
+	if len(got.Agents) != 1 || got.Agents[0].Name != "pm" {
+		t.Fatalf("agents = %#v, name must be unchanged", got.Agents)
+	}
+}
+
 // Gap 1 的核心動機：一個宣告零 capabilities 的 agent 在 a2a_server.go 會被
 // 永久 fail-closed（TestZeroCapabilityAgentDeniedByDefault），過去唯一的救法
 // 是刪掉重建——這會丟掉任何跟它綁在一起的東西。/update 讓它可以直接被修好。

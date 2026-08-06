@@ -48,33 +48,70 @@ func AgentsPath(root string) string { return filepath.Join(root, "agents.json") 
 //     頻道唯讀輸出」這個不變量。bindings.json 只讀不寫。
 //
 // 兩者都是「跳過並 log」而不是整份載入失敗：一個手寫錯誤不該讓所有 agent 消失。
+//
+// 這個過濾規則是 dispatch 唯一該看到的版本，語意不可以變——revokeReasonForRunningTask
+// 特地拿 LoadAgents 對比 LoadAgentsRaw 來分辨「這個名字真的不存在」跟「存在,只是
+// 這次沒通過驗證」。但它同時也是這裡的代價：一個 agent 可以先合法建立、後來因為
+// 完全不相關的一個動作（例如建立一個 channel 相同的 binding）而在某次 LoadAgents
+// 悄悄消失——不只從 dispatch 消失,GET /api/a2a/agents 這份清單過去也看不到它,
+// 操作者無從發現、更無從修。LoadAgentsFiltered 是給那個需求用的額外唯讀路徑：
+// 語意跟這裡完全一樣,只是連被濾掉的 entry 跟原因也一起回傳。LoadAgents 直接呼叫
+// 它、丟掉第二個回傳值,兩者永遠不會分岔（2026-08-06 followup review）。
 func LoadAgents(root string) (AgentStore, error) {
+	s, _, err := LoadAgentsFiltered(root)
+	return s, err
+}
+
+// FilteredAgent 是 LoadAgentsFiltered 濾掉的一筆 agents.json raw entry，附上
+// 為什麼。存在的唯一理由：讓只讀的診斷/管理介面（目前是 GET /api/a2a/agents）
+// 能把「被排除」的 agent 顯示給操作者看，而不是像 dispatch 一樣直接讓它消失
+// ——尤其是那種「建立時完全合法，後來被一個跟它無關的動作連坐濾掉」的 entry,
+// 操作者往往不知道要去哪裡找。
+type FilteredAgent struct {
+	Agent  Agent  `json:"agent"`
+	Reason string `json:"reason"`
+}
+
+// LoadAgentsFiltered 套用跟 LoadAgents 完全相同的兩條驗證，但額外把被濾掉的
+// entry 連同原因一起回傳。kept 的內容、行為與 LoadAgents 的回傳值逐位元相同
+// ——這裡刻意不精簡成別的資料結構，就是為了讓兩者不可能因為各自維護而分岔。
+//
+// 只給讀、給看：呼叫端不能把 kept 存回 agents.json（那是 WithAgents 的權責,
+// 而 WithAgents 故意讀 LoadAgentsRaw、不是這裡，理由見 WithAgents 的說明），
+// 也不能把這裡回傳的過濾語意當成可以由呼叫端另外決定要不要套用的選項——一般
+// 派送路徑（Start、DrainQueue）必須繼續呼叫 LoadAgents，不能改叫這個再自己
+// 篩，那樣兩份邏輯遲早會不同步。
+func LoadAgentsFiltered(root string) (kept AgentStore, filtered []FilteredAgent, err error) {
 	s, err := LoadAgentsRaw(root)
 	if err != nil {
-		return AgentStore{}, err
+		return AgentStore{}, nil, err
 	}
 	bindingChannels := map[string]string{}
-	if reg, err := LoadRegistry(root); err == nil {
+	if reg, rerr := LoadRegistry(root); rerr == nil {
 		for _, b := range reg.Bindings {
 			if b.ChannelID != "" {
 				bindingChannels[b.ChannelID] = b.Name
 			}
 		}
 	}
-	kept := s.Agents[:0]
+	keptAgents := make([]Agent, 0, len(s.Agents))
 	for _, a := range s.Agents {
 		if !a2aNameRe.MatchString(a.Name) {
-			log.Printf("a2a: 跳過 agent %q：名稱不合法（只允許小寫字母、數字、連字號）", a.Name)
+			reason := fmt.Sprintf("名稱不合法（只允許小寫字母、數字、連字號）：%q", a.Name)
+			log.Printf("a2a: 跳過 agent %q：%s", a.Name, reason)
+			filtered = append(filtered, FilteredAgent{Agent: a, Reason: reason})
 			continue
 		}
 		if name, clash := bindingChannels[a.ChannelID]; a.ChannelID != "" && clash {
+			reason := fmt.Sprintf("channel_id %s 與 binding %q 相同：binding 的人類頻道優先，這個 agent 因此被排除在 dispatch 之外，直到它的 channel_id 改掉為止", a.ChannelID, name)
 			log.Printf("a2a: 跳過 agent %q：它的 channel_id 與 binding %q 相同，那會讓該頻道的人類訊息被 ingest 進 cc- session", a.Name, name)
+			filtered = append(filtered, FilteredAgent{Agent: a, Reason: reason})
 			continue
 		}
-		kept = append(kept, a)
+		keptAgents = append(keptAgents, a)
 	}
-	s.Agents = kept
-	return s, nil
+	s.Agents = keptAgents
+	return s, filtered, nil
 }
 
 // LoadAgentsRaw 讀 agents.json，不套用 LoadAgents 的任何驗證過濾。只給撤銷
@@ -131,6 +168,13 @@ var agentsMu sync.Mutex
 // 事一樣）；DELETE 最終呼叫的 Remove 本身從不驗證格式，一路都能刪掉一個
 // 名字不合法的 entry。一般的新派送路徑（Start、DrainQueue）完全不受影響：
 // 它們繼續呼叫 LoadAgents，過濾規則對「要不要接受新派送」的效力不變。
+//
+// 「修好」這句話當時只對 channel_id 撞名這一類為真：replace 換得掉一個
+// entry 的任何欄位，但換不掉它的 Name（見 replace 的說明），所以名字本身
+// 不合法（例如含空白）的那一類過去仍然只能刪除,不能修好——這一段先前的
+// 敘述沒有把兩類分開講清楚。updateA2AAgent 現在多開了一條窄門：只有在
+// URL 裡現有的名字本身就不合法時，才允許把它改成一個合法的新名字（見
+// a2a_admin.go updateA2AAgent 的說明），讓「修好或刪掉」對這一類也成真。
 func WithAgents(root string, fn func(*AgentStore) error) error {
 	agentsMu.Lock()
 	defer agentsMu.Unlock()
@@ -178,6 +222,13 @@ func (s *AgentStore) Add(a Agent) error {
 // 證對「改欄位」這一半成立的關鍵——找不到就是呼叫方自己的邏輯錯誤（呼叫
 // 前一定先 Get 確認過存在），直接讓它整段被 fn 的失敗吸收沒有意義，所以
 // 用 no-op 表達：找不到就什麼都不做，讓上層自己的 Get 檢查去把關。
+//
+// 這也是 replace 名字裡沒有 rename 語意的原因：它只用 a.Name 去比對、找到
+// 就整列換掉，如果呼叫端先把 a.Name 改成別的字串再傳進來，找不到同名的舊
+// 列，就會靜靜地什麼都不做——舊列原封不動留著，新名字也沒有真的被存進去，
+// 呼叫端會誤以為改名成功。名字不合法這一類 entry 唯一真正的修法（把名字本
+// 身換成合法的）因此不能走這裡，得走 updateA2AAgent 裡明確處理 Remove+append
+// 的那條窄門（見該函式的說明），且只在原本的名字就過不了驗證時才開放。
 func (s *AgentStore) replace(a Agent) {
 	for i := range s.Agents {
 		if s.Agents[i].Name == a.Name {

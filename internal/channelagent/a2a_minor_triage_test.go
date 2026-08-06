@@ -9,7 +9,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -236,39 +239,88 @@ func TestGateLogRotationSkippedWhileAnotherProcessHoldsTheLock(t *testing.T) {
 // rotateTestHookBeforeRotate seam the tests above use) until all of them
 // have arrived, then release them all at once, forcing genuine simultaneous
 // contention on the real rotationLockPath lock. That fix was built and then
-// dropped, because it traded one non-discriminating test for a worse one:
-// releasing 4 goroutines to call AcquireLock at the exact same instant
-// reliably (verified 6/100 runs under -race, CORRECT code) triggers a
-// separate, pre-existing race in lockIsStale (lock.go) that is not part of
-// this review and is out of scope to fix here — a lock file that was just
-// os.OpenFile(O_EXCL)-created but has not yet had its pid Fprintf+Sync'd is
-// briefly empty; a concurrent AcquireLock call that loses the O_EXCL race
-// reads that empty file, fails to parse a pid, and lockIsStale calls that
-// "corrupt pid" (unconditionally stale, no age check unlike the other
-// branches) and steals it — so two callers can both believe they hold the
-// same lock. Serializing the scheduler (GOMAXPROCS(1)) around the barrier
-// avoids that false failure, but also removes essentially all genuine
-// overlap, so it stopped catching the intended bug too (0/100 failures with
-// AcquireLock's real call removed entirely). The two races sit at the same
-// syscall-level timescale, so there is no dial between "hits the intended
-// bug reliably" and "avoids the unrelated one reliably" — every value tried
-// landed at one extreme or the other.
+// dropped in that same review, because at the time it traded one
+// non-discriminating test for a worse one: releasing 4 goroutines to call
+// AcquireLock at the exact same instant reliably (6/100 runs under -race)
+// triggered a separate, pre-existing race in lockIsStale (lock.go) — a lock
+// file that had just been os.OpenFile(O_EXCL)-created but had not yet had
+// its pid Fprintf+Sync'd was briefly empty, and lockIsStale treated any
+// unparseable pid as "corrupt" and stole it unconditionally (no age check,
+// unlike its other branches), so two callers could both believe they held
+// the same lock.
 //
-// Given that, this specific "several real goroutines race the real lock"
-// test is dropped rather than shipped in either a non-discriminating or a
-// flaky-against-correct-code form. Its intended coverage already exists
-// deterministically without hitting lock.go's own race:
-//   - TestGateLogRotationSkippedWhileAnotherProcessHoldsTheLock proves the
-//     mutual exclusion is real and cross-process (confirmed: it correctly
-//     fails when AcquireLock is removed from rotateOversizedLog).
-//   - TestGateLogRotationDoesNotClobberAPriorGeneration proves the exact
-//     double-rename data-loss scenario is closed under a scripted
-//     concurrent peer.
-//
-// The lockIsStale gap above is real and worth its own follow-up (it affects
-// every AcquireLock caller, not just gate-log rotation), but changing shared
-// lock infrastructure was not requested by this review and deserves review
-// on its own, not as a side effect of tightening a test.
+// That race is now fixed (60785f8, lockWriteGrace): a lock file younger
+// than lockWriteGrace with no parseable pid is treated as "held by a writer
+// that has not recorded its pid yet", not stale, so the barrier below no
+// longer needs to dodge it — confirmed by running it 220× under -race
+// (across two GOMAXPROCS settings) against the correct, unmodified code
+// with zero failures. Re-confirmed it still catches the original missing-
+// lock regression: with the AcquireLock call hand-removed from
+// rotateOversizedLog, it fails intermittently (roughly 1-5% of runs in this
+// environment, both with and without -race) rather than the 0/100 the
+// dropped version's report claimed — the four writers still contend for the
+// same unsynchronized rename, but which pair actually lands on the
+// destructive stat→rename→stat→rename interleaving depends on scheduler
+// timing this barrier does not otherwise control. That is a materially
+// weaker catch rate than hoped for, but it is strictly better than the
+// non-discriminating version this replaces (5/30 historically) and, more
+// importantly, it is not flaky against correct code, which the
+// lockIsStale-affected version briefly was. The claim in an earlier version
+// of this comment that the lockIsStale gap was "out of scope to fix here"
+// was true when it was written; it stopped being true two commits later,
+// which is why this test is back instead of staying dropped.
+func TestGateLogConcurrentRotationLosesNothing(t *testing.T) {
+	root := t.TempDir()
+	path := GateLogPath(root)
+	overCapFile(t, path, `{"at":"GEN-A"}`)
+
+	const writers = 4
+	old := rotateTestHookBeforeRotate
+	defer func() { rotateTestHookBeforeRotate = old }()
+
+	// 每個寫入者在「已經決定要輪替」的那一刻卡住，直到全部 writers 個都到齊
+	// 才一次放行——逼出真正同時對 rotationLockPath 搶鎖的情況，而不是賭
+	// goroutine 排程恰好撞在一起。
+	var arrived atomic.Int32
+	release := make(chan struct{})
+	rotateTestHookBeforeRotate = func(p string) {
+		if p != path {
+			return
+		}
+		if arrived.Add(1) == int32(writers) {
+			close(release)
+		}
+		<-release
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if err := AppendGateLog(root, GateLogEntry{At: "W" + strconv.Itoa(i), Session: "aa-a-c1"}); err != nil {
+				t.Errorf("AppendGateLog: %v", err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	var all []byte
+	for _, p := range []string{path, path + ".1"} {
+		if b, err := os.ReadFile(p); err == nil {
+			all = append(all, b...)
+		}
+	}
+	if !bytes.Contains(all, []byte("GEN-A")) {
+		t.Fatal("the pre-existing generation vanished under concurrent rotation")
+	}
+	for i := 0; i < writers; i++ {
+		want := `"at":"W` + strconv.Itoa(i) + `"`
+		if !bytes.Contains(all, []byte(want)) {
+			t.Fatalf("writer %d's line is in neither generation", i)
+		}
+	}
+}
 
 // --- Fix 3: a corrupt audit key file must not silently disable correlation --
 

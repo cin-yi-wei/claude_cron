@@ -89,8 +89,11 @@ func runA2ACommand(rest []string, stdout, stderr io.Writer) int {
 
 const a2aUsage = `用法：
   claude-cron a2a agent add <name> --project=<dir> [--description=…] [--capabilities=a,b] [--channel=<id>] [--enabled]
-  claude-cron a2a agent update <name> [--project=<dir>] [--description=…] [--capabilities=a,b] [--channel=<id>]
-      （只改有帶的欄位；name 不可變，enabled 走 enable/disable，不走這裡）
+  claude-cron a2a agent update <name> [--project=<dir>] [--description=…] [--capabilities=a,b] [--channel=<id>] [--name=<new-name>]
+      （只改有帶的欄位；enabled 走 enable/disable，不走這裡。--name 一般會被拒絕
+       ——name 是身分，要換名字得刪除重建——唯一例外是 <name> 本身格式不合法
+       （含空白等）時，可以把它改成一個合法的新名字：這種 entry 從沒通過驗證、
+       從沒派送過任何工作，改名不會孤兒化任何沙盒）
   claude-cron a2a agent list|remove <name>|enable <name>|disable <name>
   claude-cron a2a caller register <id> [--credential=…]
   claude-cron a2a caller list
@@ -196,9 +199,12 @@ func runA2AOnline(c a2aClient, pos []string, opts map[string]string, flags map[s
 	case "agent update":
 		// 只送真的有出現的 --flag：admin API 的 /update 用 pointer 語意分辨
 		// 「沒帶這個 key」跟「帶了空字串/空陣列」，才能只改一個欄位而不清空
-		// 其餘欄位。name 不在這裡——它是 agent 的身分，/update 拒絕改名，
-		// 要換名字只能刪除重建。
+		// 其餘欄位。--name 平時仍會被伺服器端拒絕（agent 的身分，一般得刪除
+		// 重建），只有 <name> 本身格式不合法時才會被接受，見上面 a2aUsage。
 		body := map[string]any{}
+		if v, ok := opts["name"]; ok {
+			body["name"] = v
+		}
 		if v, ok := opts["project"]; ok {
 			body["project_dir"] = v
 		}

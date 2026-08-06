@@ -253,6 +253,38 @@ func TestA2ACLIAgentUpdateMultipleFlags(t *testing.T) {
 	}
 }
 
+// Follow-up review (2026-08-06): the admin API's /update now accepts a
+// rename when the CURRENT name is itself invalid (the one repair for a
+// name-malformed entry — see a2a_admin.go updateA2AAgent). The CLI is the
+// only supported write path (no direct agents.json edits), so without a
+// --name flag that server-side repair would be reachable only via raw curl.
+func TestA2ACLIAgentUpdateSendsNameWhenProvided(t *testing.T) {
+	var gotBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"updated"}`))
+	}))
+	defer srv.Close()
+	root := seedA2ARoot(t, strings.TrimPrefix(srv.URL, "http://"))
+
+	var out, errOut bytes.Buffer
+	code := runA2ACommand([]string{
+		"agent", "update", "Bad Name", "--name=badname", "--root", root,
+	}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, errOut.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal([]byte(gotBody), &body); err != nil {
+		t.Fatalf("body not JSON: %s", gotBody)
+	}
+	if body["name"] != "badname" {
+		t.Fatalf("body = %s, want name=badname", gotBody)
+	}
+}
+
 // --root must accept both `--root <dir>` and `--root=<dir>` — runBusyCommand
 // (main.go:745) already accepts both forms; a2a silently ignoring the
 // latter and falling back to ./.channel-agent would target the wrong tree.

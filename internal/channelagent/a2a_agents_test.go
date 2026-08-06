@@ -2,6 +2,7 @@ package channelagent
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -188,5 +189,64 @@ func TestWithAgentsPreservesValidationFailingEntries(t *testing.T) {
 	}
 	if !names["good"] || !names["new"] {
 		t.Fatalf("both the pre-existing valid entry and the newly added one must survive: got %#v", raw.Agents)
+	}
+}
+
+// Follow-up review (2026-08-06): an agent can be made to disappear from the
+// other direction too — create it first, then create a binding on the same
+// channel. LoadAgents then drops it silently on every future load, and
+// before this fix nothing told the operator why (or that it had happened at
+// all). LoadAgentsFiltered is the additive diagnostic path: same kept list
+// as LoadAgents (verified below), plus the excluded entries and their
+// reasons, without changing what LoadAgents itself returns — dispatch and
+// revokeReasonForRunningTask's LoadAgents-vs-LoadAgentsRaw contrast must stay
+// exactly as they were.
+func TestLoadAgentsFilteredReportsReasonsForBothFilterClasses(t *testing.T) {
+	root := filepath.Join(t.TempDir(), ".channel-agent")
+	if err := Init(root); err != nil {
+		t.Fatal(err)
+	}
+	seedBinding(t, root, Binding{Name: "w", ChannelID: "chan-1", Worktree: t.TempDir(), Root: pathIn(root, "bindings", "w")})
+
+	var agents AgentStore
+	if err := agents.Add(Agent{Name: "ok", ProjectDir: "/p/ok", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	// Bad Name 直接 append，繞過 Add 的驗證——這正是它會出現在 agents.json
+	// 裡的方式：手改，或是曾經合法、後來規則變嚴。
+	agents.Agents = append(agents.Agents, Agent{Name: "Bad Name", ProjectDir: "/p/bad", Enabled: true})
+	if err := agents.Add(Agent{Name: "clashed", ProjectDir: "/p/clash", ChannelID: "chan-1", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveAgents(root, agents); err != nil {
+		t.Fatal(err)
+	}
+
+	kept, filtered, err := LoadAgentsFiltered(root)
+	if err != nil {
+		t.Fatalf("LoadAgentsFiltered: %v", err)
+	}
+	if len(kept.Agents) != 1 || kept.Agents[0].Name != "ok" {
+		t.Fatalf("kept = %#v, want only ok — LoadAgentsFiltered's kept list must match LoadAgents exactly", kept.Agents)
+	}
+	viaLoadAgents, err := LoadAgents(root)
+	if err != nil {
+		t.Fatalf("LoadAgents: %v", err)
+	}
+	if len(viaLoadAgents.Agents) != 1 || viaLoadAgents.Agents[0].Name != "ok" {
+		t.Fatalf("LoadAgents = %#v, must agree with LoadAgentsFiltered's kept list", viaLoadAgents.Agents)
+	}
+	if len(filtered) != 2 {
+		t.Fatalf("filtered = %#v, want both excluded entries reported", filtered)
+	}
+	byName := map[string]string{}
+	for _, f := range filtered {
+		byName[f.Agent.Name] = f.Reason
+	}
+	if byName["Bad Name"] == "" {
+		t.Fatal("want a non-empty reason for the invalid-name entry")
+	}
+	if r := byName["clashed"]; r == "" || !strings.Contains(r, "w") {
+		t.Fatalf("want a reason for clashed naming the colliding binding %q, got %q", "w", r)
 	}
 }

@@ -272,13 +272,20 @@
     <div style="overflow-x:auto">
       <table>
         <thead><tr>
-          <th>{t('agents.col.name')}</th><th>{t('agents.col.project')}</th>
+          <th>{t('agents.col.name')}</th><th>{t('agents.col.health')}</th><th>{t('agents.col.project')}</th>
           <th>{t('agents.col.caps')}</th><th>{t('agents.col.enabled')}</th><th></th>
         </tr></thead>
         <tbody>
           {#each agents as a}
-            <tr>
+            <tr class={a.filtered ? 'filtered-row' : ''}>
               <td><strong>{a.name}</strong></td>
+              <td>
+                {#if a.filtered}
+                  <span class="bad" title={a.filter_reason}>⚠ {t('agents.status.filtered')}</span>
+                {:else}
+                  <span class="ok">✅ {t('agents.status.ok')}</span>
+                {/if}
+              </td>
               <td><code>{a.project_dir}</code></td>
               <td>{(a.capabilities || []).join(', ')}</td>
               <td>{a.enabled ? '✅' : '—'}</td>
@@ -292,9 +299,14 @@
                 <button class="mini contrast outline" onclick={() => removeAgent(a.name)}>{t('agents.action.remove')}</button>
               </td>
             </tr>
+            {#if a.filtered}
+              <tr class="filtered-row">
+                <td colspan="6"><small class="bad">{t('agents.filtered.hint', { reason: a.filter_reason })}</small></td>
+              </tr>
+            {/if}
           {/each}
           {#if agents.length === 0}
-            <tr><td colspan="5"><em class="muted">{t('common.none')}</em></td></tr>
+            <tr><td colspan="6"><em class="muted">{t('common.none')}</em></td></tr>
           {/if}
         </tbody>
       </table>
@@ -467,4 +479,5 @@
   .credential-banner { border: 2px solid var(--pico-del-color); margin-bottom: 1rem; }
   .credline { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap; margin: .5rem 0; }
   .credline code { background: var(--pico-code-background-color); padding: .3rem .5rem; border-radius: var(--pico-border-radius); user-select: all; }
+  .filtered-row { background: color-mix(in srgb, var(--pico-del-color) 10%, transparent); }
 </style>
