@@ -98,7 +98,7 @@ func sandboxDecision(root, session string, hi hookInput) (pol SandboxPolicy, dec
 	case "Edit", "Write", "NotebookEdit":
 		return pol, editDecision(pol, hi)
 	case "Bash":
-		return pol, bashDecision(pol.Level, bashCommand(hi.ToolInput))
+		return pol, bashDecision(pol.Level, session, bashCommand(hi.ToolInput))
 	case "WebFetch", "WebSearch":
 		if pol.Level == GrantReadOnly {
 			return pol, gateDeny("denied_level", "a2a gate: readonly 不允許對外取用")
@@ -379,7 +379,7 @@ var readonlyHeadFlags = map[string]flagPolicy{
 	},
 }
 
-func bashDecision(level GrantLevel, cmd string) gateDecision {
+func bashDecision(level GrantLevel, session, cmd string) gateDecision {
 	if level == GrantFull {
 		// full 等同把主機交出去（Bash 無限制 = 能讀憑證、能 curl | sh）。
 		// 只授予信任程度等同 operator 本人的呼叫方。
@@ -407,7 +407,7 @@ func bashDecision(level GrantLevel, cmd string) gateDecision {
 		return gateDeny("denied_bash_rule", "a2a gate: 等級 "+string(level)+" 不允許指令 "+head)
 	}
 	if head == "git" {
-		return gitDecision(level, fields)
+		return gitDecision(level, session, fields)
 	}
 	if head == "find" {
 		return findDecision(fields)
@@ -462,7 +462,7 @@ var readonlyFindTokens = map[string]bool{
 // gitDecision 檢查 git 的子命令。子命令必須是 fields[1]：允許 `git -C <dir>
 // push` 這種形式等於允許沙盒對任意 repo 動手，而 -C 的值本身無法用首 token
 // 規則約束。
-func gitDecision(level GrantLevel, fields []string) gateDecision {
+func gitDecision(level GrantLevel, session string, fields []string) gateDecision {
 	if len(fields) < 2 {
 		return gateDeny("denied_bash_rule", "a2a gate: git 缺少子命令")
 	}
@@ -478,14 +478,28 @@ func gitDecision(level GrantLevel, fields []string) gateDecision {
 		return gateDeny("denied_bash_rule", "a2a gate: 等級 "+string(level)+" 不允許 git "+sub)
 	}
 	if sub == "push" {
-		// 保護分支命名空間 aa/<session>（BranchFor，a2a_executor.go:39）：
-		// 沙盒可以推自己的分支，但不能強推、不能刪遠端分支、不能用 refspec
-		// 把 commit 推到別的 ref 上。
-		for _, f := range fields[2:] {
-			if f == "--force" || f == "-f" || f == "--delete" || f == "-d" ||
-				strings.HasPrefix(f, "--force-with-lease") || strings.Contains(f, ":") {
-				return gateDeny("denied_bash_rule", "a2a gate: git push 不允許參數 "+f)
-			}
+		// 最終審查 Critical：這裡原本是黑名單（只擋 --force/-f/--delete/-d/
+		// --force-with-lease/任何含 ":" 的 token），真的用三個探測指令驗證過
+		// 全部繞過——`git push --mirror origin`（--mirror 沒被列進黑名單，能
+		// 刪光遠端所有 ref）、`git push origin +master`（leading "+" 不含
+		// ":"，黑名單漏了它）、`git push origin master`（沒有旗標、沒有
+		// ":"，黑名單完全放行，但這推的是共用生產 repo 的 master，不是自己
+		// 的分支）。舊註解宣稱「推限制在 aa/<session> 命名空間、force 被
+		// 擋」，兩者都不成立，這正是被抓到的原因。
+		//
+		// 現在整個反過來，用跟檔案其餘部分一致的正向清單模型：
+		//   - 旗標一律不放行（firstDeniedFlag 用零值 flagPolicy{}，等於
+		//     「查不到政策就是不給旗標」，涵蓋 --force/-f/--delete/-d/
+		//     --force-with-lease/--mirror/--all/--tags 的每一種寫法，不用
+		//     再猜下一個沒想到的旗標名字）；
+		//   - 位置引數只放行「推自己的 aa/<session> 分支」這一種形狀
+		//     （pushArgsAllowed），用 BranchFor(session) 算出來的名字比對，
+		//     不是猜字串規律。
+		if bad := firstDeniedFlag(flagPolicy{}, fields[2:]); bad != "" {
+			return gateDeny("denied_bash_rule", "a2a gate: git push 不允許旗標 "+bad)
+		}
+		if !pushArgsAllowed(session, fields[2:]) {
+			return gateDeny("denied_bash_rule", "a2a gate: git push 只能推自己的 aa/<session> 分支")
 		}
 	}
 	if sub == "remote" {
@@ -521,8 +535,65 @@ func gitDecision(level GrantLevel, fields []string) gateDecision {
 		if bad := firstDeniedFlag(readonlyGitSubFlags[sub], fields[2:]); bad != "" {
 			return gateDeny("denied_bash_rule", "a2a gate: git "+sub+" 不允許旗標 "+bad)
 		}
+		// 最終審查 Important：branch 的旗標清單只擋得住 -D/-d/-m/-M 這種
+		// 「以 -」開頭的建立/刪除/改名寫法；firstDeniedFlag 只檢查以 "-"
+		// 開頭的 token，一個完全不帶旗標的位置引數（`git branch <name>`）
+		// 會直接跳過檢查，落到函式尾端的 gateAllow——真的用
+		// `git branch new-branch` 驗證過會建出一條新分支。分支存在主 repo
+		// 底下，是所有從它切出去的 worktree（含另外 ~40 個 cc- binding）
+		// 共用的，readonly 的規格是「no write」，不能因為一個位置引數沒被
+		// 掃到就悄悄破例。這裡把 branch 限制成真正的「僅列出」形狀：任何
+		// 不是以 "-" 開頭的 token（要建立/移動/查詢的分支名稱）一律拒絕；
+		// -a/-r/-v/--list/--all/--remotes/--verbose 等純列出旗標不受影響。
+		if sub == "branch" {
+			for _, f := range fields[2:] {
+				if !strings.HasPrefix(f, "-") {
+					return gateDeny("denied_bash_rule", "a2a gate: git branch 不允許指定分支名稱（僅允許列出）")
+				}
+			}
+		}
 	}
 	return gateAllow("a2a gate: 等級 " + string(level) + " 允許 git " + sub)
+}
+
+// pushArgsAllowed 是 git push 的正向清單核心：只放行「推自己的
+// aa/<session> 分支到一個具名 remote」這一種形狀（remote/refspec 語法見
+// `git push --help`：`git push [<repository> [<refspec>…]]`）。
+//   - args 少於兩個 token（沒有明確 remote+refspec，例如裸的
+//     `git push origin`）一律拒絕：裸 push 推什麼由 push.default 決定，
+//     不是這裡能靜態驗證的行為，寧可拒絕也不要猜。
+//   - 任何 token（remote 或 refspec）以 "+" 開頭一律拒絕：這是 git 的
+//     force push 標記，不論出現在哪個位置都一樣。
+//   - args[0] 當 remote，不檢查是否等於分支名稱（remote 是誰在
+//     readonlyGitRemoteSubs 那層已經被鎖死成不能新增/改掉，這裡只管目的
+//     ref 是誰）。
+//   - args[1:] 每個都當 refspec 驗證：冒號左邊（source）是空字串
+//     （例如 "origin :aa/session"）等於 git 的刪除語法，拒絕；冒號右邊
+//     （或整個 token，沒有冒號時）去掉可能的 "refs/heads/" 前綴後，必須
+//     完全等於 BranchFor(session)，不是前綴、不是子字串比對。
+func pushArgsAllowed(session string, args []string) bool {
+	if len(args) < 2 {
+		return false
+	}
+	for _, tok := range args {
+		if strings.HasPrefix(tok, "+") {
+			return false
+		}
+	}
+	own := BranchFor(session)
+	for _, tok := range args[1:] {
+		dst := tok
+		if i := strings.IndexByte(tok, ':'); i >= 0 {
+			if tok[:i] == "" {
+				return false
+			}
+			dst = tok[i+1:]
+		}
+		if strings.TrimPrefix(dst, "refs/heads/") != own {
+			return false
+		}
+	}
+	return true
 }
 
 // readonlyGitRemoteSubs 是 `git remote` 允許的子命令：裸的 `git remote`

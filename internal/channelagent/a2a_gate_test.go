@@ -511,6 +511,45 @@ func TestSandboxGateCannotWriteMCPConfig(t *testing.T) {
 	}
 }
 
+// 最終安全審查 Finding 1（Critical）：git push 的閘門原本是黑名單，三個真
+// 的執行過的探測都能繞過——--mirror（可刪掉遠端所有 ref）、leading "+"
+// refspec（強推）、以及單純 `git push origin master`（推去共用生產 repo 的
+// master，不是自己的 aa/<session> 分支）。develop 才碰得到 push
+// （readonlyGitSubs 沒有 push），所以探測都用 GrantDevelop。
+func TestSandboxGateGitPushIsAllowlistNotBlacklist(t *testing.T) {
+	for _, cmd := range []string{
+		"git push --mirror origin",
+		"git push origin +master",
+		"git push origin master",
+	} {
+		_, registryRoot, worktree := seedSandbox(t, GrantDevelop)
+		body, _ := json.Marshal(map[string]any{"command": cmd})
+		hook := `{"cwd":"` + worktree + `","tool_name":"Bash","tool_input":` + string(body) + `}`
+		if d, r := gateOutput(t, registryRoot, hook); d != "deny" {
+			t.Fatalf("cmd=%q -> %q (%s); must deny (push escapes the sandbox's own aa/<session> namespace)", cmd, d, r)
+		}
+	}
+	// 唯一合法用法：推自己的 aa/<session> 分支（session 在 seedSandbox 裡固定
+	// 是 "aa-pm-c1"，BranchFor 算出來就是 "aa/aa-pm-c1"）。
+	_, registryRoot, worktree := seedSandbox(t, GrantDevelop)
+	hook := `{"cwd":"` + worktree + `","tool_name":"Bash","tool_input":{"command":"git push origin aa/aa-pm-c1"}}`
+	if d, r := gateOutput(t, registryRoot, hook); d != "allow" {
+		t.Fatalf("pushing own branch aa/aa-pm-c1 got %q (%s), want allow", d, r)
+	}
+}
+
+// 最終安全審查 Finding 2（Important）：`git branch <name>` 的位置引數原本完
+// 全沒被檢查——firstDeniedFlag 只看以 "-" 開頭的 token，一個不帶任何旗標的
+// `git branch new-branch` 會直接落到函式尾端的 gateAllow。分支是主 repo 共
+// 用的（worktree 之間共享），readonly 靠這個口子就能在生產 repo 裡建 ref。
+func TestSandboxGateGitBranchCreateDeniedAtReadonly(t *testing.T) {
+	_, registryRoot, worktree := seedSandbox(t, GrantReadOnly)
+	hook := `{"cwd":"` + worktree + `","tool_name":"Bash","tool_input":{"command":"git branch new-branch"}}`
+	if d, r := gateOutput(t, registryRoot, hook); d != "deny" {
+		t.Fatalf("readonly `git branch new-branch` got %q (%s); must deny (mutates a ref in the shared repo)", d, r)
+	}
+}
+
 func TestSandboxGateWritesGateLog(t *testing.T) {
 	root, registryRoot, worktree := seedSandbox(t, GrantReadOnly)
 	gateOutput(t, registryRoot, `{"cwd":"`+worktree+`","tool_name":"Bash","tool_input":{"command":"go build ./..."}}`)
