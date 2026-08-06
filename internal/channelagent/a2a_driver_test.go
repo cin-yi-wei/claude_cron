@@ -2,6 +2,8 @@ package channelagent
 
 import (
 	"context"
+	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -98,6 +100,51 @@ func TestSandboxDriverStopEndsTheLoop(t *testing.T) {
 	}
 	if got := d.Running(); len(got) != 0 {
 		t.Fatalf("Running() = %#v after Stop, want empty", got)
+	}
+}
+
+// EnsureSandboxDrivers is what makes the driver actually run in production: the
+// A2A cycle calls it every tick, so a working task must gain a driver and a task
+// that has since gone terminal must lose one (its sandbox is about to be
+// reclaimed — nothing may still be injecting into it).
+func TestEnsureSandboxDriversStartsWorkingAndStopsTerminal(t *testing.T) {
+	var sent []string
+	stubTmuxPane(t, "", &sent) // no real tmux: capture-pane always returns empty
+	root := t.TempDir()
+	task := A2ATask{ContextID: "c1", Agent: "pm", Session: SessionNameFor("pm", "c1"), State: TaskWorking}
+	if err := Init(SandboxRoot(root, task.Session)); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	store := TaskStore{}
+	store.Upsert(task)
+	if err := SaveTasks(root, store); err != nil {
+		t.Fatalf("SaveTasks: %v", err)
+	}
+
+	d := NewSandboxDriver(root, time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	defer d.StopAll()
+
+	EnsureSandboxDrivers(ctx, root, d)
+	if got := d.Running(); len(got) != 1 || got[0] != task.Session {
+		t.Fatalf("Running() = %#v, want [%s]", got, task.Session)
+	}
+	// Idempotent: a second pass must not spawn a second goroutine.
+	EnsureSandboxDrivers(ctx, root, d)
+	if got := d.Running(); len(got) != 1 {
+		t.Fatalf("Running() = %#v after second pass, want exactly one", got)
+	}
+
+	task.State = TaskCompleted
+	store = TaskStore{}
+	store.Upsert(task)
+	if err := SaveTasks(root, store); err != nil {
+		t.Fatalf("SaveTasks: %v", err)
+	}
+	EnsureSandboxDrivers(ctx, root, d)
+	if got := d.Running(); len(got) != 0 {
+		t.Fatalf("Running() = %#v after the task went terminal, want empty", got)
 	}
 }
 
@@ -199,5 +246,143 @@ func TestAutoAnswerSandboxConfirmDebouncesRepeatedDialog(t *testing.T) {
 	}
 	if len(sent) != 2 {
 		t.Fatalf("keystrokes = %#v, want exactly one [1 Enter] pair total", sent)
+	}
+}
+
+// This is the Part B wiring itself, proven end to end through the driver —
+// not merely that SandboxOutputPrefix/AgentChannelFor format/resolve
+// correctly in isolation. A real driver loop must pick up new transcript
+// activity and hand it to the wired AgentOutputSink, labelled with the
+// task's contextId, for the task's agent's channel.
+func TestSandboxDriverStreamsActivityToAgentChannel(t *testing.T) {
+	var sentKeys []string
+	stubTmuxPane(t, "", &sentKeys) // no real tmux; auto-answer/confirm checks just no-op
+
+	root := t.TempDir()
+	agents := AgentStore{}
+	if err := agents.Add(Agent{Name: "pm", ChannelID: "chan-pm", Enabled: true}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if err := SaveAgents(root, agents); err != nil {
+		t.Fatalf("SaveAgents: %v", err)
+	}
+
+	task := A2ATask{ContextID: "ctx9", Agent: "pm", Session: SessionNameFor("pm", "ctx9"), State: TaskWorking}
+	sandbox := SandboxRoot(root, task.Session)
+	if err := Init(sandbox); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	// Seed a transcript with one assistant "thinking" event already past the
+	// activity-tailer's offset — i.e. pre-establish the baseline (as if the
+	// tailer had already seen an earlier, shorter transcript) so the very
+	// first CollectActivity call inside the driver loop reads it as NEW,
+	// rather than CollectActivity's own "first sight of a transcript → skip
+	// to EOF, no backlog replay" rule swallowing it before the driver ever
+	// gets a chance to emit it.
+	tp := sandbox + "-transcript.jsonl"
+	line := `{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"looking into the flaky retry test"}]}}` + "\n"
+	if err := os.WriteFile(tp, []byte(line), 0o644); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	if err := AtomicWriteJSON(pathIn(sandbox, "state", "session.json"), sessionInfo{SessionID: "s1", TranscriptPath: tp}); err != nil {
+		t.Fatalf("write session.json: %v", err)
+	}
+	if err := AtomicWriteJSON(pathIn(sandbox, "state", "activity.json"), activityState{Path: tp, Offset: 0}); err != nil {
+		t.Fatalf("write activity.json: %v", err)
+	}
+
+	type sent struct{ channelID, text string }
+	got := make(chan sent, 8)
+	send := func(_ context.Context, channelID, text string) error {
+		got <- sent{channelID, text}
+		return nil
+	}
+	sinkCtx, sinkCancel := context.WithCancel(context.Background())
+	defer sinkCancel()
+	sink := newAgentOutputSink(sinkCtx, root, send)
+
+	d := NewSandboxDriver(root, time.Second)
+	d.SetOutputSink(sink)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	defer d.StopAll()
+	d.Ensure(ctx, task, &recordingInjector{})
+
+	// The driver also emits lifecycle lines (e.g. "driver started") through the
+	// same sink, so scan every message that arrives — not just the first —
+	// for the one carrying the transcript activity.
+	deadline := time.After(3 * time.Second)
+	for {
+		select {
+		case msg := <-got:
+			if msg.channelID != "chan-pm" {
+				t.Fatalf("channelID = %q, want chan-pm", msg.channelID)
+			}
+			if !strings.Contains(msg.text, "ctx9") {
+				t.Fatalf("text = %q, missing the context label", msg.text)
+			}
+			if strings.Contains(msg.text, "looking into the flaky retry test") {
+				return
+			}
+		case <-deadline:
+			t.Fatal("driver never streamed transcript activity to the agent channel")
+		}
+	}
+}
+
+// The output-sink send must never slow down (let alone stall) the driver's
+// actual job — a hung/slow agent-channel send is a visibility loss, not
+// something that may delay message delivery to the sandbox's real caller.
+func TestSandboxDriverDeliversJobWhileAgentChannelSendHangs(t *testing.T) {
+	root := t.TempDir()
+	agents := AgentStore{}
+	if err := agents.Add(Agent{Name: "codereview", ChannelID: "chan-cr", Enabled: true}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if err := SaveAgents(root, agents); err != nil {
+		t.Fatalf("SaveAgents: %v", err)
+	}
+
+	task := A2ATask{ContextID: "c1", Agent: "codereview", Session: SessionNameFor("codereview", "c1"), State: TaskWorking}
+	sandbox := SandboxRoot(root, task.Session)
+	if err := Init(sandbox); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if _, err := IngestMessages(context.Background(), sandbox, []SourceMessage{{
+		Platform: "a2a", ChannelID: "c1", MessageID: "m1",
+		CreatedAt: time.Now().UTC().Format(time.RFC3339), Content: "review this",
+	}}); err != nil {
+		t.Fatalf("stage job: %v", err)
+	}
+
+	// A send that hangs until the test releases it — standing in for a
+	// throttled/429'd/hung Discord channel.
+	release := make(chan struct{})
+	slowSend := func(ctx context.Context, _, _ string) error {
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+		return nil
+	}
+	sinkCtx, sinkCancel := context.WithCancel(context.Background())
+	defer func() { close(release); sinkCancel() }()
+	sink := newAgentOutputSink(sinkCtx, root, slowSend)
+
+	inj := &recordingInjector{}
+	d := NewSandboxDriver(root, 2*time.Second)
+	d.SetOutputSink(sink)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	defer d.StopAll()
+	d.Ensure(ctx, task, inj)
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && inj.count() == 0 {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if inj.count() == 0 {
+		t.Fatal("driver never delivered the staged job — a slow agent-channel send blocked it")
 	}
 }

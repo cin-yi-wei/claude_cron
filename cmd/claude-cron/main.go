@@ -285,26 +285,53 @@ func run(args []string, stdout, stderr io.Writer) int {
 						if _, err := agent.RunSchedulerOnce(supCtx, *root, time.Now()); err != nil {
 							fmt.Fprintf(stderr, "scheduler error: %v\n", err)
 						}
-						// A2A per-cycle lifecycle work, gated behind cfg.A2A.Enabled.
-						// Runs sequentially in THIS goroutine, on this same 30s
-						// ticker — never its own goroutine or timer — so DrainQueue
-						// (which tracks capacity locally within one call) never
-						// races a concurrent invocation of itself. Order matters:
-						// collect frees capacity that sweep/drain then act on in
-						// the same cycle. Any failure is logged and does not abort
-						// this cycle or touch the cc- bindings' own processing.
-						if cfg.A2A.Enabled {
-							if _, err := agent.CollectResults(*root, time.Now()); err != nil {
-								fmt.Fprintf(stderr, "a2a collect: %v\n", err)
-							}
-							if _, _, err := agent.SweepTimeouts(supCtx, *root, agent.TmuxSessionManager{}, time.Now()); err != nil {
-								fmt.Fprintf(stderr, "a2a sweep: %v\n", err)
-							}
-							if _, err := agent.DrainQueue(supCtx, *root, agent.NewSandboxExecutor(*root, agent.TmuxSessionManager{})); err != nil {
-								fmt.Fprintf(stderr, "a2a drain: %v\n", err)
-							}
-						}
 					}
+				}
+			}()
+		}
+		// A2A cycle (collect → sweep → drain) + sandbox drivers: its OWN ticker
+		// and goroutine, entirely separate from the scheduler's above. DrainQueue
+		// can start up to 8 sandboxes SYNCHRONOUSLY at up to 90s each (tmux
+		// session boot) — sharing the scheduler's 30s ticker goroutine would
+		// stall triggers.json scheduling for all ~40 production cc- bindings for
+		// however long a cycle's drain takes. DrainQueue itself still must never
+		// run concurrently with itself (it tracks capacity locally within one
+		// call): it appears exactly once, right here, on this one goroutine.
+		// Gated behind cfg.A2A.Enabled so a default/unconfigured serve process
+		// starts no extra goroutine at all — byte-for-byte unchanged behaviour.
+		if !*once && cfg.A2A.Enabled {
+			driver := agent.NewSandboxDriver(*root, timeout)
+			// AgentOutputSink streams each sandbox's transcript activity (plus
+			// lifecycle/error lines) to its agent's Discord channel — output-only
+			// visibility, never an input path (see a2a_channel.go). Tied to
+			// supCtx so it shuts down alongside everything else on serve stop.
+			sink := agent.NewAgentOutputSink(supCtx, *root, cfg)
+			driver.SetOutputSink(sink)
+			ex := agent.NewSandboxExecutor(*root, agent.TmuxSessionManager{})
+			go func() {
+				defer sink.Wait()
+				defer driver.StopAll()
+				t := time.NewTicker(cfg.A2ACycleInterval())
+				defer t.Stop()
+				for {
+					select {
+					case <-supCtx.Done():
+						return
+					case <-t.C:
+					}
+					// Order matters: collect frees capacity that sweep/drain then
+					// act on in the same cycle. Any failure is logged and does not
+					// abort this cycle or touch the cc- bindings' own processing.
+					if _, err := agent.CollectResults(*root, time.Now()); err != nil {
+						fmt.Fprintf(stdout, "a2a collect: %v\n", err)
+					}
+					if _, _, err := agent.SweepTimeouts(supCtx, *root, agent.TmuxSessionManager{}, time.Now()); err != nil {
+						fmt.Fprintf(stdout, "a2a sweep: %v\n", err)
+					}
+					if _, err := agent.DrainQueue(supCtx, *root, ex); err != nil {
+						fmt.Fprintf(stdout, "a2a drain: %v\n", err)
+					}
+					agent.EnsureSandboxDrivers(supCtx, *root, driver)
 				}
 			}()
 		}

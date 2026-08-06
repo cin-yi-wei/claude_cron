@@ -117,6 +117,18 @@ type A2AConfig struct {
 	Enabled bool   `json:"enabled,omitempty"`
 	Listen  string `json:"listen,omitempty"`
 	BaseURL string `json:"base_url,omitempty"`
+	// CycleSeconds 是 A2A 生命週期迴圈的間隔；0 表示採用預設值（10 秒）。
+	CycleSeconds int `json:"cycle_seconds,omitempty"`
+}
+
+// A2ACycleInterval is how often the A2A lifecycle runs. It has its own ticker
+// and goroutine, separate from the cron scheduler's: DrainQueue starts sandboxes
+// synchronously and would otherwise stall scheduling for every cc- binding.
+func (c Config) A2ACycleInterval() time.Duration {
+	if c.A2A.CycleSeconds > 0 {
+		return time.Duration(c.A2A.CycleSeconds) * time.Second
+	}
+	return 10 * time.Second
 }
 
 // A2AListen resolves the A2A listen address, defaulting to a port distinct from
