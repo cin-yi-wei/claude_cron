@@ -74,6 +74,11 @@ type FakeSessionManager struct {
 	// teardown for the previous, terminal task is in flight (task-8 review
 	// round 3, finding 1).
 	OnRemove func()
+	// OnStart, if set, fires on every Start call after the session has been
+	// recorded. Tests use it to observe the on-disk state that must already be
+	// in place by the time a real tmux session would come up — the sandbox
+	// policy in particular.
+	OnStart func(session string)
 }
 
 func (f *FakeSessionManager) EnsureWorkspace(_ context.Context, _, _, worktree string) error {
@@ -89,6 +94,9 @@ func (f *FakeSessionManager) Start(_ context.Context, session, _, _ string) erro
 		return errors.New("fake start failure")
 	}
 	f.Started = append(f.Started, session)
+	if f.OnStart != nil {
+		f.OnStart(session)
+	}
 	return nil
 }
 

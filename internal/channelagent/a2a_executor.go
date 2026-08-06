@@ -136,6 +136,14 @@ func (e *SandboxExecutor) Start(ctx context.Context, task A2ATask, prompt string
 		return err
 	}
 
+	// 沒有有效等級的 row 不可以起沙盒:政策檔會寫不出可用的 Level,gate 會
+	// 全面拒絕,結果是一個活著卻什麼都做不了、還佔著併發額度的殭屍。
+	if !ValidGrantLevel(task.Level) {
+		err := fmt.Errorf("task %s has no valid grant level", task.ContextID)
+		e.markFailed(task, err.Error())
+		return err
+	}
+
 	task.Worktree = SandboxWorktree(agent.ProjectDir, task.Session)
 	task.Branch = BranchFor(task.Session)
 	sandboxRoot := SandboxRoot(e.Root, task.Session)
@@ -166,6 +174,23 @@ func (e *SandboxExecutor) Start(ctx context.Context, task A2ATask, prompt string
 		e.markFailed(task, "ensure worktree: "+err.Error())
 		return err
 	}
+
+	// 政策檔必須在 session 起來之前落地:session 一起來就能發工具呼叫,晚一步
+	// 寫等於開了一個沒有約束的窗口。寫入失敗 = dispatch 失敗,不可以降級成
+	// 「先開起來再說」。
+	if err := WriteSandboxPolicy(e.Root, SandboxPolicy{
+		Session:     task.Session,
+		ContextID:   task.ContextID,
+		Agent:       task.Agent,
+		CallerID:    task.CallerID,
+		Level:       task.Level,
+		Worktree:    cleanAbs(task.Worktree),
+		SandboxRoot: cleanAbs(sandboxRoot),
+	}); err != nil {
+		e.markFailed(task, "write sandbox policy: "+err.Error())
+		return err
+	}
+
 	if err := e.Sessions.Start(ctx, task.Session, task.Worktree, sandboxRoot); err != nil {
 		e.markFailed(task, "start session: "+err.Error())
 		return err

@@ -58,6 +58,35 @@ func TestCallerAuthenticateRejectsUnknownCredential(t *testing.T) {
 	}
 }
 
+func TestCallerEffectiveGrantLevelDefaultsToReadOnly(t *testing.T) {
+	// 既有 callers.json 沒有 grant_level 欄位:解讀為最小權限的地板,
+	// 不是「無限制」,也不是「拒絕」。
+	if got := (Caller{Status: CallerApproved}).EffectiveGrantLevel(); got != GrantReadOnly {
+		t.Fatalf("EffectiveGrantLevel() = %q, want %q", got, GrantReadOnly)
+	}
+	if got := (Caller{Status: CallerApproved, GrantLevel: GrantFull}).EffectiveGrantLevel(); got != GrantFull {
+		t.Fatalf("EffectiveGrantLevel() = %q, want %q", got, GrantFull)
+	}
+	// 檔案裡出現不認得的值 → 退回地板,絕不放大。
+	if got := (Caller{Status: CallerApproved, GrantLevel: "root"}).EffectiveGrantLevel(); got != GrantReadOnly {
+		t.Fatalf("EffectiveGrantLevel() = %q for a bogus level, want %q", got, GrantReadOnly)
+	}
+}
+
+func TestSetGrantLevel(t *testing.T) {
+	var s CallerStore
+	_ = s.Register("peer-a", "secret")
+	if !s.SetGrantLevel("peer-a", GrantDevelop) {
+		t.Fatal("SetGrantLevel on an existing caller must report success")
+	}
+	if s.Callers[0].GrantLevel != GrantDevelop {
+		t.Fatalf("grant level = %q", s.Callers[0].GrantLevel)
+	}
+	if s.SetGrantLevel("ghost", GrantDevelop) {
+		t.Fatal("SetGrantLevel on an unknown caller must report failure")
+	}
+}
+
 func TestCallerStoreRoundTrip(t *testing.T) {
 	root := t.TempDir()
 	var s CallerStore

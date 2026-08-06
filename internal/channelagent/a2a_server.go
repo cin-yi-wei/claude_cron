@@ -56,6 +56,7 @@ type MessageSendParams struct {
 	ContextID string `json:"contextId"`
 	Text      string `json:"text"`
 	TaskID    string `json:"taskId"`
+	Level     string `json:"level"`
 }
 
 // A2AServer serves the Agent Card and the JSON-RPC endpoint. It MUST be mounted
@@ -200,6 +201,32 @@ func (s *A2AServer) handleRPC(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// 有效等級 = min(請求的 level, caller 的授權上限)。請求未給則取 caller 的。
+	// 請求高於授權 → RPCForbidden + 一筆稽核;請求的字串不是三個已知等級之一
+	// → RPCInvalidParams(不是靜默降級,那會讓呼叫方以為自己拿到了 full)。
+	callerLevel := caller.EffectiveGrantLevel()
+	requested := callerLevel
+	if p.Level != "" {
+		requested = GrantLevel(p.Level)
+		if !ValidGrantLevel(requested) {
+			writeRPC(w, RPCFail(req.ID, RPCInvalidParams, "level must be readonly, develop or full"))
+			return
+		}
+	}
+	effective := MinGrantLevel(requested, callerLevel)
+	if effective != requested {
+		_ = AppendAudit(s.Root, AuditEntry{
+			At:        time.Now().UTC().Format(time.RFC3339),
+			CallerID:  caller.CallerID,
+			Agent:     p.Agent,
+			ContextID: p.ContextID,
+			Summary:   p.Text,
+			Outcome:   "forbidden_level",
+		})
+		writeRPC(w, RPCFail(req.ID, RPCForbidden, "requested level exceeds this caller's grant"))
+		return
+	}
+
 	task := A2ATask{
 		ContextID: p.ContextID,
 		TaskID:    p.TaskID,
@@ -209,6 +236,7 @@ func (s *A2AServer) handleRPC(w http.ResponseWriter, r *http.Request) {
 		State:     TaskSubmitted,
 		StartedAt: time.Now().UTC().Format(time.RFC3339),
 		Prompt:    p.Text,
+		Level:     effective,
 	}
 
 	// contextId is caller-controlled. Without an ownership check, a second

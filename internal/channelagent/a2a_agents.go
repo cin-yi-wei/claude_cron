@@ -12,9 +12,12 @@ import (
 // channel and never executes work itself — tasks run in per-contextId
 // aa-<Name>-<ctx> instances.
 type Agent struct {
-	Name         string   `json:"name"`
-	ProjectDir   string   `json:"project_dir"`
-	Description  string   `json:"description"`
+	Name        string `json:"name"`
+	ProjectDir  string `json:"project_dir"`
+	Description string `json:"description"`
+	// Capabilities 是**路由標籤**,不是沙盒權限。dispatch 當下要求呼叫方持有
+	// 這裡宣告的每一項(宣告零項的 agent fail-closed),但它對沙盒實際能做
+	// 什麼零影響 —— 那由任務的 GrantLevel 與 a2a_gate.go 決定。
 	Capabilities []string `json:"capabilities"`
 	Enabled      bool     `json:"enabled"`
 	// ChannelID is this agent identity's output-only Discord channel. All of the

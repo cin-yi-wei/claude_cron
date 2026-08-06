@@ -35,6 +35,9 @@ type A2ATask struct {
 	// Detail carries the outcome: the sandbox's reply on success, or the error
 	// reason on failure. Never the input — that is Prompt.
 	Detail string `json:"detail,omitempty"`
+	// Level 是這個任務的有效授權等級,dispatch 當下算出並寫進沙盒政策檔。
+	// 空值的 row 不可以起沙盒(SandboxExecutor.Start 會拒絕)。
+	Level GrantLevel `json:"level,omitempty"`
 }
 
 type TaskStore struct {

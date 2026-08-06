@@ -610,3 +610,55 @@ func TestMalformedAuthorizationHeaderRejected(t *testing.T) {
 		}
 	}
 }
+
+// 有效等級 = min(請求的 level, caller.grant_level)。請求高於授權 → RPCForbidden
+// 且留一筆稽核。
+func TestMessageSendLevelIsCappedByCallerGrant(t *testing.T) {
+	s, root := newTestA2AServer(t)
+	callers, _ := LoadCallers(root)
+	callers.SetGrantLevel("peer-a", GrantDevelop)
+	_ = SaveCallers(root, callers)
+
+	rec := postRPC(t, s.Handler(), "secret-1",
+		`{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"agent":"codereview","contextId":"c1","text":"hi","level":"full"}}`)
+	var resp RPCResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	if resp.Error == nil || resp.Error.Code != RPCForbidden {
+		t.Fatalf("requesting a level above the grant must be forbidden, got %#v", resp.Error)
+	}
+	entries, _ := ReadAudit(root)
+	if len(entries) == 0 || entries[len(entries)-1].Outcome != "forbidden_level" {
+		t.Fatalf("audit tail = %#v", entries)
+	}
+}
+
+func TestMessageSendDefaultsToCallerGrantLevel(t *testing.T) {
+	s, root := newTestA2AServer(t)
+	callers, _ := LoadCallers(root)
+	callers.SetGrantLevel("peer-a", GrantDevelop)
+	_ = SaveCallers(root, callers)
+
+	rec := postRPC(t, s.Handler(), "secret-1",
+		`{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"agent":"codereview","contextId":"c1","text":"hi"}}`)
+	var resp RPCResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %#v", resp.Error)
+	}
+	tasks, _ := LoadTasks(root)
+	tk, _ := tasks.ByContext("c1")
+	if tk.Level != GrantDevelop {
+		t.Fatalf("task level = %q, want %q", tk.Level, GrantDevelop)
+	}
+}
+
+func TestMessageSendRejectsUnknownLevel(t *testing.T) {
+	s, _ := newTestA2AServer(t)
+	rec := postRPC(t, s.Handler(), "secret-1",
+		`{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"agent":"codereview","contextId":"c1","text":"hi","level":"root"}}`)
+	var resp RPCResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	if resp.Error == nil || resp.Error.Code != RPCInvalidParams {
+		t.Fatalf("unknown level must be invalid params, got %#v", resp.Error)
+	}
+}

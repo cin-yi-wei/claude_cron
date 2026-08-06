@@ -332,6 +332,12 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 				log.Printf("a2a: sweep: failed to remove sandbox root for context %s (left in place, will retry next sweep): %v", c.contextID, rmErr)
 				ok = false
 			}
+			// 政策檔與沙盒同生共死。清不掉只 log,不影響回收判定 —— 下一趟
+			// sweep 會重試,而一份指向已不存在 worktree 的政策檔本身無害
+			// (gate 只在該 session 名的 hook 行程裡才會讀到它)。
+			if rmErr := RemoveSandboxPolicy(root, c.session); rmErr != nil {
+				log.Printf("a2a: sweep: 刪除 %s 的政策檔失敗(下一趟重試): %v", c.session, rmErr)
+			}
 		}
 		if ok {
 			succeeded = append(succeeded, c)

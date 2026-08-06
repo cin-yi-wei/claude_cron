@@ -22,7 +22,7 @@ func newExecutorFixture(t *testing.T) (string, *FakeSessionManager, *SandboxExec
 
 func TestSandboxExecutorCreatesWorkspaceStartsAndInjects(t *testing.T) {
 	root, fake, ex := newExecutorFixture(t)
-	task := A2ATask{ContextID: "c1", Agent: "codereview", Session: SessionNameFor("codereview", "c1"), State: TaskSubmitted}
+	task := A2ATask{ContextID: "c1", Agent: "codereview", Session: SessionNameFor("codereview", "c1"), State: TaskSubmitted, Level: GrantReadOnly}
 
 	if err := ex.Start(context.Background(), task, "please review"); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -121,7 +121,7 @@ func TestSandboxExecutorMarksFailedWhenStartFails(t *testing.T) {
 	ex := NewSandboxExecutor(root, &FakeSessionManager{FailOn: "start"})
 
 	session := SessionNameFor("codereview", "c1")
-	task := A2ATask{ContextID: "c1", Agent: "codereview", Session: session, State: TaskSubmitted}
+	task := A2ATask{ContextID: "c1", Agent: "codereview", Session: session, State: TaskSubmitted, Level: GrantReadOnly}
 	seedSubmittedTask(t, root, task)
 	if err := ex.Start(context.Background(), task, "x"); err == nil {
 		t.Fatal("expected error when session start fails")
@@ -137,7 +137,7 @@ func TestSandboxExecutorMarksFailedWhenInjectFails(t *testing.T) {
 	ex := NewSandboxExecutor(root, &FakeSessionManager{FailOn: "inject"})
 
 	session := SessionNameFor("codereview", "c1")
-	task := A2ATask{ContextID: "c1", Agent: "codereview", Session: session, State: TaskSubmitted}
+	task := A2ATask{ContextID: "c1", Agent: "codereview", Session: session, State: TaskSubmitted, Level: GrantReadOnly}
 	seedSubmittedTask(t, root, task)
 	if err := ex.Start(context.Background(), task, "x"); err == nil {
 		t.Fatal("expected error when inject fails")
@@ -192,7 +192,7 @@ func TestSandboxExecutorPersistsIdentityBeforeSessionSideEffects(t *testing.T) {
 	spy := &orderSpy{FakeSessionManager: &FakeSessionManager{}, root: root, contextID: "c1"}
 	ex := NewSandboxExecutor(root, spy)
 
-	task := A2ATask{ContextID: "c1", Agent: "codereview", Session: session, State: TaskSubmitted}
+	task := A2ATask{ContextID: "c1", Agent: "codereview", Session: session, State: TaskSubmitted, Level: GrantReadOnly}
 	if err := ex.Start(context.Background(), task, "x"); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -229,7 +229,7 @@ func TestSandboxExecutorPersistGuardRefusesToReviveTerminalRow(t *testing.T) {
 
 	fake := &FakeSessionManager{}
 	ex := NewSandboxExecutor(root, fake)
-	task := A2ATask{ContextID: "c1", Agent: "codereview", Session: session, State: TaskSubmitted}
+	task := A2ATask{ContextID: "c1", Agent: "codereview", Session: session, State: TaskSubmitted, Level: GrantReadOnly}
 	if err := ex.Start(context.Background(), task, "x"); err != nil {
 		t.Fatalf("Start should report success for an already-terminal task (an error here would let a2a_server.go clobber it to Failed), got: %v", err)
 	}
@@ -290,7 +290,7 @@ func TestSandboxExecutorTearsDownSessionWhenTaskCanceledDuringStart(t *testing.T
 	spy := &cancelDuringInject{FakeSessionManager: &FakeSessionManager{}, root: root, contextID: "c1"}
 	ex := NewSandboxExecutor(root, spy)
 
-	task := A2ATask{ContextID: "c1", Agent: "codereview", Session: session, State: TaskSubmitted}
+	task := A2ATask{ContextID: "c1", Agent: "codereview", Session: session, State: TaskSubmitted, Level: GrantReadOnly}
 	seedSubmittedTask(t, root, task)
 
 	if err := ex.Start(context.Background(), task, "x"); err != nil {
@@ -344,7 +344,7 @@ func TestSandboxExecutorSecondMessageInSameContextIsDelivered(t *testing.T) {
 	sm := &realInjectSessionManager{FakeSessionManager: &FakeSessionManager{}}
 	ex := NewSandboxExecutor(root, sm)
 
-	task := A2ATask{ContextID: "c1", Agent: "codereview", Session: SessionNameFor("codereview", "c1"), State: TaskSubmitted}
+	task := A2ATask{ContextID: "c1", Agent: "codereview", Session: SessionNameFor("codereview", "c1"), State: TaskSubmitted, Level: GrantReadOnly}
 
 	if err := ex.Start(context.Background(), task, "first"); err != nil {
 		t.Fatalf("first Start: %v", err)
@@ -390,5 +390,52 @@ func TestNextInjectedMessageIDIsAlwaysDistinct(t *testing.T) {
 			t.Fatalf("duplicate id generated: %q", id)
 		}
 		seen[id] = true
+	}
+}
+
+// 政策檔必須在 Sessions.Start 之前就落地:session 一起來就能發工具呼叫,晚一步
+// 寫等於開了一個沒有約束的窗口。
+func TestSandboxExecutorWritesPolicyBeforeStart(t *testing.T) {
+	root, fake, ex := newExecutorFixture(t)
+	var policyAtStart SandboxPolicy
+	var policyErr error
+	fake.OnStart = func(session string) {
+		policyAtStart, policyErr = LoadSandboxPolicy(root, session)
+	}
+	task := A2ATask{
+		ContextID: "c1", Agent: "codereview", CallerID: "peer-a",
+		Session: SessionNameFor("codereview", "c1"), State: TaskSubmitted, Level: GrantDevelop,
+	}
+	if err := ex.Start(context.Background(), task, "go"); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if policyErr != nil {
+		t.Fatalf("policy not present when the session started: %v", policyErr)
+	}
+	if policyAtStart.Level != GrantDevelop || policyAtStart.CallerID != "peer-a" {
+		t.Fatalf("policy = %#v", policyAtStart)
+	}
+	if policyAtStart.Worktree == "" || policyAtStart.SandboxRoot == "" {
+		t.Fatalf("policy must pin both scopes: %#v", policyAtStart)
+	}
+}
+
+// 沒有有效等級的 row 不可以起沙盒 —— 那會是一個永遠被 gate 全拒的殭屍。
+func TestSandboxExecutorRefusesTaskWithoutLevel(t *testing.T) {
+	root, fake, ex := newExecutorFixture(t)
+	task := A2ATask{
+		ContextID: "c1", Agent: "codereview",
+		Session: SessionNameFor("codereview", "c1"), State: TaskSubmitted,
+	}
+	if err := ex.Start(context.Background(), task, "go"); err == nil {
+		t.Fatal("a task with no grant level must not start a sandbox")
+	}
+	if len(fake.Started) != 0 {
+		t.Fatalf("started %v despite having no grant level", fake.Started)
+	}
+	tasks, _ := LoadTasks(root)
+	tk, _ := tasks.ByContext("c1")
+	if tk.State != TaskFailed {
+		t.Fatalf("state = %q, want failed", tk.State)
 	}
 }
