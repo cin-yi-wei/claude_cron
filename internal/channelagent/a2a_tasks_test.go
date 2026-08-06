@@ -18,9 +18,15 @@ func TestSessionNameForIsPrefixedAndSanitised(t *testing.T) {
 	}
 }
 
+// TestCanTransitionAllowsForwardOnly 原本斷言 submitted→working 直接可行；
+// 這條路徑正是 C2 的根源（handler 派送與 DrainQueue 之間沒有任何佔位，兩者都
+// 能把同一列從 submitted 直接判定成「可以 Start」）。task 6 插入 dispatching
+// 作為必經的中間狀態後，submitted 只能先變 dispatching，於是這裡改成斷言
+// submitted→dispatching→working 這條兩段式路徑，取代原本的一步到位。
 func TestCanTransitionAllowsForwardOnly(t *testing.T) {
 	ok := [][2]TaskState{
-		{TaskSubmitted, TaskWorking},
+		{TaskSubmitted, TaskDispatching},
+		{TaskDispatching, TaskWorking},
 		{TaskWorking, TaskCompleted},
 		{TaskWorking, TaskFailed},
 		{TaskWorking, TaskCanceled},
@@ -36,6 +42,7 @@ func TestCanTransitionAllowsForwardOnly(t *testing.T) {
 		{TaskFailed, TaskCompleted},
 		{TaskCanceled, TaskWorking},
 		{TaskCompleted, TaskCompleted},
+		{TaskSubmitted, TaskWorking},
 	}
 	for _, c := range bad {
 		if CanTransition(c[0], c[1]) {
@@ -81,6 +88,40 @@ func TestRunningCountCountsOnlyWorking(t *testing.T) {
 	}}
 	if got := s.RunningCount(); got != 2 {
 		t.Fatalf("RunningCount = %d, want 2 (only the two working tasks occupy a sandbox slot)", got)
+	}
+}
+
+func TestDispatchingStateMachine(t *testing.T) {
+	for _, c := range []struct {
+		from, to TaskState
+		want     bool
+	}{
+		{TaskSubmitted, TaskDispatching, true},
+		{TaskSubmitted, TaskWorking, false}, // 必須先取得派送權
+		{TaskSubmitted, TaskCanceled, true},
+		{TaskDispatching, TaskWorking, true},
+		{TaskDispatching, TaskFailed, true},
+		{TaskDispatching, TaskCanceled, true},
+		{TaskDispatching, TaskCompleted, false},
+		{TaskCompleted, TaskDispatching, false},
+	} {
+		if got := CanTransition(c.from, c.to); got != c.want {
+			t.Errorf("CanTransition(%q,%q) = %v, want %v", c.from, c.to, got, c.want)
+		}
+	}
+}
+
+// dispatching 的 row 已經在起沙盒了，它就是佔著一個槽。不計入 RunningCount
+// 正是 40 個並發請求全部算出「有容量」的原因。
+func TestRunningCountIncludesDispatching(t *testing.T) {
+	s := TaskStore{Tasks: []A2ATask{
+		{ContextID: "a", State: TaskWorking},
+		{ContextID: "b", State: TaskDispatching},
+		{ContextID: "c", State: TaskSubmitted},
+		{ContextID: "d", State: TaskCompleted},
+	}}
+	if got := s.RunningCount(); got != 2 {
+		t.Fatalf("RunningCount = %d, want 2 (working + dispatching)", got)
 	}
 }
 

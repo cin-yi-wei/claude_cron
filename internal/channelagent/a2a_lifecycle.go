@@ -29,35 +29,58 @@ func HasCapacity(s TaskStore) bool {
 	return s.RunningCount() < MaxConcurrentSandboxes
 }
 
-// DrainQueue starts queued (submitted) tasks while slots remain. Overflow
-// stays queued rather than being rejected.
+// errNothingToDrain 表示這一趟沒有取得任何派送權，WithTasks 因此不寫檔。
+var errNothingToDrain = errors.New("a2a: nothing to drain")
+
+// DispatchStaleAfter 是一列停留在 dispatching 的上限。超過即判為「派送中崩潰」
+// （serve 被殺、機器重開），標 failed 把槽釋放出來。90 秒的 tmux 開機窗口加上
+// git worktree add 的時間，5 分鐘是寬鬆但仍有界的值。
+const DispatchStaleAfter = 5 * time.Minute
+
+// DrainQueue 先在一次 WithTasks 內原子地「只把仍是 submitted 的 row 翻成
+// dispatching」以取得派送權，再到鎖外才呼叫 Start。
 //
-// Capacity used is tracked as baseline (RunningCount at the top of this call)
-// plus started (successful Start calls made so far in this loop), not by
-// reloading the store and re-deriving RunningCount on every iteration. The
-// TaskExecutor interface makes no promise that Start synchronously persists
-// TaskWorking before returning — StubExecutor deliberately does not — so a
-// reload-based re-check can't tell "this call already started this task" from
-// "this task is still queued," and would keep reporting spare capacity that
-// this same call has already committed. Tracking the count locally consumes
-// a slot exactly once per successful start, regardless of what the executor
-// does or doesn't write to disk.
+// 為什麼非得原子不可：Start 要到 EnsureWorkspace + Start + Inject 全部成功
+// （最長 90 秒）才寫 TaskWorking，而 cycle 每 10 秒跑一次。用未上鎖的
+// LoadTasks 判斷「還是 submitted 嗎」，幾乎必然在開機窗口內把同一列再派一
+// 次；因為 message id 現在刻意保證唯一，第二則 prompt 會真的送進同一個沙盒，
+// 同一段委派工作跑兩遍（可能含 commit / push）。這正是 C2。
+//
+// 容量在同一個 critical section 內預留：翻成 dispatching 的那一刻起，這一列
+// 就計入 RunningCount，下一次並發呼叫（handler 或另一次 DrainQueue）看到的
+// 就是扣掉這一列之後的真實空位數 —— 同時修掉 I2。
 func DrainQueue(ctx context.Context, root string, ex TaskExecutor) (int, error) {
-	tasks, err := LoadTasks(root)
-	if err != nil {
+	var claimed []A2ATask
+	err := WithTasks(root, func(tasks *TaskStore) error {
+		free := MaxConcurrentSandboxes - tasks.RunningCount()
+		now := time.Now().UTC().Format(time.RFC3339)
+		for i := range tasks.Tasks {
+			if free <= 0 {
+				break
+			}
+			t := tasks.Tasks[i]
+			if t.State != TaskSubmitted {
+				continue
+			}
+			t.State = TaskDispatching
+			t.DispatchedAt = now
+			tasks.Tasks[i] = t
+			claimed = append(claimed, t)
+			free--
+		}
+		if len(claimed) == 0 {
+			return errNothingToDrain
+		}
+		return nil
+	})
+	if err != nil && !errors.Is(err, errNothingToDrain) {
 		return 0, err
 	}
-	running := tasks.RunningCount()
+
 	started := 0
-	for _, t := range tasks.Tasks {
-		if t.State != TaskSubmitted {
-			continue
-		}
-		if running+started >= MaxConcurrentSandboxes {
-			break
-		}
+	for _, t := range claimed {
 		if err := ex.Start(ctx, t, t.Prompt); err != nil {
-			continue // executor already recorded the failure
+			continue // executor 已經把失敗記在 row 上了
 		}
 		started++
 	}
@@ -164,7 +187,16 @@ type reclaimCandidate struct {
 // cleared for it. reclaimed is independent of whether step 3's SaveTasks
 // call itself succeeds; if it doesn't, the next sweep simply retries an
 // already-removed path, which os.RemoveAll and RemoveWorktree both tolerate.
-func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time.Time) (int, int, error) {
+// SandboxStopper is a placeholder for the process-liveness hook task 7 wires
+// in (checking whether a session's tmux/claude process is actually still
+// alive, independent of the timestamp-based checks below). SweepTimeouts
+// accepts it as its 5th parameter starting with this task so the signature
+// does not need to change again later, but does not call it yet — nil is a
+// valid, no-op value and every check in this function today is unaffected by
+// its presence.
+type SandboxStopper interface{}
+
+func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time.Time, stopper SandboxStopper) (int, int, error) {
 	canceled, reclaimed := 0, 0
 	// Sessions to stop are collected under the lock but stopped after it is
 	// released: sm.Stop shells out to tmux, and nothing that touches a
@@ -197,7 +229,7 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 		for i := range tasks.Tasks {
 			t := tasks.Tasks[i]
 			switch t.State {
-			case TaskWorking, TaskSubmitted:
+			case TaskWorking, TaskSubmitted, TaskDispatching:
 				if !CanTransition(t.State, TaskCanceled) {
 					continue
 				}
@@ -210,6 +242,23 @@ func SweepTimeouts(ctx context.Context, root string, sm SessionManager, now time
 				// cancel apart from an ordinary hard timeout.
 				var reason string
 				started, ok := parseRFC3339(t.StartedAt)
+
+				// 派送中崩潰:這一列停在 dispatching 超過 DispatchStaleAfter,
+				// 表示起沙盒的那個行程沒了。標 failed 把槽釋放出來 —— 不是
+				// TaskCanceled,因為這不是操作者取消,而是我們自己的執行體
+				// 死掉了,失敗歸類為 failed 才對得上其他派送失敗的分類。
+				if t.State == TaskDispatching {
+					if d, dok := parseRFC3339(t.DispatchedAt); !dok || now.Sub(d) >= DispatchStaleAfter {
+						toStop = append(toStop, t.Session)
+						t.State = TaskFailed
+						t.Detail = "dispatch stalled (no sandbox came up)"
+						t.CompletedAt = now.UTC().Format(time.RFC3339)
+						tasks.Tasks[i] = t
+						changed = true
+						continue
+					}
+				}
+
 				switch {
 				case !ok:
 					reason = "start time unreadable (missing or corrupt StartedAt); canceled as a hard-timeout backstop"

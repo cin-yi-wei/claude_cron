@@ -10,25 +10,35 @@ type TaskState string
 
 const (
 	TaskSubmitted TaskState = "submitted"
-	TaskWorking   TaskState = "working"
-	TaskCompleted TaskState = "completed"
-	TaskFailed    TaskState = "failed"
-	TaskCanceled  TaskState = "canceled"
+	// TaskDispatching 是「已取得派送權、沙盒正在建立」。它與 submitted 分開
+	// 的唯一理由是關掉重複派送：Start 要到 EnsureWorkspace + Start + Inject
+	// 全部成功（最長 90 秒的開機窗口）才寫 TaskWorking，而 A2A cycle 每 10
+	// 秒跑一次 DrainQueue —— 沒有這個中間狀態，handler 派送的任務幾乎必然被
+	// DrainQueue 再派一次，同一段委派工作跑兩遍。
+	TaskDispatching TaskState = "dispatching"
+	TaskWorking     TaskState = "working"
+	TaskCompleted   TaskState = "completed"
+	TaskFailed      TaskState = "failed"
+	TaskCanceled    TaskState = "canceled"
 )
 
 // A2ATask is one delegated task, keyed by the A2A contextId. Its sandbox is a
 // dedicated tmux session + git worktree.
 type A2ATask struct {
-	ContextID   string    `json:"context_id"`
-	TaskID      string    `json:"task_id"`
-	Agent       string    `json:"agent"`
-	CallerID    string    `json:"caller_id"`
-	Session     string    `json:"session"`
-	Worktree    string    `json:"worktree"`
-	Branch      string    `json:"branch"`
-	State       TaskState `json:"state"`
-	StartedAt   string    `json:"started_at"`
-	CompletedAt string    `json:"completed_at,omitempty"`
+	ContextID string    `json:"context_id"`
+	TaskID    string    `json:"task_id"`
+	Agent     string    `json:"agent"`
+	CallerID  string    `json:"caller_id"`
+	Session   string    `json:"session"`
+	Worktree  string    `json:"worktree"`
+	Branch    string    `json:"branch"`
+	State     TaskState `json:"state"`
+	StartedAt string    `json:"started_at"`
+	// DispatchedAt 是取得派送權的時刻。StartedAt 不能用：一個排隊數小時後才
+	// 被 DrainQueue 撿走的任務，它的 StartedAt 是提交時刻，用它算「派送中卡
+	// 住多久」會立刻誤判。
+	DispatchedAt string `json:"dispatched_at,omitempty"`
+	CompletedAt  string `json:"completed_at,omitempty"`
 	// Prompt is the caller's original request text. It must be persisted so a
 	// task queued at capacity can still be started later by DrainQueue.
 	Prompt string `json:"prompt,omitempty"`
@@ -97,26 +107,29 @@ func (s TaskStore) ActiveCount() int {
 	return n
 }
 
-// RunningCount counts only tasks actually occupying a sandbox slot
-// (TaskWorking). A submitted task has no sandbox yet — it is queued
-// precisely because it doesn't occupy one — so it must not count here.
-// Gating capacity on ActiveCount instead would deadlock permanently: a pile
-// of queued work with nothing running would read as "full" forever, since
-// nothing running means nothing can ever complete to free a slot.
+// RunningCount 計入 working 與 dispatching：一個 dispatching 的 row 已經在
+// 建 worktree、起 tmux session 了，它就是佔著一個槽。漏算它正是 40 個並發
+// 請求全部算出「有容量」的原因（I2）。submitted 仍然不算 —— 它還在排隊，
+// 把它算進去會讓「一堆排隊、什麼都沒在跑」永久讀成客滿。
 func (s TaskStore) RunningCount() int {
 	n := 0
 	for _, t := range s.Tasks {
-		if t.State == TaskWorking {
+		if t.State == TaskWorking || t.State == TaskDispatching {
 			n++
 		}
 	}
 	return n
 }
 
-// CanTransition enforces the state machine: terminal states are final.
+// CanTransition enforces the state machine: terminal states are final, and a
+// task must pass through TaskDispatching (claim the right to dispatch) before
+// it can ever become TaskWorking — submitted -> working directly is no
+// longer legal, which is what closes C2 (double dispatch).
 func CanTransition(from, to TaskState) bool {
 	switch from {
 	case TaskSubmitted:
+		return to == TaskDispatching || to == TaskFailed || to == TaskCanceled
+	case TaskDispatching:
 		return to == TaskWorking || to == TaskFailed || to == TaskCanceled
 	case TaskWorking:
 		return to == TaskCompleted || to == TaskFailed || to == TaskCanceled

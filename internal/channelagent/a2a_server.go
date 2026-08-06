@@ -50,6 +50,13 @@ var a2aContextIDRe = regexp.MustCompile(`^[A-Za-z0-9]{1,128}$`)
 // to write.
 var errContextHijack = errors.New("a2a: contextId is owned by another caller")
 
+// errContextAgentSwitch 表示這個 contextId 已經綁在另一個 agent 上。
+// SessionNameFor 與 SandboxWorktree 都含 agent 名，而 Upsert 以 contextId 為
+// key 整列覆寫，所以換 agent 再送一次會讓舊的 aa-<oldagent>-<ctx>（活著的
+// tmux session + ~80MB worktree）不再被任何 row 參照 —— 沒有任何程式碼掃
+// sandboxes/，RunningCount 也數不到它，8 併發上限對它完全無效。
+var errContextAgentSwitch = errors.New("a2a: contextId is bound to another agent")
+
 // MessageSendParams is the params body of the message/send method.
 type MessageSendParams struct {
 	Agent     string `json:"agent"`
@@ -243,21 +250,45 @@ func (s *A2AServer) handleRPC(w http.ResponseWriter, r *http.Request) {
 	// caller could reuse another caller's contextId and overwrite its task row
 	// (CallerID, Session, State), making the original task unbookkeepable. A
 	// caller may only reuse a contextId that is unclaimed or already theirs.
-	// The load, ownership check and upsert all happen inside one WithTasks
-	// call so a concurrent request can never interleave between the check and
-	// the write (the lost-update bug this task closes).
 	//
-	// Ownership applies regardless of state. Session and worktree names are
-	// caller-independent and EnsureWorktree no-ops on an existing path, so a
-	// different caller reusing even a FINISHED contextId would inherit the
-	// original caller's checkout, branch and sandbox root.
+	// Ownership applies regardless of state, and so does the agent-match
+	// check right below it: Session and worktree names are functions of
+	// (agent, contextId) (SessionNameFor, SandboxWorktree), and Upsert keys
+	// on contextId alone, so a caller resubmitting the same contextId against
+	// a DIFFERENT agent would overwrite the row and orphan the old
+	// aa-<oldagent>-<ctx> sandbox (a live tmux session + its worktree) with
+	// nothing left pointing at it (D1). This is checked in every state,
+	// including terminal ones, because the whole point is that the same
+	// caller MAY legitimately resubmit a finished contextId — just not
+	// against a different agent.
+	//
+	// The load, ownership/agent check, capacity check and upsert all happen
+	// inside one WithTasks call so a concurrent request can never interleave
+	// between the check and the write. That is what makes the capacity claim
+	// atomic (I2): hasCapacity is read and the claim (submitted ->
+	// dispatching) is written in the very same locked section, so this row
+	// counts against RunningCount from the instant any other request could
+	// possibly observe it — a check in one locked section and a mark in
+	// another would reopen the same race in a new shape.
 	var hasCapacity bool
 	err = WithTasks(s.Root, func(tasks *TaskStore) error {
-		if existing, ok := tasks.ByContext(p.ContextID); ok && existing.CallerID != caller.CallerID {
-			return errContextHijack
+		if existing, ok := tasks.ByContext(p.ContextID); ok {
+			if existing.CallerID != caller.CallerID {
+				return errContextHijack
+			}
+			if existing.Agent != "" && existing.Agent != task.Agent {
+				return errContextAgentSwitch
+			}
+		}
+		// 容量在 upsert 之「前」算，翻成 dispatching 在同一個 critical
+		// section 內完成：於是這一列立刻開始計入 RunningCount，下一個並發
+		// 請求算出的就是真話。這同時修掉 I2。
+		hasCapacity = HasCapacity(*tasks)
+		if hasCapacity {
+			task.State = TaskDispatching
+			task.DispatchedAt = time.Now().UTC().Format(time.RFC3339)
 		}
 		tasks.Upsert(task)
-		hasCapacity = HasCapacity(*tasks)
 		return nil
 	})
 	if err != nil {
@@ -275,6 +306,18 @@ func (s *A2AServer) handleRPC(w http.ResponseWriter, r *http.Request) {
 				Outcome:   "forbidden_hijack",
 			})
 			writeRPC(w, RPCFail(req.ID, RPCForbidden, "contextId is owned by another caller"))
+			return
+		}
+		if errors.Is(err, errContextAgentSwitch) {
+			_ = AppendAudit(s.Root, AuditEntry{
+				At:        time.Now().UTC().Format(time.RFC3339),
+				CallerID:  caller.CallerID,
+				Agent:     p.Agent,
+				ContextID: p.ContextID,
+				Summary:   p.Text,
+				Outcome:   "forbidden_agent_switch",
+			})
+			writeRPC(w, RPCFail(req.ID, RPCForbidden, "contextId is already bound to a different agent"))
 			return
 		}
 		writeRPC(w, RPCFail(req.ID, RPCInternalError, "cannot persist task"))

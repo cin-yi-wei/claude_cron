@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sync"
 )
 
 // SessionManager isolates every side effect that touches git or tmux, so tests
@@ -97,9 +98,18 @@ type FakeSessionManager struct {
 	// in place by the time a real tmux session would come up — the sandbox
 	// policy in particular.
 	OnStart func(session string)
+	// mu 序列化每個方法對上面那些切片的存取。task 6 之前所有測試都是單一
+	// goroutine 呼叫 fake,不需要鎖;task 6 的併發測試 (N 條 goroutine 各自
+	// message/send、或 handler 與 DrainQueue 並發) 會從多條 goroutine 同時
+	// 呼叫同一個 fake 實例的 EnsureWorkspace/Start/Inject 等方法,對同一個
+	// slice append 而不加鎖在 -race 下必炸。既有測試都在並發結束後才讀取欄位
+	// (見各方法後段的斷言),所以這個鎖不影響它們。
+	mu sync.Mutex
 }
 
 func (f *FakeSessionManager) EnsureWorkspace(_ context.Context, _, _, worktree string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.FailOn == "workspace" {
 		return errors.New("fake workspace failure")
 	}
@@ -108,6 +118,8 @@ func (f *FakeSessionManager) EnsureWorkspace(_ context.Context, _, _, worktree s
 }
 
 func (f *FakeSessionManager) Start(_ context.Context, session, _, _ string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.FailOn == "start" {
 		return errors.New("fake start failure")
 	}
@@ -119,6 +131,8 @@ func (f *FakeSessionManager) Start(_ context.Context, session, _, _ string) erro
 }
 
 func (f *FakeSessionManager) Stop(_ context.Context, session string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.FailOn == "stop" {
 		return errors.New("fake stop failure")
 	}
@@ -127,6 +141,8 @@ func (f *FakeSessionManager) Stop(_ context.Context, session string) error {
 }
 
 func (f *FakeSessionManager) RemoveWorkspace(_ context.Context, _, worktree string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.OnRemove != nil {
 		hook := f.OnRemove
 		f.OnRemove = nil
@@ -140,6 +156,8 @@ func (f *FakeSessionManager) RemoveWorkspace(_ context.Context, _, worktree stri
 }
 
 func (f *FakeSessionManager) Inject(_ context.Context, _ string, msg SourceMessage) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.FailOn == "inject" {
 		return errors.New("fake inject failure")
 	}
@@ -148,6 +166,8 @@ func (f *FakeSessionManager) Inject(_ context.Context, _ string, msg SourceMessa
 }
 
 func (f *FakeSessionManager) TrustFolder(_ context.Context, worktree string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.FailOn == "trust" {
 		return errors.New("fake trust failure")
 	}

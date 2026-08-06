@@ -131,7 +131,7 @@ func TestSweepDoesNotCancelBeforeHardTimeout(t *testing.T) {
 	_ = SaveTasks(root, s)
 
 	fake := &FakeSessionManager{}
-	canceled, _, err := SweepTimeouts(context.Background(), root, fake, now)
+	canceled, _, err := SweepTimeouts(context.Background(), root, fake, now, nil)
 	if err != nil {
 		t.Fatalf("SweepTimeouts: %v", err)
 	}
@@ -156,7 +156,7 @@ func TestSweepCancelsAfterHardTimeout(t *testing.T) {
 	_ = SaveTasks(root, s)
 
 	fake := &FakeSessionManager{}
-	canceled, _, err := SweepTimeouts(context.Background(), root, fake, now)
+	canceled, _, err := SweepTimeouts(context.Background(), root, fake, now, nil)
 	if err != nil {
 		t.Fatalf("SweepTimeouts: %v", err)
 	}
@@ -195,7 +195,7 @@ func TestSweepPreservesPriorDetailOnHardTimeout(t *testing.T) {
 	_ = SaveTasks(root, s)
 
 	fake := &FakeSessionManager{}
-	canceled, _, err := SweepTimeouts(context.Background(), root, fake, now)
+	canceled, _, err := SweepTimeouts(context.Background(), root, fake, now, nil)
 	if err != nil {
 		t.Fatalf("SweepTimeouts: %v", err)
 	}
@@ -231,7 +231,7 @@ func TestSweepReclaimsCompletedAfterRetention(t *testing.T) {
 	_ = SaveTasks(root, s)
 
 	fake := &FakeSessionManager{}
-	_, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now)
+	_, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now, nil)
 	if err != nil {
 		t.Fatalf("SweepTimeouts: %v", err)
 	}
@@ -254,7 +254,7 @@ func TestSweepLeavesFailedSandboxForensics(t *testing.T) {
 	_ = SaveTasks(root, s)
 
 	fake := &FakeSessionManager{}
-	if _, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now); err != nil || reclaimed != 0 {
+	if _, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now, nil); err != nil || reclaimed != 0 {
 		t.Fatalf("failed sandboxes must be kept: reclaimed=%d err=%v", reclaimed, err)
 	}
 	if len(fake.Stopped) != 0 {
@@ -278,7 +278,7 @@ func TestSweepCancelsWorkingTaskWithEmptyStartedAt(t *testing.T) {
 	_ = SaveTasks(root, s)
 
 	fake := &FakeSessionManager{}
-	canceled, _, err := SweepTimeouts(context.Background(), root, fake, now)
+	canceled, _, err := SweepTimeouts(context.Background(), root, fake, now, nil)
 	if err != nil {
 		t.Fatalf("SweepTimeouts: %v", err)
 	}
@@ -311,7 +311,7 @@ func TestSweepCancelsWorkingTaskWithGarbageStartedAt(t *testing.T) {
 	_ = SaveTasks(root, s)
 
 	fake := &FakeSessionManager{}
-	canceled, _, err := SweepTimeouts(context.Background(), root, fake, now)
+	canceled, _, err := SweepTimeouts(context.Background(), root, fake, now, nil)
 	if err != nil {
 		t.Fatalf("SweepTimeouts: %v", err)
 	}
@@ -345,7 +345,7 @@ func TestSweepReclaimsCompletedTaskWithUnparseableCompletedAt(t *testing.T) {
 	_ = SaveTasks(root, s)
 
 	fake := &FakeSessionManager{}
-	_, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now)
+	_, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now, nil)
 	if err != nil {
 		t.Fatalf("SweepTimeouts: %v", err)
 	}
@@ -382,7 +382,7 @@ func TestSweepRemovesWorktreeOnReclaim(t *testing.T) {
 	}
 
 	fake := &FakeSessionManager{}
-	if _, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now); err != nil || reclaimed != 1 {
+	if _, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now, nil); err != nil || reclaimed != 1 {
 		t.Fatalf("reclaimed = %d err = %v", reclaimed, err)
 	}
 	if len(fake.Removed) != 1 || fake.Removed[0] != "/p/aa-a-c1" {
@@ -410,7 +410,7 @@ func TestSweepRetriesFailedRemoval(t *testing.T) {
 	_ = SaveTasks(root, s)
 
 	fake := &FakeSessionManager{FailOn: "remove"}
-	if _, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now); err != nil || reclaimed != 0 {
+	if _, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now, nil); err != nil || reclaimed != 0 {
 		t.Fatalf("first sweep: reclaimed = %d err = %v, want 0 (removal failed)", reclaimed, err)
 	}
 	got, _ := LoadTasks(root)
@@ -420,7 +420,7 @@ func TestSweepRetriesFailedRemoval(t *testing.T) {
 	}
 
 	fake.FailOn = ""
-	if _, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now); err != nil || reclaimed != 1 {
+	if _, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now, nil); err != nil || reclaimed != 1 {
 		t.Fatalf("retry sweep: reclaimed = %d err = %v, want 1", reclaimed, err)
 	}
 	if len(fake.Removed) != 1 || fake.Removed[0] != "/p/aa-a-c1" {
@@ -475,7 +475,7 @@ func TestSweepSkipsRowChangedDuringTeardown(t *testing.T) {
 		}
 	}
 
-	if _, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now); err != nil || reclaimed != 0 {
+	if _, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now, nil); err != nil || reclaimed != 0 {
 		t.Fatalf("reclaimed = %d err = %v, want 0 (the row now belongs to a different, live task)", reclaimed, err)
 	}
 	got, _ := LoadTasks(root)
@@ -502,7 +502,7 @@ func TestSweepReclaimsWorktreeOnHardTimeoutCancel(t *testing.T) {
 	_ = SaveTasks(root, s)
 
 	fake := &FakeSessionManager{}
-	canceled, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now)
+	canceled, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now, nil)
 	if err != nil {
 		t.Fatalf("SweepTimeouts: %v", err)
 	}
@@ -542,7 +542,7 @@ func TestSweepCapsRetainedFailedSandboxes(t *testing.T) {
 	_ = SaveTasks(root, s)
 
 	fake := &FakeSessionManager{}
-	if _, _, err := SweepTimeouts(context.Background(), root, fake, now); err != nil {
+	if _, _, err := SweepTimeouts(context.Background(), root, fake, now, nil); err != nil {
 		t.Fatalf("SweepTimeouts: %v", err)
 	}
 	if len(fake.Removed) != 5 {
@@ -566,7 +566,7 @@ func TestSweepKeepsFailedSandboxesUnderTheCap(t *testing.T) {
 	_ = SaveTasks(root, s)
 
 	fake := &FakeSessionManager{}
-	_, _, _ = SweepTimeouts(context.Background(), root, fake, now)
+	_, _, _ = SweepTimeouts(context.Background(), root, fake, now, nil)
 	if len(fake.Removed) != 0 {
 		t.Fatalf("a single old failed sandbox must be kept for forensics, got %#v", fake.Removed)
 	}
@@ -587,10 +587,42 @@ func TestSweepLeavesFailedSandboxForensicsEvenWithGarbageTimestamp(t *testing.T)
 	_ = SaveTasks(root, s)
 
 	fake := &FakeSessionManager{}
-	if _, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now); err != nil || reclaimed != 0 {
+	if _, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now, nil); err != nil || reclaimed != 0 {
 		t.Fatalf("failed sandboxes must be kept even with a corrupt timestamp: reclaimed=%d err=%v", reclaimed, err)
 	}
 	if len(fake.Stopped) != 0 {
 		t.Fatalf("failed sandbox must not be torn down: %#v", fake.Stopped)
+	}
+}
+
+// 派送中崩潰（serve 被殺、機器重開）會留下永遠停在 dispatching 的 row，佔著
+// 一個併發槽。
+func TestSweepFailsStaleDispatchingRows(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	var s TaskStore
+	s.Upsert(A2ATask{
+		ContextID: "c1", Agent: "a", Session: "aa-a-c1", State: TaskDispatching,
+		StartedAt:    now.Add(-10 * time.Minute).Format(time.RFC3339),
+		DispatchedAt: now.Add(-DispatchStaleAfter - time.Minute).Format(time.RFC3339),
+	})
+	s.Upsert(A2ATask{
+		ContextID: "c2", Agent: "a", Session: "aa-a-c2", State: TaskDispatching,
+		StartedAt:    now.Format(time.RFC3339),
+		DispatchedAt: now.Format(time.RFC3339),
+	})
+	_ = SaveTasks(root, s)
+
+	if _, _, err := SweepTimeouts(context.Background(), root, &FakeSessionManager{}, now, nil); err != nil {
+		t.Fatalf("SweepTimeouts: %v", err)
+	}
+	got, _ := LoadTasks(root)
+	c1, _ := got.ByContext("c1")
+	c2, _ := got.ByContext("c2")
+	if c1.State != TaskFailed {
+		t.Fatalf("stale dispatching row = %q, want failed", c1.State)
+	}
+	if c2.State != TaskDispatching {
+		t.Fatalf("fresh dispatching row = %q, want it left alone", c2.State)
 	}
 }

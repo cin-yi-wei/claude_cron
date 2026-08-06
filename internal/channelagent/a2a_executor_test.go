@@ -22,7 +22,13 @@ func newExecutorFixture(t *testing.T) (string, *FakeSessionManager, *SandboxExec
 
 func TestSandboxExecutorCreatesWorkspaceStartsAndInjects(t *testing.T) {
 	root, fake, ex := newExecutorFixture(t)
-	task := A2ATask{ContextID: "c1", Agent: "codereview", Session: SessionNameFor("codereview", "c1"), State: TaskSubmitted, Level: GrantReadOnly}
+	// task 6: submitted -> working is no longer a legal direct transition
+	// (CanTransition requires the intermediate TaskDispatching claim state);
+	// by the time anything calls Executor.Start in production, the caller
+	// (a2a_server.go or DrainQueue) has already flipped the row to
+	// TaskDispatching in the same locked section that reserved its capacity
+	// slot. Reproduce that precondition here.
+	task := A2ATask{ContextID: "c1", Agent: "codereview", Session: SessionNameFor("codereview", "c1"), State: TaskDispatching, Level: GrantReadOnly}
 
 	if err := ex.Start(context.Background(), task, "please review"); err != nil {
 		t.Fatalf("Start: %v", err)

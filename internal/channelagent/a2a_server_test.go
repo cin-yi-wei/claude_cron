@@ -8,7 +8,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func newTestA2AServer(t *testing.T) (*A2AServer, string) {
@@ -134,8 +136,15 @@ func TestValidTaskIsPersistedAndDispatched(t *testing.T) {
 	if !ok {
 		t.Fatal("task not persisted")
 	}
-	if tk.State != TaskSubmitted {
-		t.Fatalf("state = %s", tk.State)
+	// task 6: the capacity claim (submitted -> dispatching) happens in the
+	// same locked section that upserts the row, before the executor is ever
+	// called — so by the time this handler call has returned successfully,
+	// the row is already TaskDispatching, not TaskSubmitted. StubExecutor
+	// never writes TaskWorking itself (that is SandboxExecutor's job once a
+	// real sandbox is actually up), so this is the terminal state a stub
+	// dispatch leaves behind.
+	if tk.State != TaskDispatching {
+		t.Fatalf("state = %s, want dispatching", tk.State)
 	}
 	if tk.Session != SessionNameFor("codereview", "c1") {
 		t.Fatalf("session = %q", tk.Session)
@@ -660,5 +669,95 @@ func TestMessageSendRejectsUnknownLevel(t *testing.T) {
 	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
 	if resp.Error == nil || resp.Error.Code != RPCInvalidParams {
 		t.Fatalf("unknown level must be invalid params, got %#v", resp.Error)
+	}
+}
+
+// D1：同一 contextId 換 agent 會永久孤兒化一個活著的沙盒（SessionNameFor 與
+// SandboxWorktree 都含 agent 名，Upsert 以 contextId 為 key 整列覆寫，舊的
+// aa-<oldagent>-<ctx> 就不再被任何 row 參照）。拒絕而非拆除：在 handler 內
+// 拆掉舊沙盒需要在鎖內碰 tmux / git。
+func TestSameContextIDCannotSwitchAgent(t *testing.T) {
+	s, root := newTestA2AServer(t)
+	agents, _ := LoadAgents(root)
+	_ = agents.Add(Agent{Name: "pm", ProjectDir: "/p/pm", Capabilities: []string{"read"}, Enabled: true})
+	_ = SaveAgents(root, agents)
+
+	fake := &FakeSessionManager{}
+	s.Executor = NewSandboxExecutor(root, fake)
+
+	rec := postRPC(t, s.Handler(), "secret-1",
+		`{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"agent":"codereview","contextId":"c1","text":"first"}}`)
+	var first RPCResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &first)
+	if first.Error != nil {
+		t.Fatalf("first send failed: %#v", first.Error)
+	}
+
+	rec = postRPC(t, s.Handler(), "secret-1",
+		`{"jsonrpc":"2.0","id":2,"method":"message/send","params":{"agent":"pm","contextId":"c1","text":"second"}}`)
+	var second RPCResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &second)
+	if second.Error == nil || second.Error.Code != RPCForbidden {
+		t.Fatalf("switching agent on a live contextId must be forbidden, got %#v", second.Error)
+	}
+	if len(fake.Started) != 1 {
+		t.Fatalf("started %#v; the first sandbox must not be orphaned by a second one", fake.Started)
+	}
+	entries, _ := ReadAudit(root)
+	if len(entries) == 0 || entries[len(entries)-1].Outcome != "forbidden_agent_switch" {
+		t.Fatalf("audit tail = %#v", entries)
+	}
+}
+
+// 規格第五節測試 1：handler 與 DrainQueue 同時對同一個 contextId 動作，只能
+// 有一則 prompt 真的落進沙盒。
+func TestHandlerAndDrainQueueNeverDoubleDispatch(t *testing.T) {
+	s, root := newTestA2AServer(t)
+	fake := &FakeSessionManager{}
+	ex := NewSandboxExecutor(root, fake)
+	s.Executor = ex
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		postRPC(t, s.Handler(), "secret-1",
+			`{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"agent":"codereview","contextId":"c1","text":"go"}}`)
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 20; i++ {
+			_, _ = DrainQueue(context.Background(), root, ex)
+			time.Sleep(time.Millisecond)
+		}
+	}()
+	wg.Wait()
+
+	if n := len(fake.Injected); n != 1 {
+		t.Fatalf("injected %d prompts for one contextId; the delegated work would run %d times", n, n)
+	}
+}
+
+// 規格第五節測試 2：N 條 goroutine 送 N 個不同 contextId，併發上限必須是硬
+// 上限而不是建議值。
+func TestConcurrentSubmitsRespectTheSandboxCap(t *testing.T) {
+	s, root := newTestA2AServer(t)
+	fake := &FakeSessionManager{}
+	s.Executor = NewSandboxExecutor(root, fake)
+
+	const n = 40
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			body := fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"method":"message/send","params":{"agent":"codereview","contextId":"ctx%02d","text":"go"}}`, i, i)
+			postRPC(t, s.Handler(), "secret-1", body)
+		}(i)
+	}
+	wg.Wait()
+
+	if got := len(fake.Started); got > MaxConcurrentSandboxes {
+		t.Fatalf("started %d sandboxes, cap is %d", got, MaxConcurrentSandboxes)
 	}
 }
