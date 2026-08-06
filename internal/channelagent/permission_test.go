@@ -285,6 +285,62 @@ func TestPermissionGateWriteToOtherProjectMemoryAsksChannel(t *testing.T) {
 	<-done
 }
 
+// cc- binding 經過 gate 的每一個判定，逐字寫死在這裡。沙盒分支插在
+// LoadRegistry 之前並直接 return，所以這些輸出一位元都不該變。任何一條
+// 失敗都代表 cc- 的行為被改到了 —— 那是本輪最不能發生的事。
+func TestPermissionGateBindingPathUnchanged(t *testing.T) {
+	root := filepath.Join(t.TempDir(), ".channel-agent")
+	if err := Init(root); err != nil {
+		t.Fatal(err)
+	}
+	wt := t.TempDir()
+	seedBinding(t, root, Binding{
+		Name: "b", ChannelID: "c1", Worktree: wt, Root: pathIn(root, "bindings", "b"),
+	})
+	auto := t.TempDir()
+	seedBinding(t, root, Binding{
+		Name: "auto", ChannelID: "c2", Worktree: auto, Root: pathIn(root, "bindings", "auto"),
+		AutoApprove: true,
+	})
+
+	for _, c := range []struct{ name, hook, want string }{
+		{
+			"in-worktree edit",
+			`{"cwd":"` + wt + `","tool_name":"Edit","tool_input":{"file_path":"` + wt + `/a.go"}}`,
+			`{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"permission gate: in-worktree edit auto-allowed"}}`,
+		},
+		{
+			"ordinary bash",
+			`{"cwd":"` + wt + `","tool_name":"Bash","tool_input":{"command":"git status"}}`,
+			`{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"permission gate: ordinary command auto-allowed"}}`,
+		},
+		{
+			"auto-approve binding",
+			`{"cwd":"` + auto + `","tool_name":"mcp__x__y","tool_input":{}}`,
+			`{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"permission gate: auto-approved (binding bypass)"}}`,
+		},
+		{
+			// cc- 的 fail-open 對未知 cwd 仍然保留 —— 這是既有行為，不在本輪範圍。
+			"unknown cwd stays fail-open for cc-",
+			`{"cwd":"` + t.TempDir() + `","tool_name":"Bash","tool_input":{"command":"rm -rf /"}}`,
+			`{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"permission gate: no binding for cwd, allowing"}}`,
+		},
+		{
+			"out-of-worktree write times out to deny",
+			`{"cwd":"` + wt + `","tool_name":"Write","tool_input":{"file_path":"/etc/hosts"}}`,
+			`{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"權限請求逾時，自動拒絕"}}`,
+		},
+	} {
+		var out bytes.Buffer
+		if err := RunPermissionGate(context.Background(), root, strings.NewReader(c.hook), &out, 50*time.Millisecond); err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		if got := out.String(); got != c.want {
+			t.Errorf("%s:\n got %s\nwant %s", c.name, got, c.want)
+		}
+	}
+}
+
 func TestPermissionGateWriteOutsideWorktreeAsksChannel(t *testing.T) {
 	root := filepath.Join(t.TempDir(), ".channel-agent")
 	if err := Init(root); err != nil {

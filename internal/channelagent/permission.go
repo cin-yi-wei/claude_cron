@@ -263,6 +263,14 @@ func RunPermissionGate(ctx context.Context, registryRoot string, in io.Reader, o
 		return nil
 	}
 
+	// A2A 沙盒分支。判別依據是 registryRoot（來自 tmux 環境變數 CC_REGISTRY_ROOT，
+	// 沙盒內的工具呼叫改不到 hook 行程的環境），不是 hi.CWD（那是 Claude 自己
+	// 回報的，沙盒內 cd 一下就變）。命中就完全走沙盒分支並直接 return，於是
+	// 底下 cc- 路徑的每一行都不動 —— 見 TestPermissionGateBindingPathUnchanged。
+	if mainRoot, session, ok := SandboxSessionFromRegistryRoot(registryRoot); ok {
+		return runSandboxGate(mainRoot, session, hi, out)
+	}
+
 	reg, err := LoadRegistry(registryRoot)
 	if err != nil {
 		fmt.Fprint(out, hookDecisionJSON(false, "permission gate: registry error"))
