@@ -13,6 +13,10 @@ type SessionManager interface {
 	Start(ctx context.Context, session, cwd, registryRoot string) error
 	Stop(ctx context.Context, session string) error
 	Inject(ctx context.Context, root string, msg SourceMessage) error
+	// RemoveWorkspace tears down a sandbox checkout. Reclaiming only the tmux
+	// session leaves ~80MB per task on disk, and contextId is caller-chosen, so
+	// without this one approved caller can grow the disk without bound.
+	RemoveWorkspace(ctx context.Context, projectDir, worktree string) error
 }
 
 // TmuxSessionManager is the production implementation, delegating to the same
@@ -29,6 +33,10 @@ func (TmuxSessionManager) Start(ctx context.Context, session, cwd, registryRoot 
 
 func (TmuxSessionManager) Stop(ctx context.Context, session string) error {
 	return StopTmuxSession(ctx, session)
+}
+
+func (TmuxSessionManager) RemoveWorkspace(ctx context.Context, projectDir, worktree string) error {
+	return RemoveWorktree(ctx, projectDir, worktree)
 }
 
 func (TmuxSessionManager) Inject(ctx context.Context, root string, msg SourceMessage) error {
@@ -56,6 +64,7 @@ type FakeSessionManager struct {
 	Started    []string
 	Stopped    []string
 	Injected   []SourceMessage
+	Removed    []string
 	FailOn     string
 }
 
@@ -80,6 +89,14 @@ func (f *FakeSessionManager) Stop(_ context.Context, session string) error {
 		return errors.New("fake stop failure")
 	}
 	f.Stopped = append(f.Stopped, session)
+	return nil
+}
+
+func (f *FakeSessionManager) RemoveWorkspace(_ context.Context, _, worktree string) error {
+	if f.FailOn == "remove" {
+		return errors.New("fake remove failure")
+	}
+	f.Removed = append(f.Removed, worktree)
 	return nil
 }
 

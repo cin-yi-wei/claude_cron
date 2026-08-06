@@ -2,6 +2,7 @@ package channelagent
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -314,6 +315,73 @@ func TestSweepReclaimsCompletedTaskWithUnparseableCompletedAt(t *testing.T) {
 // forensics exemption is not weakened by the corrupt-timestamp fix: a failed
 // task must never be reclaimed, regardless of how unreadable its CompletedAt
 // is.
+func TestSweepRemovesWorktreeOnReclaim(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	var s TaskStore
+	s.Upsert(A2ATask{
+		ContextID: "c1", Session: "aa-a-c1", State: TaskCompleted,
+		Worktree:    "/p/aa-a-c1",
+		CompletedAt: now.Add(-15 * time.Minute).Format(time.RFC3339),
+	})
+	_ = SaveTasks(root, s)
+
+	fake := &FakeSessionManager{}
+	if _, reclaimed, err := SweepTimeouts(context.Background(), root, fake, now); err != nil || reclaimed != 1 {
+		t.Fatalf("reclaimed = %d err = %v", reclaimed, err)
+	}
+	if len(fake.Removed) != 1 || fake.Removed[0] != "/p/aa-a-c1" {
+		t.Fatalf("worktree not removed: %#v", fake.Removed)
+	}
+}
+
+func TestSweepCapsRetainedFailedSandboxes(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	var s TaskStore
+	for i := 0; i < MaxRetainedFailedSandboxes+5; i++ {
+		s.Upsert(A2ATask{
+			ContextID: fmt.Sprintf("c%d", i),
+			Session:   fmt.Sprintf("aa-a-c%d", i),
+			Worktree:  fmt.Sprintf("/p/aa-a-c%d", i),
+			State:     TaskFailed,
+			// oldest first
+			CompletedAt: now.Add(-time.Duration(200-i) * time.Hour).Format(time.RFC3339),
+		})
+	}
+	_ = SaveTasks(root, s)
+
+	fake := &FakeSessionManager{}
+	if _, _, err := SweepTimeouts(context.Background(), root, fake, now); err != nil {
+		t.Fatalf("SweepTimeouts: %v", err)
+	}
+	if len(fake.Removed) != 5 {
+		t.Fatalf("removed %d failed sandboxes, want 5 (the oldest beyond the cap)", len(fake.Removed))
+	}
+	for _, r := range fake.Removed {
+		if r == "/p/aa-a-c24" {
+			t.Fatal("newest failed sandbox was reclaimed; the cap must drop the OLDEST")
+		}
+	}
+}
+
+func TestSweepKeepsFailedSandboxesUnderTheCap(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	var s TaskStore
+	s.Upsert(A2ATask{
+		ContextID: "c1", Session: "aa-a-c1", Worktree: "/p/aa-a-c1", State: TaskFailed,
+		CompletedAt: now.Add(-300 * time.Hour).Format(time.RFC3339),
+	})
+	_ = SaveTasks(root, s)
+
+	fake := &FakeSessionManager{}
+	_, _, _ = SweepTimeouts(context.Background(), root, fake, now)
+	if len(fake.Removed) != 0 {
+		t.Fatalf("a single old failed sandbox must be kept for forensics, got %#v", fake.Removed)
+	}
+}
+
 func TestSweepLeavesFailedSandboxForensicsEvenWithGarbageTimestamp(t *testing.T) {
 	root := t.TempDir()
 	now := time.Now().UTC()
