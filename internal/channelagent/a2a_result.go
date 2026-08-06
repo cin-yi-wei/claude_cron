@@ -41,6 +41,14 @@ var collectResultsAfterScanForTest func()
 // write in flight" property while still bounding the retry-forever case: a
 // file that is STILL unreadable after this long is genuinely broken, not
 // slow, and is quarantined so it stops being re-attempted every cycle.
+//
+// round 10 review 第二輪，記錄不修：這個寬限期量的是檔案的 mtime，而 mtime
+// 是沙盒自己(它的檔案系統操作)寫出來的，不是任何人驗證過的時間戳——一個
+// 沙盒可以透過持續碰這個檔案(哪怕只是每隔幾秒 touch 一下)讓自己這份壞掉
+// 的結果永遠不被隔離(這正是修這個之前的行為),或者反過來刻意把 mtime 往
+// 過去調,讓自己這份可能其實還沒寫完的結果被提早摧毀。兩種效果都只影響
+// 「這個沙盒自己的 outbox/pending 目錄」,不會波及其他 session,所以接受
+// 這個限制——但下一個讀到這段的人不該假設 mtime 是可信的外部證據。
 const unreadableResultGrace = 5 * time.Second
 
 // resultBelongsToTask 比對結果檔是否真的來自這個任務最後一次注入的訊息。
@@ -189,6 +197,12 @@ func CollectResults(root string, now time.Time) (int, error) {
 			// completed——它的真正主人（那則舊訊息本身）已經不會再被任何
 			// row 認領，而這個 contextId 現在等的是新訊息的回覆，那份回覆
 			// 之後會用新的 LastMessageID 通過這裡的比對。
+			// round 10 review 第二輪，記錄不修：這裡 continue 之後，f.path
+			// 這份「屬於被追問取代的舊訊息」的檔案不會被隔離、也不會被搬
+			// 走——它會一直留在 outbox/pending 裡，每一輪 CollectResults
+			// 都會重新 ReadJSON 一次它（直到整個沙盒被 sweep 回收），跟被
+			// 隔離的壞檔不同。成本是每個被取代的追問各留一份檔案，接受這
+			// 個限制：它不會累積到跨 session，也不會讓任何 row 卡住。
 			if !resultBelongsToTask(OutputJob{JobID: f.jobID}, cur) {
 				continue
 			}

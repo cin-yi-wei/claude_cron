@@ -146,23 +146,27 @@ func drainRejectReason(callers CallerStore, agents AgentStore, cerr, aerr error,
 // 濾掉。那個過濾對「要不要接受新派送」是對的——不該讓一個名字有問題的 agent
 // 建立新沙盒；但對「要不要撤銷已經在跑的任務」是不對的——一次手誤（打錯字、
 // channel_id 恰好跟某個新建的 binding 撞了）不該跟操作者刻意把 agent
-// 刪除/停用有一樣的後果。於是這裡在 drainRejectReason 判定「agent 不存在」
-// 之後，多查一次未過濾的 rawAgents：如果那個名字其實還在 agents.json 裡
-// （只是這次驗證沒通過），就不算數——放過這一列，留給 operator 修好設定檔，
-// 而不是連坐撤銷這個 agent 名下每一個正在跑的沙盒。rawErr != nil（讀檔失敗）
-// 時無法分辨兩種情況，保守起見維持 drainRejectReason 原本的判定（fail
-// closed，跟 cerr/aerr 那條既有規則一致的方向）。
+// 刪除/停用有一樣的後果。
+//
+// round 10 review 第二輪，Important：第一版一撞見「filtered 版本找不到這個
+// agent 名字」就整段放過，等於把過濾造成的假陽性豁免權套用到 drainRejectReason
+// 回的**任何**理由上——包含跟 agent 過濾完全無關的 caller 撤銷、caller 等級
+// 被降。用未過濾的 rawAgents 重跑一次完整的 drainRejectReason（caller
+// 狀態、agent 存在、enabled、grant level 全部重查一遍），只有在「用未過濾
+// 視角看，這一列什麼問題都沒有」的時候才算數——那才真的只剩下「agent 被過
+// 濾」這一個原因，其他任何真正的撤銷理由（caller 被撤銷、agent 被明確停用、
+// 等級被降）都會在 rawReason 裡冒出來，於是豁免不成立，維持原本的撤銷判定。
+// rawErr != nil（讀檔失敗）時無法重跑這個判定，保守起見維持 drainRejectReason
+// 原本的判定（fail closed，跟 cerr/aerr 那條既有規則一致的方向）。
 func revokeReasonForRunningTask(callers CallerStore, agents, rawAgents AgentStore, rawErr error, t A2ATask) string {
 	reason := drainRejectReason(callers, agents, nil, nil, t)
 	if reason == "" {
 		return ""
 	}
 	if rawErr == nil {
-		if _, filteredOK := agents.Get(t.Agent); !filteredOK {
-			if _, rawOK := rawAgents.Get(t.Agent); rawOK {
-				log.Printf("a2a: sweep: agent %q 在 agents.json 裡存在但這次驗證沒通過（名稱不合法或 channel_id 跟某個 binding 撞了），不對它正在跑的任務做撤銷——這是設定檔問題，不是操作者刻意移除；context %s 保持原樣，等 operator 修好設定", t.Agent, t.ContextID)
-				return ""
-			}
+		if rawReason := drainRejectReason(callers, rawAgents, nil, nil, t); rawReason == "" {
+			log.Printf("a2a: sweep: agent %q 在 agents.json 裡存在、caller 跟等級也都沒問題，只是這次驗證沒通過（名稱不合法或 channel_id 跟某個 binding 撞了）——不對它正在跑的任務做撤銷，這是設定檔問題，不是操作者刻意移除；context %s 保持原樣，等 operator 修好設定", t.Agent, t.ContextID)
+			return ""
 		}
 	}
 	return reason

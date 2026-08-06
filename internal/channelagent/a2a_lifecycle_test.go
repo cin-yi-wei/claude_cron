@@ -1633,6 +1633,128 @@ func TestSweepDoesNotRevokeRunningTaskWhenAgentOnlyFailedValidation(t *testing.T
 	}
 }
 
+// TestSweepStillRevokesFilteredAgentWhoseCallerWasRevoked pins the round-10
+// review's second-pass fix: the first version of revokeReasonForRunningTask
+// granted amnesty the moment the filtered agents.Get missed, regardless of
+// WHY drainRejectReason returned non-empty — so a filtered agent's caller
+// being revoked was silently swallowed too, leaving a revoked caller's
+// sandbox running with its policy untouched until the two-hour hard timeout.
+// Same filtered-agent setup as
+// TestSweepDoesNotRevokeRunningTaskWhenAgentOnlyFailedValidation, except the
+// caller is revoked — that must still revoke, because re-running
+// drainRejectReason against the RAW (unfiltered) agent store surfaces the
+// caller-revocation reason, which has nothing to do with the agent filter.
+func TestSweepStillRevokesFilteredAgentWhoseCallerWasRevoked(t *testing.T) {
+	root := t.TempDir()
+	if err := Init(root); err != nil {
+		t.Fatal(err)
+	}
+	seedBinding(t, root, Binding{Name: "w", ChannelID: "chan-1", Worktree: t.TempDir(), Root: pathIn(root, "bindings", "w")})
+
+	var callers CallerStore
+	_ = callers.Register("peer-a", "s")
+	callers.Approve("peer-a", []string{"read"})
+	callers.Revoke("peer-a")
+	_ = SaveCallers(root, callers)
+	var agents AgentStore
+	_ = agents.Add(Agent{Name: "a", ProjectDir: "/p/a", ChannelID: "chan-1", Capabilities: []string{"read"}, Enabled: true})
+	_ = SaveAgents(root, agents)
+
+	now := time.Now().UTC()
+	const session = "aa-a-c1"
+	var s TaskStore
+	s.Upsert(A2ATask{
+		ContextID: "c1", TaskID: "t1", Agent: "a", CallerID: "peer-a", Level: GrantReadOnly,
+		Session: session, State: TaskWorking, StartedAt: now.Format(time.RFC3339),
+	})
+	if err := SaveTasks(root, s); err != nil {
+		t.Fatalf("SaveTasks: %v", err)
+	}
+	if err := WriteSandboxPolicy(root, SandboxPolicy{
+		Session: session, ContextID: "c1", Agent: "a", CallerID: "peer-a", Level: GrantReadOnly,
+	}); err != nil {
+		t.Fatalf("WriteSandboxPolicy: %v", err)
+	}
+	if got, _ := LoadAgents(root); len(got.Agents) != 0 {
+		t.Fatalf("precondition failed: agent %q should have been filtered by LoadAgents, got %#v", "a", got.Agents)
+	}
+
+	fake := &FakeSessionManager{}
+	if _, _, err := SweepTimeouts(context.Background(), root, fake, now, nil); err != nil {
+		t.Fatalf("SweepTimeouts: %v", err)
+	}
+
+	got, _ := LoadTasks(root)
+	tk, _ := got.ByContext("c1")
+	if tk.State != TaskFailed {
+		t.Fatalf("state = %s, want failed: a revoked caller must still revoke a running task even when its agent is also filtered", tk.State)
+	}
+	pol, err := LoadSandboxPolicy(root, session)
+	if err != nil {
+		t.Fatalf("LoadSandboxPolicy: %v", err)
+	}
+	if pol.Level != GrantRevoked {
+		t.Fatalf("policy level = %q, want revoked", pol.Level)
+	}
+	if len(fake.Stopped) != 1 || fake.Stopped[0] != session {
+		t.Fatalf("session not stopped: %#v", fake.Stopped)
+	}
+}
+
+// TestSweepStillRevokesFilteredAgentThatIsAlsoDisabled is the other half of
+// the same fix: the agent is both filtered (channel_id clash) AND
+// explicitly disabled in the raw store. Disabling is an operator's
+// deliberate action and must still revoke, regardless of the unrelated
+// filter also applying to the same row.
+func TestSweepStillRevokesFilteredAgentThatIsAlsoDisabled(t *testing.T) {
+	root := t.TempDir()
+	if err := Init(root); err != nil {
+		t.Fatal(err)
+	}
+	seedBinding(t, root, Binding{Name: "w", ChannelID: "chan-1", Worktree: t.TempDir(), Root: pathIn(root, "bindings", "w")})
+
+	var callers CallerStore
+	_ = callers.Register("peer-a", "s")
+	callers.Approve("peer-a", []string{"read"})
+	_ = SaveCallers(root, callers)
+	var agents AgentStore
+	_ = agents.Add(Agent{Name: "a", ProjectDir: "/p/a", ChannelID: "chan-1", Capabilities: []string{"read"}, Enabled: false})
+	_ = SaveAgents(root, agents)
+
+	now := time.Now().UTC()
+	const session = "aa-a-c1"
+	var s TaskStore
+	s.Upsert(A2ATask{
+		ContextID: "c1", TaskID: "t1", Agent: "a", CallerID: "peer-a", Level: GrantReadOnly,
+		Session: session, State: TaskWorking, StartedAt: now.Format(time.RFC3339),
+	})
+	if err := SaveTasks(root, s); err != nil {
+		t.Fatalf("SaveTasks: %v", err)
+	}
+	if err := WriteSandboxPolicy(root, SandboxPolicy{
+		Session: session, ContextID: "c1", Agent: "a", CallerID: "peer-a", Level: GrantReadOnly,
+	}); err != nil {
+		t.Fatalf("WriteSandboxPolicy: %v", err)
+	}
+	if got, _ := LoadAgents(root); len(got.Agents) != 0 {
+		t.Fatalf("precondition failed: agent %q should have been filtered by LoadAgents, got %#v", "a", got.Agents)
+	}
+
+	fake := &FakeSessionManager{}
+	if _, _, err := SweepTimeouts(context.Background(), root, fake, now, nil); err != nil {
+		t.Fatalf("SweepTimeouts: %v", err)
+	}
+
+	got, _ := LoadTasks(root)
+	tk, _ := got.ByContext("c1")
+	if tk.State != TaskFailed {
+		t.Fatalf("state = %s, want failed: a disabled agent must still revoke its running tasks even when it is also filtered for an unrelated reason", tk.State)
+	}
+	if len(fake.Stopped) != 1 || fake.Stopped[0] != session {
+		t.Fatalf("session not stopped: %#v", fake.Stopped)
+	}
+}
+
 // task 9 review: ordering must be fail-safe in the OTHER direction too — the
 // slower step (stopping the session) failing must never leave the sandbox
 // MORE capable than the (already revoked) policy says. Capability removal
