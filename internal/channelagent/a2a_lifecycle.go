@@ -229,14 +229,33 @@ const (
 //     RetainAfterComplete 的優惠期、或單純還沒輪到），SweepTimeouts 的候選
 //     清單完全靠掃 tasks.Tasks 產生，這一列從檔案裡消失，worktree 就永遠
 //     不會再被任何機制看見，變成沒有主人的孤兒。
-//   - Session != ""：同一個道理套用在 tmux session 上。
 //   - SessionStopPending：session 是否真的停過還沒被確認，下一輪 sweep 需要
 //     靠這一列重新嘗試（見 A2ATask.SessionStopPending 的說明）。
 //
-// 只有這三項都不成立 —— 也就是 SweepTimeouts 已經把這一列的磁碟/session
-// 回收乾淨 —— 才會真的進入排名/保留期判斷。這樣的 row 因此只跳過這一輪，不
-// 是永遠豁免：等它被 sweep 收乾淨之後，之後某一次 PruneTasks 呼叫會再看到
-// 它並判定資格。
+// round 11 review, Important 1：Session != "" 刻意不在這個清單裡，即使它
+// 表面上跟 Worktree 對稱。handleRPC 在 accept 那一刻就把 Session 填進 row
+// （SessionNameFor 是 contextId 的確定性函式，跟沙盒有沒有真的起來完全無
+// 關），但 Worktree 只在 SandboxExecutor.Start 真的跑到「拿到 agent、驗證
+// 過 grant level」那一步之後才被賦值、persist 進 row（a2a_executor.go:176，
+// 早於任何真正的磁碟/tmux side effect）。因此：
+//   - 任何一列如果真的起過 tmux session（不管現在死活），它的 Worktree 在
+//     那之前就已經被 persist 寫進 row 了——「session 真的活過」蘊含
+//     「Worktree != ""」，只看 Worktree 不會漏掉任何有真實磁碟/session
+//     足跡的 row。
+//   - 反過來，Session != "" 但 Worktree == "" 的 row 只可能是「Start 從未
+//     真正跑起來」的一列：DrainQueue 認領後因 caller 被撤銷/agent 被停用
+//     由 failDrainedTask 直接判 failed（從未呼叫 Start）、或 Start 內部在
+//     還沒設定 Worktree 之前就失敗（unknown/disabled agent、grant level
+//     不合法）。這種 row 從來沒有任何磁碟或 tmux 東西存在過，把它的 Session
+//     當成「還有東西要靠它才找得到」是誤判——原本的檢查讓它永遠非空、永遠
+//     擋住 PruneTasks，tasks.json 又變回無上限成長（正是這條規則要修的問
+//     題，只是換了一個欄位；一個被撤銷 caller 排隊中的 N 個 contextId 會
+//     全部變成永久 row）。
+//
+// 只有這兩項都不成立 —— 也就是 SweepTimeouts 已經把這一列的磁碟/session
+// 回收乾淨，或者這一列從來就沒有東西需要回收 —— 才會真的進入排名/保留期
+// 判斷。這樣的 row 因此只跳過這一輪，不是永遠豁免：等它被 sweep 收乾淨之
+// 後，之後某一次 PruneTasks 呼叫會再看到它並判定資格。
 //
 // TaskWorking/TaskDispatching（非終止）的 row 完全不進終止排名，所以「結果
 // 還沒被 CollectResults 收下」不需要另外檢查：CollectResults 把 row 轉終
@@ -266,8 +285,10 @@ func PruneTasks(root string, now time.Time) (int, error) {
 		drop := map[int]bool{}
 		for rank, r := range terminal {
 			t := tasks.Tasks[r.idx]
-			// 還沒被 sweep 回收乾淨：不管排名或保留期，一律留著，交給下一次。
-			if t.Worktree != "" || t.Session != "" || t.SessionStopPending {
+			// 還沒被 sweep 回收乾淨、或還在等 session-stop 確認：不管排名或
+			// 保留期，一律留著，交給下一次。Session 本身刻意不在這個判斷
+			// 裡——見上面函式說明 round 11 review, Important 1。
+			if t.Worktree != "" || t.SessionStopPending {
 				continue
 			}
 			if rank >= MaxTaskRows {

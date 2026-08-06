@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -1000,5 +1001,58 @@ func TestOverlongTaskIDIsRejected(t *testing.T) {
 	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
 	if resp.Error == nil || resp.Error.Code != RPCInvalidParams {
 		t.Fatalf("an unbounded taskId lets a caller stash a ~1 MiB blob in the task store; got %#v", resp.Error)
+	}
+}
+
+// round 11 review, Important 2, reproduced end-to-end: an APPROVED caller
+// (secret-1/peer-a — no unauthorized/bearer trickery needed) sending a
+// message/send whose contextId fails the alphanumeric/length check reaches
+// auditBadRequest with the raw, unbounded p.ContextID. Before the fix, three
+// such requests (900 KB illegal contextId each) produced a 2.7 MB
+// a2a-audit.jsonl — enough that well under a hundred requests would rotate
+// the 32 MiB cap and overwrite the .1 generation too, destroying the entire
+// audit history. The body stays under the handler's 1 MiB io.LimitReader
+// cap so it reaches auditBadRequest rather than failing to parse.
+func TestBadRequestAuditBoundsCallerControlledContextID(t *testing.T) {
+	s, root := newTestA2AServer(t)
+	huge := strings.Repeat("x", 900_000)
+	body := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"agent":"codereview","contextId":%q,"text":"hi"}}`, huge)
+	for i := 0; i < 3; i++ {
+		postRPC(t, s.Handler(), "secret-1", body)
+	}
+	info, err := os.Stat(AuditPath(root))
+	if err != nil {
+		t.Fatalf("stat audit log: %v", err)
+	}
+	if info.Size() > 10_000 {
+		t.Fatalf("audit log grew to %d bytes for 3 requests carrying a 900KB caller-controlled contextId; ContextID must be bounded before it reaches the log", info.Size())
+	}
+	got, err := ReadAudit(root)
+	if err != nil || len(got) != 3 {
+		t.Fatalf("ReadAudit = %#v, %v", got, err)
+	}
+	for _, e := range got {
+		if n := len([]rune(e.ContextID)); n > maxAuditFieldRunes+8 {
+			t.Fatalf("stored ContextID kept %d runes", n)
+		}
+	}
+}
+
+// Same probe against the unknown-agent branch, whose Summary embeds
+// "unknown agent "+p.Agent (already bounded via Summary truncation) but
+// whose AuditEntry.Agent field previously carried the raw, unbounded value
+// separately.
+func TestBadRequestAuditBoundsCallerControlledAgent(t *testing.T) {
+	s, root := newTestA2AServer(t)
+	huge := strings.Repeat("y", 900_000)
+	body := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"agent":%q,"contextId":"c1","text":"hi"}}`, huge)
+	postRPC(t, s.Handler(), "secret-1", body)
+
+	got, err := ReadAudit(root)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("ReadAudit = %#v, %v", got, err)
+	}
+	if n := len([]rune(got[0].Agent)); n > maxAuditFieldRunes+8 {
+		t.Fatalf("stored Agent kept %d runes", n)
 	}
 }

@@ -207,13 +207,14 @@ func (s *A2AServer) handleRPC(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		// 認證失敗完全不留稽核，等於一個以「需要誰要求了什麼的持久紀錄」為
 		// 存在理由的對外監聽器，卻對暴力嘗試視而不見（I8）。以來源 IP 限流，
-		// 記憑證指紋（SHA-256 前 8 hex）而非憑證本身——絕不記憑證。
+		// 記憑證指紋（HMAC-SHA256，per-install 金鑰，前 8 hex）而非憑證本
+		// 身——絕不記憑證。
 		host := sourceHost(r)
 		if unauthorizedAudits.allow(host, time.Now()) {
 			_ = AppendAudit(s.Root, AuditEntry{
 				At:           time.Now().UTC().Format(time.RFC3339),
 				Outcome:      "unauthorized",
-				CredentialFP: credentialFingerprint(bearer(r)),
+				CredentialFP: credentialFingerprint(s.Root, bearer(r)),
 				RemoteAddr:   host,
 			})
 		}

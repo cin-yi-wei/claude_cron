@@ -2234,8 +2234,19 @@ func TestUpsertTruncatesPromptAndDetail(t *testing.T) {
 // 回收乾淨、且 SessionStopPending 不再是 true。任何一項不成立都代表磁碟或
 // tmux 上還有東西只能靠這一列的存在才找得到 —— 刪掉它就是製造一個永遠找不
 // 到主人的孤兒 worktree/session。這裡直接證明：一列即使排名遠遠超過
-// MaxTaskRows、且早就過了 TaskRetention，只要它的 Worktree/Session 還沒被
-// 回收，PruneTasks 也絕不刪它。
+// MaxTaskRows、且早就過了 TaskRetention，只要它的 Worktree 還沒被回收、或
+// SessionStopPending 還沒清掉，PruneTasks 也絕不刪它。
+//
+// round 11 review：這個測試原本只斷言兩個受保護的 row 還在，對一個完全
+// no-op（永遠不刪任何東西）的 PruneTasks 一樣會通過，沒有真正證明函式有在
+// 刪東西。現在額外斷言 dropped > 0、超過上限的乾淨 row 真的被清掉了，並且
+// 直接證明 round 11 review Important 1 修的那個問題本身：一列帶著 Session
+// （每一列從 handleRPC accept 的那一刻起都有）但從來沒有真正的 Worktree
+// （呼叫方排隊中的 backlog 因為 caller 被撤銷而被 failDrainedTask 判
+// failed，從未呼叫過 Start；或 Start 內部在算出 Worktree 之前就失敗：
+// unknown/disabled agent、grant level 不合法），不可以因為 Session 非空就
+// 永久豁免——修之前這一列會被留到永遠，正是這個 task 要收的無上限成長，只
+// 是換了一個欄位重新出現。
 func TestPruneTasksNeverDropsARowWithAnUnreclaimedSandbox(t *testing.T) {
 	root := t.TempDir()
 	now := time.Now().UTC()
@@ -2261,16 +2272,40 @@ func TestPruneTasksNeverDropsARowWithAnUnreclaimedSandbox(t *testing.T) {
 		Session:            "aa-codereview-stoppending",
 		SessionStopPending: true,
 	})
-	_ = SaveTasks(root, s)
+	// Session 有值（跟每一列一樣，accept 那一刻就填了），但沒有 Worktree
+	// （Start 從沒跑到算出 Worktree 那一步），也沒有 SessionStopPending，
+	// 排名與保留期都早就超過。這一列從來沒有任何磁碟/tmux 東西存在過，必須
+	// 是可以被刪的。
+	s.Upsert(A2ATask{
+		ContextID:   "revoked-backlog",
+		State:       TaskFailed,
+		CompletedAt: now.Add(-TaskRetention - time.Hour).Format(time.RFC3339),
+		Session:     SessionNameFor("codereview", "revoked-backlog"),
+	})
+	if err := SaveTasks(root, s); err != nil {
+		t.Fatalf("SaveTasks: %v", err)
+	}
+	totalBefore := len(s.Tasks)
 
-	if _, err := PruneTasks(root, now); err != nil {
+	dropped, err := PruneTasks(root, now)
+	if err != nil {
 		t.Fatalf("PruneTasks: %v", err)
 	}
+	if dropped == 0 {
+		t.Fatal("PruneTasks reported 0 dropped — this test seeded far more than MaxTaskRows clean, expired rows, so a no-op prune must not pass silently")
+	}
+
 	got, _ := LoadTasks(root)
+	if len(got.Tasks) >= totalBefore {
+		t.Fatalf("row count = %d, was %d before prune; nothing was actually removed from disk", len(got.Tasks), totalBefore)
+	}
 	if _, ok := got.ByContext("unreclaimed"); !ok {
 		t.Fatal("a row with an unreclaimed worktree/session must never be dropped")
 	}
 	if _, ok := got.ByContext("stoppending"); !ok {
 		t.Fatal("a row with SessionStopPending must never be dropped")
+	}
+	if _, ok := got.ByContext("revoked-backlog"); ok {
+		t.Fatal("a terminal row that never got a real Worktree (Session alone, from a caller whose queued backlog was rejected before Start ever ran) must be prunable — Session must not permanently exempt a row that never had a sandbox")
 	}
 }
