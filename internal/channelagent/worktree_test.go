@@ -2,6 +2,7 @@ package channelagent
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -231,5 +232,46 @@ func TestWaitSessionReadySkippedWhenDelayZero(t *testing.T) {
 	waitSessionReady(context.Background(), "cc-x")
 	if called {
 		t.Fatal("waitSessionReady must not probe when sessionBootDelay <= 0")
+	}
+}
+
+// 沙盒 worktree 的 settings 不可以有 SessionStart hook:Claude Code 開機時會
+// 因此跳「Managed settings require approval」閘,而該畫面被 classifyScreen 判為
+// ScreenLogin,autoAnswerSandboxConfirm 永遠不會答到它 —— prompt 就被打進核准
+// 畫面然後消失。cc- worker 的 agentSettings 一個字都不能動。
+func TestSandboxSettingsDropSessionStartHookOnly(t *testing.T) {
+	worker := t.TempDir()
+	if err := EnsureAgentSettings(worker); err != nil {
+		t.Fatal(err)
+	}
+	workerBlob, err := os.ReadFile(filepath.Join(worker, ".claude", "settings.local.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(workerBlob), "SessionStart") {
+		t.Fatal("cc- worker settings must still carry the SessionStart hook")
+	}
+
+	sandbox := t.TempDir()
+	if err := EnsureSandboxSettings(sandbox); err != nil {
+		t.Fatal(err)
+	}
+	blob, err := os.ReadFile(filepath.Join(sandbox, ".claude", "settings.local.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(blob)
+	if strings.Contains(got, "SessionStart") {
+		t.Fatal("sandbox settings must NOT carry the SessionStart hook")
+	}
+	// 六條 PreToolUse matcher 一條不少 —— 少一條就是一個沒有 gate 的工具。
+	for _, m := range []string{`"Edit"`, `"Write"`, `"Bash"`, `"WebFetch"`, `"WebSearch"`, `"mcp__.*"`} {
+		if !strings.Contains(got, m) {
+			t.Errorf("sandbox settings lost the %s matcher", m)
+		}
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(blob, &parsed); err != nil {
+		t.Fatalf("sandbox settings are not valid JSON: %v", err)
 	}
 }

@@ -163,6 +163,45 @@ const controlAgentSettings = `{
 }
 `
 
+// sandboxAgentSettings 是 aa- 沙盒 worktree 的 Claude Code 權限設定:與
+// agentSettings 逐字相同,只刪掉 SessionStart 區塊,六條 PreToolUse matcher
+// 一條不少。
+//
+// 為什麼要刪:帶 hooks 的 settings.local.json 會讓 Claude Code 開機時跳
+// 「Managed settings require approval」閘。該畫面被 classifyScreen 判為
+// ScreenLogin(screen.go:55 → paneAwaitingManagedSettings),而
+// autoAnswerSandboxConfirm 只在 ScreenConfirm 時動作 —— 於是沒有任何東西會
+// 答它,prompt 被 RunWorkerOnce 打進核准畫面(paneBusy 不把 ScreenLogin 算成
+// 忙碌)、Inject 回報成功、job 移進 done、prompt 消失,任務停在 working 兩
+// 小時後被 sweep 判成 canceled。沙盒不需要 SessionStart(那個 hook 只記錄
+// transcript 路徑給 cc- 的 supervisor 用),所以直接不裝是最乾淨的做法。
+//
+// agentSettings 與 EnsureAgentSettings 一個字都不能改:cc- 的行為必須逐位元
+// 不變。
+const sandboxAgentSettings = `{
+  "model": "opus",
+  "permissions": {
+    "allow": ["Read"]
+  },
+  "enabledPlugins": {
+    "ruby-lsp@claude-plugins-official": false
+  },
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "Edit", "hooks": [ { "type": "command", "command": "claude-cron permission-gate --timeout=1800s", "timeout": 1860 } ] },
+      { "matcher": "Write", "hooks": [ { "type": "command", "command": "claude-cron permission-gate --timeout=1800s", "timeout": 1860 } ] },
+      { "matcher": "Bash", "hooks": [ { "type": "command", "command": "claude-cron permission-gate --timeout=1800s", "timeout": 1860 } ] },
+      { "matcher": "WebFetch", "hooks": [ { "type": "command", "command": "claude-cron permission-gate --timeout=1800s", "timeout": 1860 } ] },
+      { "matcher": "WebSearch", "hooks": [ { "type": "command", "command": "claude-cron permission-gate --timeout=1800s", "timeout": 1860 } ] },
+      { "matcher": "mcp__.*", "hooks": [ { "type": "command", "command": "claude-cron permission-gate --timeout=1800s", "timeout": 1860 } ] }
+    ]
+  }
+}
+`
+
+// EnsureSandboxSettings 把 aa- 沙盒的權限設定寫進 dir(已存在則不動)。
+func EnsureSandboxSettings(dir string) error { return writeAgentSettings(dir, sandboxAgentSettings) }
+
 // EnsureAgentSettings writes the WORKER permission config into dir's
 // .claude/settings.local.json if absent (existing file left untouched).
 func EnsureAgentSettings(dir string) error { return writeAgentSettings(dir, agentSettings) }
@@ -269,10 +308,24 @@ func RemoveWorktree(ctx context.Context, projectDir, worktreePath string) error 
 	return err
 }
 
-// StartTmuxClaude ensures a detached tmux session named session is running
-// `claude` with its working directory set to cwd. No-op if it already exists.
+// StartTmuxClaude 啟動一個 cc- binding 的 session。簽章與行為與改動前完全
+// 相同(傳 EnsureAgentSettings)。
 func StartTmuxClaude(ctx context.Context, session, cwd, registryRoot string) error {
-	if err := EnsureAgentSettings(cwd); err != nil {
+	return startTmuxClaudeWith(ctx, session, cwd, registryRoot, EnsureAgentSettings)
+}
+
+// StartTmuxClaudeSandbox 啟動一個 aa- 沙盒的 session:唯一的差別是寫入不含
+// SessionStart hook 的 settings(見 sandboxAgentSettings)。
+func StartTmuxClaudeSandbox(ctx context.Context, session, cwd, registryRoot string) error {
+	return startTmuxClaudeWith(ctx, session, cwd, registryRoot, EnsureSandboxSettings)
+}
+
+// startTmuxClaudeWith ensures a detached tmux session named session is
+// running `claude` with its working directory set to cwd. No-op if it
+// already exists. ensure writes whichever settings.local.json variant the
+// caller needs (cc- worker vs aa- sandbox) before the session starts.
+func startTmuxClaudeWith(ctx context.Context, session, cwd, registryRoot string, ensure func(string) error) error {
+	if err := ensure(cwd); err != nil {
 		return err
 	}
 	if runExternalCommand(ctx, "tmux", "has-session", "-t", session) == nil {

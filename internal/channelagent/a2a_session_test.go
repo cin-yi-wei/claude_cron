@@ -44,6 +44,29 @@ func TestFakeSessionManagerCanFail(t *testing.T) {
 	}
 }
 
+// TrustFolder 走 SessionManager 介面而不是直接呼叫 EnsureFolderTrusted 是
+// 強制要求:後者寫的是 ~/.claude.json,那是這台機器上所有 claude 行程共用的
+// 活檔,一個直接呼叫它的單元測試會改寫 operator 的線上設定。FakeSessionManager
+// 只記錄呼叫,絕不碰真實檔案。
+func TestFakeSessionManagerTrustFolderRecordsAndCanFail(t *testing.T) {
+	var m SessionManager = &FakeSessionManager{}
+	f := m.(*FakeSessionManager)
+	if err := m.TrustFolder(context.Background(), "/w/x"); err != nil {
+		t.Fatalf("TrustFolder: %v", err)
+	}
+	if len(f.Trusted) != 1 || f.Trusted[0] != "/w/x" {
+		t.Fatalf("Trusted = %#v", f.Trusted)
+	}
+
+	failing := &FakeSessionManager{FailOn: "trust"}
+	if err := failing.TrustFolder(context.Background(), "/w/x"); err == nil {
+		t.Fatal("expected TrustFolder to fail when FailOn=trust")
+	}
+	if len(failing.Trusted) != 0 {
+		t.Fatalf("Trusted should stay empty on failure: %#v", failing.Trusted)
+	}
+}
+
 // TestTmuxSessionManagerInjectErrorsWhenDeduped pins the fix for the other
 // half of the task-5 bug: IngestMessages reports a deduped message by
 // returning created=0 with a nil error, so a caller that only checks the

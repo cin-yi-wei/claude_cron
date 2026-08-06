@@ -439,3 +439,41 @@ func TestSandboxExecutorRefusesTaskWithoutLevel(t *testing.T) {
 		t.Fatalf("state = %q, want failed", tk.State)
 	}
 }
+
+// EnsureFolderTrusted 目前是死碼(零正式呼叫端),所以資料夾信任對話框在每個
+// 沙盒開機時都會跳。接上它 —— 但一定要走 SessionManager,否則單元測試會改寫
+// operator 的 ~/.claude.json。
+func TestSandboxExecutorTrustsWorktreeBeforeStart(t *testing.T) {
+	_, fake, ex := newExecutorFixture(t)
+	task := A2ATask{
+		ContextID: "c1", Agent: "codereview", CallerID: "peer-a",
+		Session: SessionNameFor("codereview", "c1"), State: TaskSubmitted, Level: GrantDevelop,
+	}
+	if err := ex.Start(context.Background(), task, "go"); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if len(fake.Trusted) != 1 {
+		t.Fatalf("TrustFolder calls = %#v, want exactly one", fake.Trusted)
+	}
+	if fake.Trusted[0] != SandboxWorktree("/p/x", task.Session) {
+		t.Fatalf("trusted %q, want the sandbox worktree", fake.Trusted[0])
+	}
+}
+
+// 信任只是省一個對話框,不是必要條件(第 3 層 backstop 仍在)。它失敗時
+// dispatch 必須照常完成,否則一個 ~/.claude.json 的暫時性讀寫錯誤就會讓每一
+// 個委派任務失敗。
+func TestSandboxExecutorContinuesWhenTrustFails(t *testing.T) {
+	_, fake, ex := newExecutorFixture(t)
+	fake.FailOn = "trust"
+	task := A2ATask{
+		ContextID: "c1", Agent: "codereview", CallerID: "peer-a",
+		Session: SessionNameFor("codereview", "c1"), State: TaskSubmitted, Level: GrantDevelop,
+	}
+	if err := ex.Start(context.Background(), task, "go"); err != nil {
+		t.Fatalf("a trust failure must not abort dispatch: %v", err)
+	}
+	if len(fake.Started) != 1 {
+		t.Fatalf("session not started: %#v", fake.Started)
+	}
+}

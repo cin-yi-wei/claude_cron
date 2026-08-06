@@ -175,6 +175,13 @@ func (e *SandboxExecutor) Start(ctx context.Context, task A2ATask, prompt string
 		return err
 	}
 
+	// 失敗只 log 不中止:它只是省一個對話框,不是必要條件(driver 的第 3 層
+	// backstop 仍在)。讓一個 ~/.claude.json 的暫時性讀寫錯誤害死每一個委派
+	// 任務,遠比多跳一次對話框糟糕。
+	if err := e.Sessions.TrustFolder(ctx, task.Worktree); err != nil {
+		log.Printf("a2a: 預先信任 %s 失敗(沙盒仍會啟動,靠 driver 的畫面 backstop): %v", task.Worktree, err)
+	}
+
 	// 政策檔必須在 session 起來之前落地:session 一起來就能發工具呼叫,晚一步
 	// 寫等於開了一個沒有約束的窗口。寫入失敗 = dispatch 失敗,不可以降級成
 	// 「先開起來再說」。

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 )
 
 // SessionManager isolates every side effect that touches git or tmux, so tests
@@ -17,6 +18,11 @@ type SessionManager interface {
 	// session leaves ~80MB per task on disk, and contextId is caller-chosen, so
 	// without this one approved caller can grow the disk without bound.
 	RemoveWorkspace(ctx context.Context, projectDir, worktree string) error
+	// TrustFolder 預先把 worktree 標成已信任,讓沙盒開機時不會跳資料夾信任
+	// 對話框。走介面而不是直接呼叫 EnsureFolderTrusted 是強制要求:後者寫的
+	// 是 ~/.claude.json,那是這台機器上所有 claude 行程共用的活檔,一個直接
+	// 呼叫它的單元測試會改寫 operator 的線上設定。
+	TrustFolder(ctx context.Context, worktree string) error
 }
 
 // TmuxSessionManager is the production implementation, delegating to the same
@@ -28,7 +34,17 @@ func (TmuxSessionManager) EnsureWorkspace(ctx context.Context, projectDir, branc
 }
 
 func (TmuxSessionManager) Start(ctx context.Context, session, cwd, registryRoot string) error {
-	return StartTmuxClaude(ctx, session, cwd, registryRoot)
+	// SessionManager 只服務 aa- 沙盒(cc- 走 supervisor.go 的自己那條路),
+	// 所以這裡一律用不含 SessionStart hook 的沙盒 settings。
+	return StartTmuxClaudeSandbox(ctx, session, cwd, registryRoot)
+}
+
+func (TmuxSessionManager) TrustFolder(_ context.Context, worktree string) error {
+	abs, err := filepath.Abs(worktree)
+	if err != nil {
+		abs = worktree
+	}
+	return EnsureFolderTrusted(ClaudeConfigPath(), abs)
 }
 
 func (TmuxSessionManager) Stop(ctx context.Context, session string) error {
@@ -58,13 +74,15 @@ func (TmuxSessionManager) Inject(ctx context.Context, root string, msg SourceMes
 }
 
 // FakeSessionManager records calls for assertions. FailOn makes one method
-// return an error: "workspace", "start", "stop", or "inject".
+// return an error: "workspace", "start", "stop", "inject", "remove", or
+// "trust".
 type FakeSessionManager struct {
 	Workspaces []string
 	Started    []string
 	Stopped    []string
 	Injected   []SourceMessage
 	Removed    []string
+	Trusted    []string
 	FailOn     string
 	// OnRemove, if set, fires once on the first RemoveWorkspace call, then
 	// clears itself. Tests use it to inject a state change into tasks.json
@@ -126,5 +144,14 @@ func (f *FakeSessionManager) Inject(_ context.Context, _ string, msg SourceMessa
 		return errors.New("fake inject failure")
 	}
 	f.Injected = append(f.Injected, msg)
+	return nil
+}
+
+func (f *FakeSessionManager) TrustFolder(_ context.Context, worktree string) error {
+	if f.FailOn == "trust" {
+		return errors.New("fake trust failure")
+	}
+	// 只記錄呼叫,絕不碰真實的 ~/.claude.json。
+	f.Trusted = append(f.Trusted, worktree)
 	return nil
 }
