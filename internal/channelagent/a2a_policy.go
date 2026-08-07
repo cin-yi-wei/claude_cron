@@ -13,6 +13,22 @@ import (
 // GrantLevel 是沙盒的能力授權等級。呼叫方只能「選等級」，永遠不能自行組裝
 // 規則集；等級的內容集中定義在本檔與 a2a_gate.go 的 sandboxDecision，要調整
 // 授權範圍只會動到那幾處，不會散落在各個呼叫端。
+//
+// 這幾個等級各自買到什麼，必須說清楚，否則會被當成比實際更強的保證：
+//
+//   - GrantReadOnly 是唯一真正的邊界。最終安全 review 對它實跑了約 45 條攻擊
+//     指令（rg --pre、find -exec/-delete、git diff --output、git branch、環境
+//     變數前綴、群集短旗標、git -c core.pager、NAT64/6to4/SIIT 位址編碼等），
+//     沒有一條能執行程式、寫檔或連出網路。
+//   - GrantDevelop 與 GrantFull 之間沒有牆，只有安全帶。政策檔與沙盒同屬一個
+//     unix 使用者，而 develop 依設計就允許跑 python / node / go run，所以它能
+//     改寫自己的政策檔升成 full（已實測：改寫後 curl 與 mcp__* 由 deny 變
+//     allow）。這不是可補的洞，是「同一個使用者身分」的直接結果——把 sed 從
+//     清單拿掉沒有用，python 一行就做得到。授予 develop 時應視同授予 full。
+//
+// 要讓 develop 成為真正的邊界需要 OS 層隔離（另開 unix 使用者或容器）。容器
+// 方案已評估並驗證過關鍵機制，在「呼叫方只有自己人」的模型下成本效益不成立
+// 而暫停保留，見 docs/superpowers/specs/2026-08-07-a2a-container-isolation-STATUS.md。
 type GrantLevel string
 
 const (
